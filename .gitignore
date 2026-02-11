@@ -4,3 +4,5 @@ faiss_index/
 __pycache__/
 
 /plans
+
+rag-search-engine/

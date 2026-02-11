@@ -6,25 +6,26 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from .prompts import RAG_PROMPT
-
-DATA_DIR = "./data"
-FAISS_DIR = "./faiss_index"
+from .config import (
+    DATA_DIR, FAISS_DIR, EMBEDDING_MODEL, LLM_MODEL, LLM_TEMPERATURE,
+    RETRIEVAL_K, CHUNK_SIZE, CHUNK_OVERLAP
+)
 
 def ingest_docs():
     loader = DirectoryLoader(DATA_DIR, glob="**/*.pdf", loader_cls=PyPDFLoader)
     docs = loader.load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     splits = splitter.split_documents(docs)
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
     vectorstore = FAISS.from_documents(splits, embeddings)
     vectorstore.save_local(FAISS_DIR)
     print(f"Ingested {len(splits)} chunks.")
 
 def query_brain(question: str):
     prompt = RAG_PROMPT
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
     vectorstore = FAISS.load_local(FAISS_DIR, embeddings, allow_dangerous_deserialization=True)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVAL_K})
     docs = retriever.invoke(question)
 
     print("RETRIEVED:", len(docs))
@@ -33,7 +34,7 @@ def query_brain(question: str):
         print(d.page_content[:300])
         print("----")
 
-    llm = OllamaLLM(model="dolphin-llama3:8b", temperature=0)
+    llm = OllamaLLM(model=LLM_MODEL, temperature=LLM_TEMPERATURE)
     
     prompt = PromptTemplate.from_template(
         """You MUST ONLY answer using the provided context. Do NOT make up information.
@@ -62,5 +63,12 @@ if __name__ == "__main__":
     if choice == "1":
         ingest_docs()
     else:
-        q = input("Ask: ")
-        print(query_brain(q))
+        print("Query mode. Type 'quit' to exit.\n")
+        while True:
+            q = input("Ask: ").strip()
+            if q.lower() == "quit":
+                print("Goodbye!")
+                break
+            if q:
+                result = query_brain(q)
+                print(f"\nAnswer: {result}\n")
