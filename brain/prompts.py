@@ -44,3 +44,16 @@ GENERATE_QUESTION_PROMPT = PromptTemplate(
     input_variables=["text"],
     template="Generate 3 important questions about this text:\n\n{text}"
 )
+
+# Strict RAG prompt that enforces context-only answers
+STRICT_RAG_PROMPT = ChatPromptTemplate.from_template(
+    """You MUST ONLY answer using the provided context. Do NOT make up information.
+
+Context:
+{context}
+
+Question: {input}
+
+If the answer is not found in the context, respond EXACTLY with: "I don't have that information in the documents."
+Answer:"""
+)
