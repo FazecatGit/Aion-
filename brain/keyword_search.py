@@ -68,14 +68,12 @@ class InvertedIndex:
         return tf * idf
     
     def _get_avg_doc_length(self) -> float:
-        """Calculate average document length for BM25 normalization."""
         if not self.doc_lengths:
             return 0.0
         total_length = sum(self.doc_lengths.values())
         return total_length / len(self.doc_lengths)
     
     def get_bm25_tf(self, doc_id, term, k1=BM25_K1, b=BM25_B):
-        """Calculate BM25 term frequency component."""
         tf = self.get_tf(doc_id, term)
         doc_length = self.doc_lengths.get(doc_id, 0)
         avg_doc_length = self._get_avg_doc_length()
@@ -88,7 +86,6 @@ class InvertedIndex:
         return (tf * (k1 + 1)) / (tf + k1 * length_norm)
     
     def get_bm25_idf(self, term: str) -> float:
-        """Calculate BM25 IDF component (different from standard IDF)."""
         tokens = tokenize_text(term)
         if len(tokens) != 1:
             raise ValueError("Term should be a single token")
@@ -99,7 +96,6 @@ class InvertedIndex:
         return math.log((total_doc_count - term_match_doc_count + 0.5) / (term_match_doc_count + 0.5) + 1)
     
     def get_bm25_tfidf(self, doc_id, term, k1=BM25_K1, b=BM25_B):
-        """Calculate full BM25 score for a term in a document."""
         tf = self.get_bm25_tf(doc_id, term, k1, b)
         idf = self.get_bm25_idf(term)
         return tf * idf
@@ -169,7 +165,6 @@ def has_matching_token(query_tokens: list[str], doc_tokens: list[str]) -> bool:
     return False
 
 def search_documents(query: str, documents: list[dict], n_results: int = 5, use_bm25: bool = True) -> list[dict]:
-    """Search documents using BM25 ranking (or TF-IDF if use_bm25=False)."""
     if not documents:
         return []
     
