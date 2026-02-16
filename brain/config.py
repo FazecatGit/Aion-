@@ -20,3 +20,8 @@ RETRIEVAL_K = int(os.getenv("RAG_RETRIEVAL_K", "5"))
 # Text splitting settings
 CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
+
+# Hybrid fusion settings
+FUSION_MODE = os.getenv("RAG_FUSION_MODE", "rrf")  # "rrf" or "weighted"
+FUSION_ALPHA = float(os.getenv("RAG_FUSION_ALPHA", "0.5"))  # For weighted mode: 1.0 = semantic, 0.0 = keyword
+FUSION_K_PARAM = int(os.getenv("RAG_FUSION_K_PARAM", "60"))  # For RRF mode: higher = more conservative
