@@ -1,4 +1,5 @@
 from typing import Optional
+import json
 
 from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
@@ -130,3 +131,61 @@ def rerank_documents(
     if verbose:
         print(f"Unknown rerank method '{method}'. Skipping rerank.")
     return docs
+
+
+def evaluate_documents_with_llm(
+    query: str,
+    docs: list[Document],
+    llm_model: str,
+    verbose: bool = False,
+) -> list[int]:
+    if not docs:
+        return []
+    
+    llm = OllamaLLM(model=llm_model, temperature=0)
+    
+    formatted_docs = []
+    for i, doc in enumerate(docs, 1):
+        content = doc.page_content[:300]
+        formatted_docs.append(f"{i}. {content}")
+    
+    evaluation_prompt = f"""Rate how relevant each document/snippet is to this query on a 0-3 scale:
+
+Query: "{query}"
+
+Documents:
+{chr(10).join(formatted_docs)}
+
+Scale:
+- 3: Highly relevant
+- 2: Relevant
+- 1: Marginally relevant
+- 0: Not relevant
+
+Return ONLY the scores as a JSON list, nothing else. For example: [3, 1, 2, 0]"""
+    
+    try:
+        response = llm.invoke(evaluation_prompt)
+        if response:
+            response_text = response.strip()
+            if verbose:
+                print(f"LLM evaluation response: {response_text}")
+            
+            try:
+                if "[" in response_text and "]" in response_text:
+                    json_str = response_text[response_text.find("["):response_text.rfind("]")+1]
+                    scores = json.loads(json_str)
+                    if isinstance(scores, list) and len(scores) == len(docs):
+                        return [int(s) for s in scores if 0 <= int(s) <= 3]
+            except (json.JSONDecodeError, ValueError):
+                if verbose:
+                    print("Failed to parse LLM scores as JSON")
+        
+        if verbose:
+            print("Falling back to neutral scores (all 1s)")
+        return [1] * len(docs)
+    
+    except Exception as e:
+        if verbose:
+            print(f"LLM evaluation error: {e}")
+        return [1] * len(docs)
