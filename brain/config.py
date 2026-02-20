@@ -41,3 +41,9 @@ RETRIEVAL_CANDIDATE_MULTIPLIER = int(os.getenv("RAG_RETRIEVAL_CANDIDATE_MULTIPLI
 # Reranking settings
 RERANK_METHOD = os.getenv("RAG_RERANK_METHOD", "keyword")  # "none", "keyword", "cross_encoder"
 CROSS_ENCODER_MODEL = os.getenv("RAG_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# ChromaDB config
+CHROMA_PERSIST_DIR = "db/chroma_db"      # where vectors live
+CHROMA_COLLECTION_NAME = "aion-code"     # collection for code docs
+CHROMA_CHUNK_SIZE = 1000                 # optional, for new ingest
+CHROMA_CHUNK_OVERLAP = 100               # optional for new ingest
