@@ -1,4 +1,3 @@
-"""Keyword search functionality for PDFs using text processing and stemming."""
 import string
 import nltk
 import math

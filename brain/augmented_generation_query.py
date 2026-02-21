@@ -4,6 +4,10 @@ from langchain_ollama import OllamaLLM
 from .config import LLM_MODEL, LLM_TEMPERATURE, DATA_DIR
 from .pdf_utils import load_pdfs
 from .ingest import fast_topic_search
+from .rag_brain import hybrid_retrieval
+from langchain_core.documents import Document
+
+session_chat_history = []
 
 def _run_fast_search(query: str, verbose: bool = False) -> list:
     documents = load_pdfs(DATA_DIR)
@@ -18,9 +22,18 @@ def _format_search_results_for_prompt(results: list) -> str:
         
     formatted = []
     for i, doc in enumerate(results, 1):
-        content = doc['content'][:500]
-        source = doc['metadata'].get("source", "Unknown")
-        page = doc['metadata'].get("page", "?")
+        if isinstance(doc, dict):
+            content = doc.get("content", doc.get("text", ""))[:500]
+            metadata = doc.get("metadata", {})
+            source = metadata.get("source", "Unknown")
+            page = metadata.get("page", "?")
+            
+        else:
+            content = getattr(doc, "page_content", "")[:500]
+            metadata = getattr(doc, "metadata", {})
+            source = metadata.get("source", "Unknown")
+            page = metadata.get("page", "?")
+            
         formatted.append(f"--- Document [{i}] ---\nSource File: {source} (Page {page})\nContent: {content}")
     
     return "\n\n".join(formatted)
@@ -56,7 +69,7 @@ Summary:"""
 def cite_documents(query: str, formatted_docs: str, llm_model: str) -> str:
     """Uses the LLM to extract the exact quotes and sources used to answer the query."""
     llm = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
-    prompt = f"""Find and extract the most relevant citations from the provided documents that answer this query.
+    prompt = f"""You are a citation extractor. Your job is to show the user exactly which documents were used for context.
 
 Query: {query}
 
@@ -64,33 +77,57 @@ Documents:
 {formatted_docs}
 
 Instructions:
-- Extract EXACT, VERBATIM quotes from the documents. Do not change the wording.
-- Format each citation like this: "[Source File Name, Page X] 'exact quote goes here'"
-- Include at least 2-3 key citations if they exist.
-- Do not make up quotes. If there are no relevant quotes, say "No relevant quotes found."
+- Look at the Documents provided above. 
+- For EVERY document source provided, extract one relevant sentence as an EXACT, VERBATIM quote.
+- Do NOT evaluate if the quote perfectly answers the query. If the document is in the context, you MUST extract a quote from it.
+- Format each citation strictly like this: "[Source File Name, Page X] 'exact quote goes here'"
 
 Citations:"""
+    
     return llm.invoke(prompt)
 
 def detailed_answer(query: str, formatted_docs: str, llm_model: str) -> str:
+    global session_chat_history
     llm = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+
+    recent_history = session_chat_history[-5:]
+
+    history_str = []
+    for msg in recent_history:
+        content = msg['content']
+        if msg['role'] == 'Assistant' and len(content) > 300:
+            content = content[:300] + "..."
+        history_str.append(f"{msg['role'].upper()}: {content}")
+
+    history_text = "\n".join(history_str)
+
     prompt = f"""Provide a detailed, comprehensive answer to this question.
-Question: {query}
-Documents:
+
+PREVIOUS CONVERSATION HISTORY:
+{history_text}
+
+NEW QUESTION: {query}
+DOCUMENTS:
 {formatted_docs}
 
 Instructions:
 - Start with a brief introduction
 - Provide a thorough, multi-paragraph answer
 - Cover different angles and perspectives
+- If this is a follow-up question, use the PREVIOUS CONVERSATION HISTORY to understand the context!
 - End with key takeaways or conclusions
 Answer:"""
-    return llm.invoke(prompt)
+    
+    response = llm.invoke(prompt)
+    session_chat_history.append({"role": "User", "content": query})
+    session_chat_history.append({"role": "Assistant", "content": response})
+    return response
 
 def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool = False) -> dict:
     llm_model = llm_model or LLM_MODEL
 
-    results = _run_fast_search(query, verbose=verbose)
+    if verbose: print(f"[DEBUG] Running hybrid retrieval for: '{query}'")
+    results = hybrid_retrieval(query, k=5, verbose=verbose)
     
     if not results:
         error_msg = "I don't have enough information in the provided documents."

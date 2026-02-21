@@ -4,10 +4,12 @@ from pathlib import Path
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_chroma import Chroma
+import os 
+import shutil
 
 from .utils import pipe
-from .config import DATA_DIR, FAISS_DIR, EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, INDEX_META_PATH, LLM_MODEL
+from .config import CHROMA_DIR, DATA_DIR, EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, INDEX_META_PATH, LLM_MODEL
 from .pdf_utils import load_pdfs
 from .keyword_search import search_documents
 from langchain_ollama import OllamaLLM
@@ -36,7 +38,7 @@ def generate_tech_synonyms(topic: str) -> list[str]:
     return [word.strip().lower() for word in response.split(",")]
 
 def ingest_docs():
-    loader = DirectoryLoader(DATA_DIR, glob="**/*.pdf", loader_cls=PyPDFLoader)
+    loader = DirectoryLoader(DATA_DIR,  glob="**/*.pdf", loader_cls=PyPDFLoader)
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
 
@@ -44,9 +46,18 @@ def ingest_docs():
         loader.load(),
         lambda docs: splitter.split_documents(docs)
     )
+    if os.path.exists(CHROMA_DIR):
+        print("Clearing old Chroma database...")
+        shutil.rmtree(CHROMA_DIR)
 
-    vectorstore = FAISS.from_documents(splits, embeddings)
-    vectorstore.save_local(FAISS_DIR)
+    print(f"Creating new Chroma database with {len(splits)} chunks...")
+    
+    _ = Chroma.from_documents(
+        documents=splits, 
+        embedding=embeddings, 
+        persist_directory=CHROMA_DIR
+    )
+    
     _write_index_metadata(len(splits))
 
     documents = load_pdfs(DATA_DIR)

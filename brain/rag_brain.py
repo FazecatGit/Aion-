@@ -2,21 +2,20 @@ import json
 
 from pathlib import Path
 from operator import itemgetter
-from .ingest import fast_topic_search
-from utils import pipe
-from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from brain.keyword_search import search_documents
+#from .ingest import fast_topic_search
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
-from langchain_community.vectorstores import FAISS
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from .utils import pipe
 from .prompts import STRICT_RAG_PROMPT
 from .config import (
-    DATA_DIR, FAISS_DIR, INDEX_META_PATH, EMBEDDING_MODEL, LLM_MODEL, LLM_TEMPERATURE,
+    DATA_DIR, INDEX_META_PATH, EMBEDDING_MODEL, LLM_MODEL, LLM_TEMPERATURE,
     RETRIEVAL_K, CHUNK_SIZE, CHUNK_OVERLAP, FUSION_MODE, FUSION_ALPHA, FUSION_K_PARAM,
     ENABLE_QUERY_SPELL_CORRECTION, ENABLE_QUERY_REWRITE, ENABLE_QUERY_EXPANSION,
-    RETRIEVAL_CANDIDATE_MULTIPLIER, RERANK_METHOD, CROSS_ENCODER_MODEL
+    RETRIEVAL_CANDIDATE_MULTIPLIER, RERANK_METHOD, CROSS_ENCODER_MODEL, CHROMA_DIR
 )
-from .keyword_search import search_documents
 from .pdf_utils import load_pdfs
 from .query_pipeline import enhance_query_for_retrieval, rerank_documents
 
@@ -176,7 +175,7 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
     
     _validate_index_metadata()
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-    vectorstore = FAISS.load_local(FAISS_DIR, embeddings, allow_dangerous_deserialization=True)
+    vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
     
     effective_question = enhance_query_for_retrieval(
         query=question,
@@ -185,13 +184,6 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
         enable_rewrite=ENABLE_QUERY_REWRITE,
         enable_expansion=ENABLE_QUERY_EXPANSION,
         verbose=verbose,
-    )
-    candidate_multiplier = max(1, RETRIEVAL_CANDIDATE_MULTIPLIER)
-    candidate_k = max(k * candidate_multiplier, k)
-
-    semantic_docs = pipe(
-        vectorstore.as_retriever(search_kwargs={"k": candidate_k}).invoke(effective_question),
-        lambda docs: _filter_docs(docs, filters)
     )
     
     if not isinstance(effective_question, str):
@@ -202,12 +194,51 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
     else:
         eq_str = effective_question
 
-    keyword_docs = pipe(
-        load_pdfs(DATA_DIR),
-        lambda docs: fast_topic_search(eq_str, docs), 
-        _build_keyword_docs
+    candidate_multiplier = max(1, RETRIEVAL_CANDIDATE_MULTIPLIER)
+    candidate_k = max(k * candidate_multiplier, k)
+
+    if verbose:
+        print(f"[DEBUG] candidate_k: {candidate_k}, effective_question: '{eq_str}'")
+
+    search_kwargs = {"k": candidate_k}
+    if filters:
+        search_kwargs["filter"] = filters
+    
+    # Try to retrieve from ChromaDB
+    try:
+        retriever = vectorstore.as_retriever(search_kwargs=search_kwargs)
+        # For langchain 0.1+, invoke returns a list of Documents
+        result = retriever.invoke(eq_str)
+        semantic_docs = result if isinstance(result, list) else []
+    except Exception as e:
+        if verbose:
+            print(f"[DEBUG] ChromaDB retrieval error: {e}")
+        semantic_docs = []
+    
+    if verbose:
+        print(f"[DEBUG] semantic_docs count: {len(semantic_docs)}")
+    
+    raw_docs = load_pdfs(DATA_DIR)
+    dict_docs = [{"content": d['content'], "metadata": d['metadata']} for d in raw_docs]
+    
+    if verbose:
+        print(f"[DEBUG] raw_docs count: {len(raw_docs)}")
+    
+    bm25_results = search_documents(
+        query=eq_str, 
+        documents=dict_docs, 
+        n_results=candidate_k, 
+        use_bm25=True
     )
     
+    if verbose:
+        print(f"[DEBUG] bm25_results count: {len(bm25_results)}")
+    
+    keyword_docs = [
+        Document(page_content=res["content"], metadata=res["metadata"]) 
+        for res in bm25_results
+    ]
+
     fused_docs = _fuse_results(
         semantic_docs, 
         keyword_docs, 
@@ -218,13 +249,13 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
 
     reranked_docs = rerank_documents(
         docs=fused_docs,
-        query=effective_question,
+        query=eq_str,
         method=rerank_method,
         cross_encoder_model=CROSS_ENCODER_MODEL,
         verbose=verbose,
     )
     
-    return reranked_docs[:k]
+    return semantic_docs[:k]
 
 def query_brain(question: str, verbose: bool = False, fusion_mode: str = None, alpha: float = None, k_param: int = None):
     fusion_mode = fusion_mode or FUSION_MODE

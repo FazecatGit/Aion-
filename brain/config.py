@@ -8,14 +8,15 @@ def _env_bool(name: str, default: str = "0") -> bool:
 # Directory paths
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = os.getenv("RAG_DATA_DIR", str(BASE_DIR / "data"))
-FAISS_DIR = os.getenv("RAG_FAISS_DIR", str(BASE_DIR / "faiss_index"))
-INDEX_META_PATH = os.getenv("RAG_INDEX_META_PATH", str(Path(FAISS_DIR) / "index_meta.json"))
+#FAISS_DIR = os.getenv("RAG_FAISS_DIR", str(BASE_DIR / "faiss_index"))
+CHROMA_DIR = os.getenv("RAG_CHROMA_DIR", str(BASE_DIR / "cache" / "chroma_db"))
+INDEX_META_PATH = os.getenv("RAG_INDEX_META_PATH", str(Path(CHROMA_DIR) / "index_meta.json"))
 
 # Embedding model settings
 EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "nomic-embed-text")
 
 # LLM settings
-LLM_MODEL = os.getenv("RAG_LLM_MODEL", "mistral")
+LLM_MODEL = os.getenv("RAG_LLM_MODEL", "qwen2.5-coder:7b")
 LLM_TEMPERATURE = float(os.getenv("RAG_LLM_TEMPERATURE", "0"))
 
 # Retrieval settings
@@ -43,7 +44,7 @@ RERANK_METHOD = os.getenv("RAG_RERANK_METHOD", "keyword")  # "none", "keyword", 
 CROSS_ENCODER_MODEL = os.getenv("RAG_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # ChromaDB config
-CHROMA_PERSIST_DIR = "db/chroma_db"      # where vectors live
+CHROMA_PERSIST_DIR = CHROMA_DIR		      # where vectors live
 CHROMA_COLLECTION_NAME = "aion-code"     # collection for code docs
 CHROMA_CHUNK_SIZE = 1000                 # optional, for new ingest
 CHROMA_CHUNK_OVERLAP = 100               # optional for new ingest
