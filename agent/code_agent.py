@@ -1,20 +1,38 @@
-
 import re
-from db.db_reader import get_code_documents
-from brain.rag_brain import query_brain
-from .tools import read_file, write_file, run_git_command, show_diff, run_python_file, run_shell_command, list_files
+import json
 from langchain_ollama import OllamaLLM
-from brain.config import LLM_MODEL
 
+from brain.config import LLM_MODEL, DATA_DIR
+from brain.pdf_utils import load_pdfs
+from brain.ingest import fast_topic_search
+from db.db_reader import get_code_documents
+from .tools import read_file, write_file, run_git_command, show_diff, run_python_file, run_shell_command, list_files
 
 class CodeAgent:
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
 
-    def edit_code(self, path: str, instruction: str, dry_run: bool = True):
+    def edit_code(self, path: str, instruction: str, dry_run: bool = True, use_rag: bool = False):
         source = read_file(path)
 
-        # The SEARCH/REPLACE Prompt (safely formatted)
+        rag_context = ""
+        if use_rag:
+            print("\nSearching offline PDFs for context...")
+            try:
+                documents = load_pdfs(DATA_DIR)
+                
+                results = fast_topic_search(instruction, documents)
+                
+                if results:
+                    rag_context = "REFERENCE DOCUMENTATION (Use this to guide your code edit):\n"
+                    for i, doc in enumerate(results):
+                        rag_context += f"--- Source {i+1} ---\n{doc['content']}\n\n"
+                    print(f"Found {len(results)} relevant PDF chunks!")
+                else:
+                    print("No relevant PDF context found. Proceeding without RAG.")
+            except Exception as e:
+                print(f"Failed to load RAG context: {e}. Proceeding without RAG.")
+
         prompt = (
             "You are an expert AI coding agent. I need you to edit a file.\n"
             "You must output a SEARCH/REPLACE block that specifies exactly what code to remove, and what code to insert.\n\n"
@@ -32,16 +50,16 @@ class CodeAgent:
             ">>>>>>> REPLACE\n"
             "```\n\n"
             f"INSTRUCTION: {instruction}\n\n"
+            f"{rag_context}"
             "ORIGINAL FILE CONTENT:\n"
             f"```python\n{source}\n```\n"
         )
         
-        # Call the LLM directly
         llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
         print("Waiting for LLM to calculate the exact edit...")
         raw_output = llm.invoke(prompt)
 
-        # Parse the output to extract the Search and Replace text
+        # Parse the output
         search_match = re.search(r'<<<<<<< SEARCH\n(.*?)\n=======', raw_output, re.DOTALL)
         replace_match = re.search(r'=======\n(.*?)\n>>>>>>> REPLACE', raw_output, re.DOTALL)
 
@@ -74,21 +92,17 @@ class CodeAgent:
             print("It tried to find this text (ignoring indentation):\n", search_text)
             return source
 
-        # Calculate original indentation of the first matched line so we can preserve it
         original_indent = len(source_lines[match_start_idx]) - len(source_lines[match_start_idx].lstrip())
         indent_str = " " * original_indent
 
-        # Indent the replacement lines to match the original code
         indented_replace = []
         for line in replace_lines:
             if line.strip() == "":
                 indented_replace.append("")
             else:
-                # If the LLM included some of its own indentation, keep it relative
                 llm_indent = len(line) - len(line.lstrip())
                 indented_replace.append(indent_str + (" " * llm_indent) + line.lstrip())
 
-        # Swap the old lines out for the new lines
         new_source_lines = (
             source_lines[:match_start_idx] + 
             indented_replace + 
@@ -97,7 +111,6 @@ class CodeAgent:
         
         new_source = "\n".join(new_source_lines)
 
-        # Preview the Diff
         diff = show_diff(source, new_source)
         print("\n--- DIFF PREVIEW ---")
         print(diff or "No changes detected.")
@@ -107,7 +120,7 @@ class CodeAgent:
             print("Dry run mode. No file written.")
             return new_source
 
-        # Save the file
+
         write_file(path, new_source)
         run_git_command(["git", "diff", path])
         return new_source
@@ -115,6 +128,7 @@ class CodeAgent:
     def list_db_code(self, limit: int = 20):
         docs = get_code_documents(limit=limit)
         return [d["text"] for d in docs]
+        
     def test_file(self, path: str) -> str:
         return run_python_file(path)
 

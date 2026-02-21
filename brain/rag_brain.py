@@ -1,8 +1,9 @@
 import json
-from datetime import datetime
+
 from pathlib import Path
-from functools import reduce
 from operator import itemgetter
+from .ingest import fast_topic_search
+from utils import pipe
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
@@ -20,33 +21,9 @@ from .pdf_utils import load_pdfs
 from .query_pipeline import enhance_query_for_retrieval, rerank_documents
 
 
-def compose(*fns):
-    """Compose functions left-to-right: compose(f, g)(x) = g(f(x))"""
-    return reduce(lambda f, g: lambda x: g(f(x)), fns, lambda x: x)
-
-
-def pipe(value, *fns):
-    """Pipe value through sequence of functions"""
-    return reduce(lambda x, f: f(x), fns, value)
-
-
-def _write_index_metadata(doc_count: int) -> None:
-    metadata = {
-        "embedding_model": EMBEDDING_MODEL,
-        "chunk_size": CHUNK_SIZE,
-        "chunk_overlap": CHUNK_OVERLAP,
-        "data_dir": DATA_DIR,
-        "doc_count": doc_count,
-        "created_at": datetime.now().isoformat() + "Z",
-    }
-    with open(INDEX_META_PATH, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2, sort_keys=True)
-
-
 def _load_index_metadata() -> dict:
     with open(INDEX_META_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
-
 
 def _validate_index_metadata() -> None:
     if not Path(INDEX_META_PATH).exists():
@@ -193,23 +170,6 @@ def _fuse_results(semantic_docs: list[Document], keyword_docs: list[Document], m
             seen.add(key)
     return result
 
-
-def ingest_docs():
-    loader = DirectoryLoader(DATA_DIR, glob="**/*.pdf", loader_cls=PyPDFLoader)
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-    
-    splits = pipe(
-        loader.load(),
-        lambda docs: splitter.split_documents(docs)
-    )
-    
-    vectorstore = FAISS.from_documents(splits, embeddings)
-    vectorstore.save_local(FAISS_DIR)
-    _write_index_metadata(len(splits))
-    print(f"Ingested {len(splits)} chunks.")
-
-
 def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None = None,
                      fusion_mode: str = "rrf", alpha: float = 0.5, k_param: int = 60,
                      rerank_method: str = RERANK_METHOD, verbose: bool = False) -> list[Document]:
@@ -229,15 +189,22 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
     candidate_multiplier = max(1, RETRIEVAL_CANDIDATE_MULTIPLIER)
     candidate_k = max(k * candidate_multiplier, k)
 
-    # Pipeline: enhance query -> retrieve -> filter -> fuse -> rerank -> truncate
     semantic_docs = pipe(
         vectorstore.as_retriever(search_kwargs={"k": candidate_k}).invoke(effective_question),
         lambda docs: _filter_docs(docs, filters)
     )
     
+    if not isinstance(effective_question, str):
+        if isinstance(effective_question, (list, tuple)):
+            eq_str = " ".join(map(str, effective_question))
+        else:
+            eq_str = str(effective_question)
+    else:
+        eq_str = effective_question
+
     keyword_docs = pipe(
         load_pdfs(DATA_DIR),
-        lambda docs: search_documents(effective_question, docs, n_results=candidate_k),
+        lambda docs: fast_topic_search(eq_str, docs), 
         _build_keyword_docs
     )
     

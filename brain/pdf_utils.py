@@ -1,7 +1,6 @@
 from pathlib import Path
 from langchain_community.document_loaders import PyPDFLoader
 
-
 def load_pdfs(data_dir: str = None) -> list[dict]:
     if data_dir is None:
         data_dir = str(Path(__file__).parent.parent / "data")
@@ -17,13 +16,16 @@ def load_pdfs(data_dir: str = None) -> list[dict]:
         try:
             loader = PyPDFLoader(str(pdf_file))
             pages = loader.load()
-            
+
+            topic = pdf_file.stem.lower()
+
             for i, page in enumerate(pages):
                 documents.append({
                     'content': page.page_content,
                     'metadata': {
                         'source': pdf_file.name,
                         'page': i + 1,
+                        'topic': topic,
                         **page.metadata
                     }
                 })
