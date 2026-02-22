@@ -204,7 +204,6 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
     if filters:
         search_kwargs["filter"] = filters
     
-    # Try to retrieve from ChromaDB
     try:
         retriever = vectorstore.as_retriever(search_kwargs=search_kwargs)
         # For langchain 0.1+, invoke returns a list of Documents
@@ -247,6 +246,7 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
         k_param=k_param
     )
 
+    #currenly using semantic_docs due to some failures with reranking. Will investigate and re-enable full reranking in next iteration
     reranked_docs = rerank_documents(
         docs=fused_docs,
         query=eq_str,

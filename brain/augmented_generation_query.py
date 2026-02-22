@@ -1,13 +1,17 @@
 import json
 from langchain_ollama import OllamaLLM
 
+from brain.router import extract_dynamic_filters
+
 from .config import LLM_MODEL, LLM_TEMPERATURE, DATA_DIR
 from .pdf_utils import load_pdfs
 from .ingest import fast_topic_search
 from .rag_brain import hybrid_retrieval
 from langchain_core.documents import Document
+from pathlib import Path
 
 session_chat_history = []
+_last_filters = {}
 
 def _run_fast_search(query: str, verbose: bool = False) -> list:
     documents = load_pdfs(DATA_DIR)
@@ -33,7 +37,8 @@ def _format_search_results_for_prompt(results: list) -> str:
             metadata = getattr(doc, "metadata", {})
             source = metadata.get("source", "Unknown")
             page = metadata.get("page", "?")
-            
+
+        source = Path(source).stem
         formatted.append(f"--- Document [{i}] ---\nSource File: {source} (Page {page})\nContent: {content}")
     
     return "\n\n".join(formatted)
@@ -42,15 +47,18 @@ def _format_search_results_for_prompt(results: list) -> str:
 def answer_question(query: str, formatted_docs: str, llm_model: str) -> str:
     llm = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
     prompt = f"""Answer the following question based on the provided documents.
+
 Question: {query}
+
 Documents:
 {formatted_docs}
 
 Instructions:
-- Provide a direct, concise answer
-- Use only information from the documents
-- If the answer isn't in the documents, say "I don't have enough information"
-Answer:"""
+- Provide a direct, concise answer (2-3 sentences max)
+- Use the provided documents as context
+- If the documents contain relevant information, use it
+- You may expand on the retrieved context to give a complete answer
+- Do NOT say "I don't have enough information" if the documents contain anything related to the query"""
     return llm.invoke(prompt)
 
 def summarize_documents(query: str, formatted_docs: str, llm_model: str) -> str:
@@ -124,10 +132,28 @@ Answer:"""
     return response
 
 def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool = False) -> dict:
+    global _last_filters
+    
     llm_model = llm_model or LLM_MODEL
 
-    if verbose: print(f"[DEBUG] Running hybrid retrieval for: '{query}'")
-    results = hybrid_retrieval(query, k=5, verbose=verbose)
+    dynamic_filters = extract_dynamic_filters(query, verbose=verbose)
+    
+    # If router found nothing, reuse the last successful filter
+    if not dynamic_filters and _last_filters:
+        dynamic_filters = _last_filters
+        if verbose:
+            print(f"[DEBUG] No filter found, reusing last: {dynamic_filters}")
+    
+    if dynamic_filters:
+        _last_filters = dynamic_filters  # Save for next query
+
+    if verbose:
+        print(f"[DEBUG] LLM Router built these filters: {dynamic_filters}")
+
+    if verbose:
+        print(f"[DEBUG] Running hybrid retrieval for: '{query}'")
+    
+    results = hybrid_retrieval(query, k=5, filters=dynamic_filters)
     
     if not results:
         error_msg = "I don't have enough information in the provided documents."
@@ -140,11 +166,12 @@ def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool =
 
     formatted_docs = _format_search_results_for_prompt(results)
     
-    if verbose: print(f"[DEBUG] Found {len(results)} chunks. Generating responses...")
+    if verbose:
+        print(f"[DEBUG] Found {len(results)} chunks. Generating responses...")
 
     return {
         'answer': answer_question(query, formatted_docs, llm_model),
         'summary': summarize_documents(query, formatted_docs, llm_model),
-        'citations': cite_documents(query, formatted_docs, llm_model), 
+        'citations': cite_documents(query, formatted_docs, llm_model),
         'detailed': detailed_answer(query, formatted_docs, llm_model)
     }

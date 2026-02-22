@@ -2,7 +2,8 @@ from brain.ingest import ingest_docs
 from brain.config import DATA_DIR, LLM_MODEL
 from agent.code_agent import CodeAgent
 from langchain_ollama import OllamaLLM
-from brain.augmented_generation_query import query_brain_comprehensive
+from brain.augmented_generation_query import query_brain_comprehensive, _last_filters
+
 
 def main():
     while True:
@@ -101,6 +102,7 @@ def main():
 
         elif choice == "4" or choice.lower() == "quit":
             print("Shutting down Aion RAG System. Goodbye!")
+            _last_filters.clear()
             break 
 
         else:
