@@ -4,7 +4,7 @@ from brain.router import extract_dynamic_filters
 
 from .config import LLM_MODEL, LLM_TEMPERATURE, DATA_DIR
 from .ingest import fast_topic_search
-from .rag_brain import hybrid_retrieval
+from .rag_brain import query_brain
 from .query_pipeline import evaluate_documents_with_llm
 from pathlib import Path
 
@@ -35,15 +35,24 @@ def _format_search_results_for_prompt(results: list) -> str:
     return "\n\n".join(formatted)
 
 
-def answer_question(query: str, formatted_docs: str, llm_model: str) -> str:
+def answer_question(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
     llm    = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+
+    recent_history = "\n".join([
+        f"{msg['role'].upper()}: {msg['content'][:200]}..."
+        for msg in session_chat_history[-3:] if len(msg['content']) > 50
+    ]) if session_chat_history else ""
+
     prompt = f"""You are an expert programming assistant with deep knowledge of software engineering.
 
 Using the provided context chunks, answer the question directly and concisely.
 - If the context contains the answer, use it and cite the source
 - If the context is partially relevant, supplement with your own knowledge
-- Never say "the documents do not contain" — just answer the question
+- If the documents don't contain enough information, say so honestly.
 - Keep it to 2-4 sentences maximum
+
+previous conversation (if relevant):
+{recent_history}
 
 Documents:
 {formatted_docs}
@@ -54,8 +63,15 @@ Answer:"""
     return llm.invoke(prompt)
 
 
-def summarize_documents(query: str, formatted_docs: str, llm_model: str) -> str:
+def summarize_documents(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
     llm    = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+
+    recent_history = "\n".join([
+        f"{msg['role'].upper()}: {msg['content'][:200]}..."
+        for msg in session_chat_history[-3:] if len(msg['content']) > 50
+    ]) if session_chat_history else ""
+
+
     prompt = f"""You are an expert programming assistant.
 
 Summarize the key points relevant to the question using the documents and your own knowledge.
@@ -65,6 +81,9 @@ Summarize the key points relevant to the question using the documents and your o
 - If the documents are thin on this topic, use your own expertise to fill the gaps
 - Maximum 3 bullet points
 
+previous conversation (if relevant):
+{recent_history}
+
 Documents:
 {formatted_docs}
 
@@ -73,13 +92,22 @@ Question: {query}
 Summary:"""
     return llm.invoke(prompt)
 
-def cite_documents(query: str, formatted_docs: str, llm_model: str) -> str:
+def cite_documents(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
     llm    = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
+
+    recent_history = "\n".join([
+        f"{msg['role'].upper()}: {msg['content'][:200]}..."
+        for msg in session_chat_history[-3:] if len(msg['content']) > 50
+    ]) if session_chat_history else ""
+
     prompt = f"""Extract only the citations that are directly relevant to answering this question.
 - Ignore chunks that are only loosely related
 - Format: [Book Title, Page X] "exact quote"
 - Maximum 3 citations
 - If a chunk is not directly about the question topic, skip it entirely
+
+previous conversation (if relevant):
+{recent_history}
 
 Documents:
 {formatted_docs}
@@ -90,10 +118,9 @@ Citations:"""
     return llm.invoke(prompt)
 
 
-def detailed_answer(query: str, formatted_docs: str, llm_model: str) -> str:
-    global session_chat_history
+def detailed_answer(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
     llm            = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
-    recent_history = session_chat_history[-5:]
+    recent_history = session_chat_history[-5:] if session_chat_history else []
 
     history_str = []
     for msg in recent_history:
@@ -124,12 +151,13 @@ Question: {query}
 Detailed Explanation:"""
 
     response = llm.invoke(prompt)
-    session_chat_history.append({"role": "User",      "content": query})
-    session_chat_history.append({"role": "Assistant", "content": response})
+    if session_chat_history is not None:
+        session_chat_history.append({"role": "User",      "content": query})
+        session_chat_history.append({"role": "Assistant", "content": response})
     return response
 
 
-def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool = False, raw_docs: list[dict] | None = None) -> dict:
+def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool = False, raw_docs: list[dict] | None = None, session_chat_history: list[dict] | None = None) -> dict:
     global _last_filters
 
     llm_model       = llm_model or LLM_MODEL
@@ -147,7 +175,7 @@ def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool =
         print(f"[DEBUG] LLM Router built these filters: {dynamic_filters}")
         print(f"[DEBUG] Running hybrid retrieval for: '{query}'")
 
-    results = hybrid_retrieval(query, k=5, filters=dynamic_filters, raw_docs=raw_docs)
+    results = query_brain(query, k=5, filters=dynamic_filters, raw_docs=raw_docs, verbose=verbose)
 
     if not results:
         error_msg = "I don't have enough information in the provided documents."
@@ -158,13 +186,13 @@ def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool =
             'detailed' : error_msg
         }
 
-    scores  = evaluate_documents_with_llm(query, results, llm_model, verbose=verbose)
-    results = [doc for doc, score in zip(results, scores) if score >= 2]
+    # scores  = evaluate_documents_with_llm(query, results, llm_model, verbose=verbose)
+    # results = [doc for doc, score in zip(results, scores) if score >= 2]
 
     if not results:
         if verbose:
             print("[DEBUG] All chunks filtered by relevance threshold, using top 2 unfiltered")
-        results = hybrid_retrieval(query, k=2, filters=dynamic_filters, raw_docs=raw_docs)
+        results = query_brain(query, k=2, filters=dynamic_filters, raw_docs=raw_docs, verbose=verbose)
 
     formatted_docs = _format_search_results_for_prompt(results)
 
@@ -172,8 +200,8 @@ def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool =
         print(f"[DEBUG] Found {len(results)} chunks. Generating responses...")
 
     return {
-        'answer'   : answer_question(query, formatted_docs, llm_model),
-        'summary'  : summarize_documents(query, formatted_docs, llm_model),
-        'citations': cite_documents(query, formatted_docs, llm_model),
-        'detailed' : detailed_answer(query, formatted_docs, llm_model)
+        'answer': answer_question(query, formatted_docs, llm_model, session_chat_history),
+        'summary': summarize_documents(query, formatted_docs, llm_model, session_chat_history),
+        'citations': cite_documents(query, formatted_docs, llm_model, session_chat_history),
+        'detailed': detailed_answer(query, formatted_docs, llm_model, session_chat_history)
     }

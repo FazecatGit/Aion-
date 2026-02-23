@@ -8,10 +8,10 @@ from brain.keyword_search import search_documents
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from .utils import pipe
+from .metrics import evaluate_retrieval
 from .prompts import STRICT_RAG_PROMPT
 from .config import (
-    DATA_DIR, INDEX_META_PATH, EMBEDDING_MODEL, LLM_MODEL, LLM_TEMPERATURE,
+    DATA_DIR, INDEX_META_PATH, EMBEDDING_MODEL, LLM_MODEL, LLM_TEMPERATURE, RERANK_BATCH_SIZE,
     RETRIEVAL_K, CHUNK_SIZE, CHUNK_OVERLAP, FUSION_MODE, FUSION_ALPHA, FUSION_K_PARAM,
     ENABLE_QUERY_SPELL_CORRECTION, ENABLE_QUERY_REWRITE, ENABLE_QUERY_EXPANSION,
     RETRIEVAL_CANDIDATE_MULTIPLIER, RERANK_METHOD, CROSS_ENCODER_MODEL, CHROMA_DIR
@@ -55,10 +55,17 @@ def _doc_key(doc: Document) -> tuple:
 def _match_filters(filters: dict | None) -> callable:
     if not filters:
         return lambda doc: True
-    
-    allowed_sources = set(filters.get("source", [])) if filters.get("source") else None
-    allowed_pages = set(filters.get("page", [])) if filters.get("page") else None
-    
+
+    def _extract_list(val):
+        if isinstance(val, dict):
+            return set(val.get("$in", []))
+        if isinstance(val, list):
+            return set(val)
+        return {val}
+
+    allowed_sources = _extract_list(filters["source"]) if filters.get("source") else None
+    allowed_pages   = _extract_list(filters["page"])   if filters.get("page")   else None
+
     def predicate(doc: Document) -> bool:
         meta = doc.metadata or {}
         if allowed_sources is not None and meta.get("source") not in allowed_sources:
@@ -66,9 +73,8 @@ def _match_filters(filters: dict | None) -> callable:
         if allowed_pages is not None and meta.get("page") not in allowed_pages:
             return False
         return True
-    
-    return predicate
 
+    return predicate
 
 def _filter_docs(docs: list[Document], filters: dict | None) -> list[Document]:
     return list(filter(_match_filters(filters), docs))
@@ -169,9 +175,19 @@ def _fuse_results(semantic_docs: list[Document], keyword_docs: list[Document], m
             seen.add(key)
     return result
 
-def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None = None,
-                     fusion_mode: str = "rrf", alpha: float = 0.5, k_param: int = 60,
-                     rerank_method: str = RERANK_METHOD, verbose: bool = False, raw_docs: list[dict] | None = None) -> list[Document]:
+def hybrid_retrieval(
+    question: str,
+    k: int = RETRIEVAL_K,
+    filters: dict | None = None,
+    fusion_mode: str = "rrf",
+    alpha: float = 0.5,
+    k_param: int = 60,
+    rerank_method: str = RERANK_METHOD,
+    cross_encoder_model: str = CROSS_ENCODER_MODEL,
+    batch_size: int = RERANK_BATCH_SIZE,
+    verbose: bool = False,
+    raw_docs: list[dict] | None = None,
+) -> list[Document]:
     if raw_docs is None:
         raw_docs = load_pdfs(DATA_DIR) 
     _validate_index_metadata()
@@ -246,27 +262,48 @@ def hybrid_retrieval(question: str, k: int = RETRIEVAL_K, filters: dict | None =
         k_param=k_param
     )
 
+    fused_docs = _filter_docs(fused_docs, filters) 
+
+    if verbose:
+        print(f"[DEBUG] Fused docs count after filtering: {len(fused_docs)}")
+
     reranked_docs = rerank_documents(
         docs=fused_docs,
         query=eq_str,
         method=rerank_method,
-        cross_encoder_model=CROSS_ENCODER_MODEL,
+        cross_encoder_model=cross_encoder_model,
+        batch_size=batch_size,
         verbose=verbose,
     )
     
     return reranked_docs[:k]
 
-def query_brain(question: str, verbose: bool = False, fusion_mode: str = None, alpha: float = None, k_param: int = None):
+def query_brain(
+    question: str,
+    verbose: bool = False,
+    fusion_mode: str = None,
+    alpha: float = None,
+    k_param: int = None,
+    k: int = RETRIEVAL_K,
+    filters: dict | None = None,
+    raw_docs: list[dict] | None = None,
+    debug_relevant: list[str] | None = None,
+) -> list[Document]:
     fusion_mode = fusion_mode or FUSION_MODE
-    alpha = alpha if alpha is not None else FUSION_ALPHA
-    k_param = k_param if k_param is not None else FUSION_K_PARAM
-    
+    alpha       = alpha    if alpha    is not None else FUSION_ALPHA
+    k_param     = k_param  if k_param  is not None else FUSION_K_PARAM
+
     docs = hybrid_retrieval(
         question,
+        k=k,
+        filters=filters,
+        raw_docs=raw_docs,
         fusion_mode=fusion_mode,
         alpha=alpha,
         k_param=k_param,
         rerank_method=RERANK_METHOD,
+        cross_encoder_model=CROSS_ENCODER_MODEL,
+        batch_size=RERANK_BATCH_SIZE,
         verbose=verbose,
     )
 
@@ -277,11 +314,9 @@ def query_brain(question: str, verbose: bool = False, fusion_mode: str = None, a
             print(d.page_content[:300])
             print("----")
 
-    llm = OllamaLLM(model=LLM_MODEL, temperature=LLM_TEMPERATURE)
-    
-    context = "\n\n".join([doc.page_content for doc in docs])
-    
-    result = STRICT_RAG_PROMPT.invoke({"context": context, "input": question})
-    llm_output = llm.invoke(result.to_string())
-    
-    return llm_output
+        if debug_relevant is not None:
+            retrieved_ids = [d.metadata.get("source", "") for d in docs]
+            scores = evaluate_retrieval(retrieved_ids, debug_relevant)
+            print(f"[DEBUG] precision={scores['precision']:.2f}  recall={scores['recall']:.2f}  f1={scores['f1']:.2f}")
+
+    return docs

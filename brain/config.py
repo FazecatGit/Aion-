@@ -42,6 +42,7 @@ RETRIEVAL_CANDIDATE_MULTIPLIER = int(os.getenv("RAG_RETRIEVAL_CANDIDATE_MULTIPLI
 # Reranking settings
 RERANK_METHOD = os.getenv("RAG_RERANK_METHOD", "keyword")  # "none", "keyword", "cross_encoder"
 CROSS_ENCODER_MODEL = os.getenv("RAG_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+RERANK_BATCH_SIZE = 32 # For cross-encoder reranking
 
 # ChromaDB config
 CHROMA_PERSIST_DIR = CHROMA_DIR		      # where vectors live

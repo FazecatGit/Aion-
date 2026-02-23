@@ -2,6 +2,7 @@
 
 from typing import Optional
 import json
+import numpy as np
 
 from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
@@ -101,10 +102,13 @@ def _cross_encoder_rerank_documents(
     docs: list[Document],
     query: str,
     cross_encoder_model: str,
+    batch_size: int = 32,
+    score_threshold: float = 0.0,
     verbose: bool = False,
 ) -> list[Document]:
     try:
         from sentence_transformers import CrossEncoder
+        import numpy as np
     except Exception:
         if verbose:
             print("Cross-encoder unavailable; falling back to keyword rerank.")
@@ -114,21 +118,30 @@ def _cross_encoder_rerank_documents(
         if cross_encoder_model not in _cross_encoder_cache:
             _cross_encoder_cache[cross_encoder_model] = CrossEncoder(cross_encoder_model)
         model = _cross_encoder_cache[cross_encoder_model]
+
         pairs  = [(query, (doc.page_content or "")[:2000]) for doc in docs]
-        scores = model.predict(pairs)
+        raw    = model.predict(pairs, batch_size=batch_size)
+        scores = 1 / (1 + np.exp(-np.array(raw)))  # sigmoid → 0-1
+
         ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
-        return [doc for _, doc in ranked]
+
+        if verbose:
+            for score, doc in ranked:
+                print(f"[RERANK] {score:.3f} → {doc.metadata.get('source', '')}")
+
+        return [doc for score, doc in ranked if score >= score_threshold]
+
     except Exception:
         if verbose:
             print("Cross-encoder scoring failed; falling back to keyword rerank.")
         return _keyword_rerank_documents(docs, query)
-
 
 def rerank_documents(
     docs: list[Document],
     query: str,
     method: str,
     cross_encoder_model: str,
+    batch_size: int = 32,
     verbose: bool = False,
 ) -> list[Document]:
     method_normalized = (method or "none").strip().lower()
@@ -137,7 +150,7 @@ def rerank_documents(
     if method_normalized == "keyword":
         return _keyword_rerank_documents(docs, query)
     if method_normalized == "cross_encoder":
-        return _cross_encoder_rerank_documents(docs, query, cross_encoder_model, verbose=verbose)
+        return _cross_encoder_rerank_documents(docs, query, cross_encoder_model, batch_size=batch_size, verbose=verbose)
 
     if verbose:
         print(f"Unknown rerank method '{method}'. Skipping rerank.")
@@ -152,14 +165,14 @@ def evaluate_documents_with_llm(
 ) -> list[int]:
     if not docs:
         return []
-    
+
     llm = OllamaLLM(model=llm_model, temperature=0)
-    
+
     formatted_docs = []
     for i, doc in enumerate(docs, 1):
         content = doc.page_content[:300]
         formatted_docs.append(f"{i}. {content}")
-    
+
     evaluation_prompt = f"""Rate how relevant each document/snippet is to this query on a 0-3 scale:
 
 Query: "{query}"
@@ -174,28 +187,37 @@ Scale:
 - 0: Not relevant
 
 Return ONLY the scores as a JSON list, nothing else. For example: [3, 1, 2, 0]"""
-    
+
     try:
         response = llm.invoke(evaluation_prompt)
         if response:
             response_text = response.strip()
             if verbose:
                 print(f"LLM evaluation response: {response_text}")
-            
+
             try:
                 if "[" in response_text and "]" in response_text:
                     json_str = response_text[response_text.find("["):response_text.rfind("]")+1]
                     scores = json.loads(json_str)
-                    if isinstance(scores, list) and len(scores) == len(docs):
-                        return [max(0, min(3, int(s))) for s in scores]
+
+                    if not isinstance(scores, list):
+                        raise ValueError("Scores is not a list")
+
+                    if len(scores) >= len(docs):          
+                        scores = scores[:len(docs)]
+                    else:                               
+                        scores = scores + [1] * (len(docs) - len(scores))
+
+                    return [max(0, min(3, int(s))) for s in scores]
+
             except (json.JSONDecodeError, ValueError):
                 if verbose:
                     print("Failed to parse LLM scores as JSON")
-        
+
         if verbose:
             print("Falling back to neutral scores (all 1s)")
         return [1] * len(docs)
-    
+
     except Exception as e:
         if verbose:
             print(f"LLM evaluation error: {e}")

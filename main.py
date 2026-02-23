@@ -4,7 +4,7 @@ from brain.ingest import ingest_docs
 from brain.config import DATA_DIR, LLM_MODEL
 from agent.code_agent import CodeAgent
 from langchain_ollama import OllamaLLM
-from brain.augmented_generation_query import query_brain_comprehensive, _last_filters
+from brain.augmented_generation_query import query_brain_comprehensive, _last_filters, session_chat_history
 from brain.pdf_utils import load_pdfs
 
 warnings.filterwarnings("ignore", message=".*Odd-length string.*")
@@ -37,6 +37,7 @@ def main():
             while True:
                 q = input("Ask: ").strip()
                 if q.lower() == "quit":
+                    session_chat_history.clear()
                     print("Returning to main menu...")
                     break
                 
@@ -46,7 +47,7 @@ def main():
                     continue
 
                 if q:
-                    results = query_brain_comprehensive(q, verbose=verbose, raw_docs=raw_docs)
+                    results = query_brain_comprehensive(q, verbose=verbose, raw_docs=raw_docs, session_chat_history=session_chat_history)
                     print("\n" + "=" * 50)
                     print("\n DIRECT ANSWER\n")
                     print(results["answer"])
@@ -90,7 +91,7 @@ def main():
                 print("\nProcessing your request...\n")
 
                 try:
-                    agent.edit_code(path=filepath, instruction=instruction, dry_run=True, use_rag=use_rag)
+                    agent.edit_code(path=filepath, instruction=instruction, dry_run=True, use_rag=use_rag, session_chat_history=session_chat_history)
                 except Exception as e:
                     print(f"An error occurred: {e}")
                     continue
@@ -99,7 +100,7 @@ def main():
                 confirm = input("\nDo you want to apply these changes? (y/n): ").strip().lower()
                 if confirm == "y":
                     try:
-                        agent.edit_code(path=filepath, instruction=instruction, dry_run=False, use_rag=use_rag)
+                        agent.edit_code(path=filepath, instruction=instruction, dry_run=False, use_rag=use_rag, session_chat_history=session_chat_history)
                         print("Edit applied successfully.")
                     except Exception as e:
                         print(f"Failed to apply edit: {e}")
