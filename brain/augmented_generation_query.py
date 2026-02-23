@@ -1,3 +1,5 @@
+import asyncio
+
 from langchain_ollama import OllamaLLM
 
 from brain.router import extract_dynamic_filters
@@ -35,7 +37,7 @@ def _format_search_results_for_prompt(results: list) -> str:
     return "\n\n".join(formatted)
 
 
-def answer_question(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
+async def answer_question(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
     llm    = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
 
     recent_history = "\n".join([
@@ -60,10 +62,10 @@ Documents:
 Question: {query}
 
 Answer:"""
-    return llm.invoke(prompt)
+    return await llm.ainvoke(prompt)
 
 
-def summarize_documents(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
+async def summarize_documents(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
     llm    = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
 
     recent_history = "\n".join([
@@ -90,9 +92,9 @@ Documents:
 Question: {query}
 
 Summary:"""
-    return llm.invoke(prompt)
+    return await llm.ainvoke(prompt)
 
-def cite_documents(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
+async def cite_documents(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
     llm    = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
 
     recent_history = "\n".join([
@@ -115,10 +117,10 @@ Documents:
 Question: {query}
 
 Citations:"""
-    return llm.invoke(prompt)
+    return await llm.ainvoke(prompt)
 
 
-def detailed_answer(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
+async def detailed_answer(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
     llm            = OllamaLLM(model=llm_model, temperature=LLM_TEMPERATURE)
     recent_history = session_chat_history[-5:] if session_chat_history else []
 
@@ -150,14 +152,14 @@ Question: {query}
 
 Detailed Explanation:"""
 
-    response = llm.invoke(prompt)
+    response = await llm.ainvoke(prompt)
     if session_chat_history is not None:
         session_chat_history.append({"role": "User",      "content": query})
         session_chat_history.append({"role": "Assistant", "content": response})
     return response
 
 
-def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool = False, raw_docs: list[dict] | None = None, session_chat_history: list[dict] | None = None) -> dict:
+async def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool = False, raw_docs: list[dict] | None = None, session_chat_history: list[dict] | None = None) -> dict:
     global _last_filters
 
     llm_model       = llm_model or LLM_MODEL
@@ -175,7 +177,7 @@ def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool =
         print(f"[DEBUG] LLM Router built these filters: {dynamic_filters}")
         print(f"[DEBUG] Running hybrid retrieval for: '{query}'")
 
-    results = query_brain(query, k=5, filters=dynamic_filters, raw_docs=raw_docs, verbose=verbose)
+    results = await query_brain(query, k=5, filters=dynamic_filters, raw_docs=raw_docs, verbose=verbose)
 
     if not results:
         error_msg = "I don't have enough information in the provided documents."
@@ -192,16 +194,25 @@ def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool =
     if not results:
         if verbose:
             print("[DEBUG] All chunks filtered by relevance threshold, using top 2 unfiltered")
-        results = query_brain(query, k=2, filters=dynamic_filters, raw_docs=raw_docs, verbose=verbose)
+        results =  await query_brain(query, k=2, filters=dynamic_filters, raw_docs=raw_docs, verbose=verbose)
 
     formatted_docs = _format_search_results_for_prompt(results)
 
     if verbose:
         print(f"[DEBUG] Found {len(results)} chunks. Generating responses...")
 
+    coros = [
+        answer_question(query, formatted_docs, llm_model, session_chat_history),
+        summarize_documents(query, formatted_docs, llm_model, session_chat_history),
+        cite_documents(query, formatted_docs, llm_model, session_chat_history),
+        detailed_answer(query, formatted_docs, llm_model, session_chat_history)
+    ]
+
+    answer, summary, citations, detailed = await asyncio.gather(*coros)
+
     return {
-        'answer': answer_question(query, formatted_docs, llm_model, session_chat_history),
-        'summary': summarize_documents(query, formatted_docs, llm_model, session_chat_history),
-        'citations': cite_documents(query, formatted_docs, llm_model, session_chat_history),
-        'detailed': detailed_answer(query, formatted_docs, llm_model, session_chat_history)
+        'answer': answer,
+        'summary': summary,
+        'citations': citations,
+        'detailed': detailed
     }

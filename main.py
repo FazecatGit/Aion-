@@ -1,3 +1,4 @@
+import asyncio
 import warnings
 
 from brain.ingest import ingest_docs
@@ -10,7 +11,7 @@ from brain.pdf_utils import load_pdfs
 warnings.filterwarnings("ignore", message=".*Odd-length string.*")
 warnings.filterwarnings("ignore", message=".*invalid hex string.*")
 
-def main():
+async def main():
     raw_docs = None
     while True:
         print("Aion RAG System")
@@ -47,7 +48,7 @@ def main():
                     continue
 
                 if q:
-                    results = query_brain_comprehensive(q, verbose=verbose, raw_docs=raw_docs, session_chat_history=session_chat_history)
+                    results = await query_brain_comprehensive(q, verbose=verbose, raw_docs=raw_docs, session_chat_history=session_chat_history)
                     print("\n" + "=" * 50)
                     print("\n DIRECT ANSWER\n")
                     print(results["answer"])
@@ -116,6 +117,6 @@ def main():
         else:
             print("Invalid choice")
 
-
+    
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

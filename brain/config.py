@@ -49,3 +49,6 @@ CHROMA_PERSIST_DIR = CHROMA_DIR		      # where vectors live
 CHROMA_COLLECTION_NAME = "aion-code"     # collection for code docs
 CHROMA_CHUNK_SIZE = 512                 # optional, for new ingest
 CHROMA_CHUNK_OVERLAP = 64               # optional for new ingest
+
+# fitler settings for query pipeline
+USE_SMART_K = True

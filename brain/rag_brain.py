@@ -14,11 +14,29 @@ from .config import (
     DATA_DIR, INDEX_META_PATH, EMBEDDING_MODEL, LLM_MODEL, LLM_TEMPERATURE, RERANK_BATCH_SIZE,
     RETRIEVAL_K, CHUNK_SIZE, CHUNK_OVERLAP, FUSION_MODE, FUSION_ALPHA, FUSION_K_PARAM,
     ENABLE_QUERY_SPELL_CORRECTION, ENABLE_QUERY_REWRITE, ENABLE_QUERY_EXPANSION,
-    RETRIEVAL_CANDIDATE_MULTIPLIER, RERANK_METHOD, CROSS_ENCODER_MODEL, CHROMA_DIR
+    RETRIEVAL_CANDIDATE_MULTIPLIER, RERANK_METHOD, CROSS_ENCODER_MODEL, CHROMA_DIR, USE_SMART_K
 )
 from .pdf_utils import load_pdfs
 from .query_pipeline import enhance_query_for_retrieval, rerank_documents
 
+def get_dynamic_k(question: str) -> int:
+    word_count = len(question.split())
+    concepts = len(set(w for w in question.split() if len(w) > 4))
+    return 8 if concepts >= 3 else 5 if word_count > 10 else 3
+
+async def get_smart_k(question: str, llm_model) -> int:
+    prompt = f"""Classify query complexity 1-3 ONLY with this number:
+
+1 = if the topic of the word is basic that is considered easy in the world of progamming
+2 = if the topic of the word is intermediate that is considered common in the world of progamming 
+3 = if the topic of the word is advanced that is considered difficult in the world of progamming
+
+Query: "{question}"
+
+Just the number (1, 2, or 3):"""
+  
+    complexity = await llm_model.ainvoke(prompt)
+    return {1:3, 2:5, 3:8}.get(int(complexity), 5)
 
 def _load_index_metadata() -> dict:
     with open(INDEX_META_PATH, "r", encoding="utf-8") as f:
@@ -175,7 +193,7 @@ def _fuse_results(semantic_docs: list[Document], keyword_docs: list[Document], m
             seen.add(key)
     return result
 
-def hybrid_retrieval(
+async def hybrid_retrieval(
     question: str,
     k: int = RETRIEVAL_K,
     filters: dict | None = None,
@@ -211,8 +229,15 @@ def hybrid_retrieval(
     else:
         eq_str = effective_question
 
-    candidate_multiplier = max(1, RETRIEVAL_CANDIDATE_MULTIPLIER)
-    candidate_k = max(k * candidate_multiplier, k)
+    candidate_multiplier = max(1, RETRIEVAL_CANDIDATE_MULTIPLIER)     
+
+    if USE_SMART_K:
+        llm = OllamaLLM(model=LLM_MODEL)  
+        base_k = await get_smart_k(question, llm)
+    else:
+        base_k = get_dynamic_k(question)
+
+    candidate_k = max(base_k * candidate_multiplier, base_k) 
 
     if verbose:
         print(f"[DEBUG] candidate_k: {candidate_k}, effective_question: '{eq_str}'")
@@ -278,7 +303,7 @@ def hybrid_retrieval(
     
     return reranked_docs[:k]
 
-def query_brain(
+async def query_brain(
     question: str,
     verbose: bool = False,
     fusion_mode: str = None,
@@ -293,7 +318,7 @@ def query_brain(
     alpha       = alpha    if alpha    is not None else FUSION_ALPHA
     k_param     = k_param  if k_param  is not None else FUSION_K_PARAM
 
-    docs = hybrid_retrieval(
+    docs = await hybrid_retrieval(
         question,
         k=k,
         filters=filters,
