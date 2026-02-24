@@ -1,22 +1,24 @@
-import json
+from rank_bm25 import BM25Okapi
+import json, pickle
+from typing import Any, List, Dict
+from collections import Counter
+import re
+import os
+import shutil
+
 from datetime import datetime
 from pathlib import Path
-from unittest import loader
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
-import os 
-import shutil
 
 from .utils import pipe
 from .config import CHROMA_DIR, DATA_DIR, EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, INDEX_META_PATH, LLM_MODEL
 from .pdf_utils import load_pdfs
-from .keyword_search import search_documents
-from langchain_ollama import OllamaLLM
+
 
 TOPIC_MAP_PATH = "cache/topic_map.json"
-
 
 def _write_index_metadata(doc_count: int) -> None:
     metadata = {
@@ -29,78 +31,77 @@ def _write_index_metadata(doc_count: int) -> None:
     }
     with open(INDEX_META_PATH, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, sort_keys=True)
-    
 
-def generate_tech_synonyms(topic: str) -> list[str]:
-    llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
-    prompt = f"List exactly 5 programming-related synonyms or related concepts for the word '{topic}'. Output ONLY a comma-separated list, nothing else."
-    
-    response = llm.invoke(prompt)
-    return [word.strip().lower() for word in response.split(",")]
+def extract_keywords_from_corpus(docs: List[Any]) -> Dict[str, int]:
+    stop_words = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 'be', 'been',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should',
+        'of', 'in', 'to', 'for', 'with', 'by', 'from', 'as', 'at', 'this', 'that',
+        'it', 'its', 'if', 'can', 'we', 'you', 'your', 'them', 'their', 'more', 'than',
+        'also', 'anyway', 'anything', 'anything else', 'anyone', 'anything at all',
+        'anything in the world', 'anything like that', 'anything more', 'anything other than',
+        'anything similar', 'anything to', 'anything under any circumstances', 'anything whatever',
+        'anything within reason', 'anything you can think of', 'anything you could imagine',
+        'anything whatsoever', 'anybody', 'anybody else', 'anybody in the world', 'anybody like that',
+        'anybody more', 'anybody other than', 'anybody similar', 'anybody to', 'anybody under any circumstances',
+        'anybody whatever', 'anybody within reason', 'anybody you can think of', 'anybody you could imagine',
+        'anybody whatsoever', 
+    }
 
-def ingest_docs():
-    loader = DirectoryLoader(DATA_DIR,  glob="**/*.pdf", loader_cls=PyPDFLoader)
+    tokenized_docs = [doc.page_content.lower().split() for doc in docs]
+    all_tokens = [token for doc in tokenized_docs 
+                  for token in doc if token not in stop_words and len(token) > 2]
+    
+    word_freq = Counter(all_tokens).most_common(250)
+    
+    scores = [freq for _, freq in word_freq]
+    
+    return dict(zip([w for w, f in word_freq], scores))
+
+async def ingest_docs():
+    if os.path.exists(CHROMA_DIR):
+        print(f"Clearing old Chroma database at {CHROMA_DIR}...")
+        shutil.rmtree(CHROMA_DIR)
+
+    loader = DirectoryLoader(DATA_DIR, glob="**/*.pdf", loader_cls=PyPDFLoader)
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-
     splits = pipe(
         loader.load(),
         lambda docs: splitter.split_documents(docs)
     )
-    if os.path.exists(CHROMA_DIR):
-        print("Clearing old Chroma database...")
-        shutil.rmtree(CHROMA_DIR)
 
-    print(f"Creating new Chroma database with {len(splits)} chunks...")
-    
-    _ = Chroma.from_documents(
-        documents=splits, 
-        embedding=embeddings, 
-        persist_directory=CHROMA_DIR
-    )
-    
+    print(f"Loaded {len(splits)} chunks")
+
+    print("Extracting top keywords from corpus...")
+    top_keywords = extract_keywords_from_corpus(splits)
+    print(f"Found {len(top_keywords)} key topics...")
+
+    tokenized_docs = [doc.page_content.lower().split() for doc in splits] 
+    bm25_idx = BM25Okapi(tokenized_docs)
+    pickle.dump(bm25_idx, Path("cache/global_bm25.pkl").open('wb'))
+    print(f"Built BM25 index: {len(splits)} chunks")
+
+    with open(TOPIC_MAP_PATH, 'w') as f:
+        json.dump(top_keywords, f, indent=2)
+
+    print("Building Chroma vector DB...")
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+
+    cleaned_splits = []
+    for doc in splits:
+        clean_doc = doc.copy()
+        clean_doc.metadata = {k: v for k, v in doc.metadata.items() 
+                            if k not in ['source', 'file_path']} 
+        cleaned_splits.append(clean_doc)
+
+    Chroma.from_documents(cleaned_splits, embedding=embeddings, persist_directory=CHROMA_DIR)
+    with Path("cache/splits.pkl").open('wb') as f:
+        pickle.dump(splits, f)  # Use original splits (not cleaned)
+    print("✓ Cached splits.pkl for BM25")
+
     _write_index_metadata(len(splits))
 
     documents = load_pdfs(DATA_DIR)
-    topic_synonyms = {}
-    if Path(TOPIC_MAP_PATH).exists():
-        with open(TOPIC_MAP_PATH, "r", encoding="utf-8") as f:
-            topic_synonyms = json.load(f)
 
-    for doc in documents:
-        topic = doc['metadata'].get('topic', '').lower()
-        if topic and topic not in topic_synonyms:
-            print(f"Asking Ollama to map synonyms for new topic: {topic}...")
-            topic_synonyms[topic] = generate_tech_synonyms(topic)
-
-    with open(TOPIC_MAP_PATH, "w", encoding="utf-8") as f:
-        json.dump(topic_synonyms, f, indent=2)
-
-    print(f"Ingested {len(splits)} vector chunks and mapped {len(topic_synonyms)} topics.")
-    return documents, topic_synonyms
-
-def fast_topic_search(query: str, documents: list):
-    try:
-        with open(TOPIC_MAP_PATH, "r", encoding="utf-8") as f:
-            topic_synonyms = json.load(f)
-    except FileNotFoundError:
-        print("Topic map not found. Please run ingest_docs() first.")
-        return []
-
-    expanded_topics = set()
-    for topic, synonyms in topic_synonyms.items():
-        if topic in query.lower():
-            expanded_topics.add(topic)
-            expanded_topics.update(synonyms)
-            
-    relevant_chunks = []
-    if expanded_topics:
-        relevant_chunks = [doc for doc in documents if doc['metadata'].get('topic') in expanded_topics]
-    
-    if not relevant_chunks:
-        relevant_chunks = documents
-
-    results = search_documents(query, relevant_chunks, n_results=5)
-        
-    return results
-
+    print(f"Ingest complete: {len(splits)} chunks → {len(documents)} PDFs, {len(top_keywords)} keywords, BM25 ready")
+    return documents, top_keywords

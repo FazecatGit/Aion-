@@ -1,6 +1,7 @@
 import asyncio
 import warnings
 
+from brain.fast_search import initialize_bm25
 from brain.ingest import ingest_docs
 from brain.config import DATA_DIR, LLM_MODEL
 from agent.code_agent import CodeAgent
@@ -12,7 +13,8 @@ warnings.filterwarnings("ignore", message=".*Odd-length string.*")
 warnings.filterwarnings("ignore", message=".*invalid hex string.*")
 
 async def main():
-    raw_docs = None
+    raw_docs = load_pdfs(DATA_DIR)
+    initialize_bm25(raw_docs)
     while True:
         print("Aion RAG System")
         print("=" * 50)
@@ -25,7 +27,7 @@ async def main():
         choice = input().strip()
         if choice == "1":
             # topic_index not neeeded yet - just load topic synonyms as part of ingest_docs
-            documents, topic_synonyms = ingest_docs()
+            documents, topic_synonyms = await ingest_docs()
             raw_docs = load_pdfs(DATA_DIR)
             print("\nIngestion complete. Topics loaded:")
             print("Available topics:", list(topic_synonyms.keys()))

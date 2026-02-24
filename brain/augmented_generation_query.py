@@ -2,10 +2,12 @@ import asyncio
 
 from langchain_ollama import OllamaLLM
 
+from brain.pdf_utils import load_pdfs
+from brain.route_execution import route_execution_mode
 from brain.router import extract_dynamic_filters
 
 from .config import LLM_MODEL, LLM_TEMPERATURE, DATA_DIR
-from .ingest import fast_topic_search
+from .fast_search import fast_topic_search
 from .rag_brain import query_brain
 from .query_pipeline import evaluate_documents_with_llm
 from pathlib import Path
@@ -159,47 +161,78 @@ Detailed Explanation:"""
     return response
 
 
-async def query_brain_comprehensive(query: str, llm_model: str = None, verbose: bool = False, raw_docs: list[dict] | None = None, session_chat_history: list[dict] | None = None) -> dict:
+async def fast_pipeline(query: str, llm_model: str):
+    results = fast_topic_search(query)
+    top_docs = results[:3]
+    formatted_docs = _format_search_results_for_prompt(top_docs)
+
+    citations_list = [f"[{i+1}] {doc.metadata.get('source', 'Unknown')}" 
+                     for i, doc in enumerate(top_docs)]
+    citations = " | ".join(citations_list)
+
+    llm = OllamaLLM(model=llm_model, temperature=0)
+    
+    prompt = f"""Answer concisely (max 4 sentences). Include code example if relevant.
+
+Documents:
+{formatted_docs}
+
+Question: {query}
+Cite using [1], [2], [3] after relevant sentences."""
+    
+    answer = await llm.ainvoke(prompt)
+    
+    summary = (answer.split('.')[0] + "..." if '.' in answer else answer[:100] + "...")
+    detailed = f"BM25 top: {results[0].metadata.get('score', 'N/A'):.1f}, {len(results)} chunks"
+
+    return {
+        "answer": answer,
+        "summary": summary,
+        "citations": citations, 
+        "detailed": detailed
+    }
+
+async def deep_pipeline(
+    query,
+    llm_model,
+    verbose=False,
+    raw_docs=None,
+    session_chat_history=None
+):
     global _last_filters
 
-    llm_model       = llm_model or LLM_MODEL
     dynamic_filters = extract_dynamic_filters(query, verbose=verbose)
 
     if not dynamic_filters and _last_filters:
         dynamic_filters = _last_filters
         if verbose:
             print(f"[DEBUG] No filter found, reusing last: {dynamic_filters}")
-
-    if dynamic_filters:
+    else:
         _last_filters = dynamic_filters
 
     if verbose:
-        print(f"[DEBUG] LLM Router built these filters: {dynamic_filters}")
         print(f"[DEBUG] Running hybrid retrieval for: '{query}'")
 
-    results = await query_brain(query, k=5, filters=dynamic_filters, raw_docs=raw_docs, verbose=verbose)
+    raw_docs = raw_docs or load_pdfs(DATA_DIR)
+
+    results = await query_brain(
+        question=query,
+        k=5,
+        filters=dynamic_filters,
+        raw_docs=raw_docs,
+        verbose=verbose
+    )
 
     if not results:
         error_msg = "I don't have enough information in the provided documents."
         return {
-            'answer'   : error_msg,
-            'summary'  : error_msg,
-            'citations': "None",
-            'detailed' : error_msg
+            "answer": error_msg,
+            "summary": error_msg,
+            "citations": "None",
+            "detailed": error_msg
         }
 
-    # scores  = evaluate_documents_with_llm(query, results, llm_model, verbose=verbose)
-    # results = [doc for doc, score in zip(results, scores) if score >= 2]
-
-    if not results:
-        if verbose:
-            print("[DEBUG] All chunks filtered by relevance threshold, using top 2 unfiltered")
-        results =  await query_brain(query, k=2, filters=dynamic_filters, raw_docs=raw_docs, verbose=verbose)
-
     formatted_docs = _format_search_results_for_prompt(results)
-
-    if verbose:
-        print(f"[DEBUG] Found {len(results)} chunks. Generating responses...")
 
     coros = [
         answer_question(query, formatted_docs, llm_model, session_chat_history),
@@ -211,8 +244,34 @@ async def query_brain_comprehensive(query: str, llm_model: str = None, verbose: 
     answer, summary, citations, detailed = await asyncio.gather(*coros)
 
     return {
-        'answer': answer,
-        'summary': summary,
-        'citations': citations,
-        'detailed': detailed
+        "answer": answer,
+        "summary": summary,
+        "citations": citations,
+        "detailed": detailed
     }
+
+async def query_brain_comprehensive(
+    query: str,
+    llm_model: str = None,
+    verbose: bool = False,
+    raw_docs: list[dict] | None = None,
+    session_chat_history: list[dict] | None = None
+) -> dict:
+
+    llm_model = llm_model or LLM_MODEL
+
+    mode = route_execution_mode(query)
+
+    if verbose:
+        print(f"[ROUTER] Execution mode: {mode}")
+
+    if mode == "fast":
+        return await fast_pipeline(query, llm_model)
+
+    return await deep_pipeline(
+        query=query,
+        llm_model=llm_model,
+        verbose=verbose,
+        raw_docs=raw_docs,
+        session_chat_history=session_chat_history
+    )

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from operator import itemgetter
 
+from brain.fast_search import fast_topic_search
 from brain.keyword_search import search_documents
 #from .ingest import fast_topic_search
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
@@ -208,7 +209,26 @@ async def hybrid_retrieval(
 ) -> list[Document]:
     if raw_docs is None:
         raw_docs = load_pdfs(DATA_DIR) 
+    
     _validate_index_metadata()
+
+    print(f"[DEBUG] Running fast topic pre-filter")
+    bm25_results = fast_topic_search(question)
+    
+    if len(bm25_results) >= 5:
+        print("[DEBUG] BM25 sufficient - skipping Chroma!")
+        reranked_docs = rerank_documents(
+            docs=bm25_results[:k*2],
+            query=question,
+            method=rerank_method,
+            cross_encoder_model=cross_encoder_model,
+            batch_size=batch_size,
+            verbose=verbose,
+        )
+        return reranked_docs[:k]
+    
+    print("[DEBUG] BM25 insufficient, running full hybrid")
+
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
     vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
     

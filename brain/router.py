@@ -2,6 +2,7 @@ import os
 import json
 from pathlib import Path
 from langchain_ollama import OllamaLLM
+from brain.fast_search import fast_topic_search
 from .config import LLM_MODEL, DATA_DIR
 
 _KEYWORD_CACHE = None

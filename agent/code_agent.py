@@ -4,7 +4,7 @@ from langchain_ollama import OllamaLLM
 
 from brain.config import LLM_MODEL, DATA_DIR
 from brain.pdf_utils import load_pdfs
-from brain.ingest import fast_topic_search
+from brain.fast_search import fast_topic_search
 from db.db_reader import get_code_documents
 from .tools import read_file, write_file, run_git_command, show_diff, run_python_file, run_shell_command, list_files
 
