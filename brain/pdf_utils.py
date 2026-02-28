@@ -17,7 +17,6 @@ def load_pdfs(data_dir: str = None, use_cache: bool = True) -> List[dict]:
     documents = []
     data_path = Path(data_dir)
 
-    # quick load from cached splits if available
     cache_path = Path("cache/splits.pkl")
     if use_cache and cache_path.exists():
         try:

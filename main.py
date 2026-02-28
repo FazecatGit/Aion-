@@ -5,6 +5,7 @@ from brain.fast_search import initialize_bm25
 from brain.ingest import ingest_docs
 from brain.config import DATA_DIR, LLM_MODEL
 from agent.code_agent import CodeAgent
+from agent.tools import write_file
 from langchain_ollama import OllamaLLM
 from brain.augmented_generation_query import query_brain_comprehensive, _last_filters, session_chat_history
 from brain.pdf_utils import load_pdfs
@@ -94,20 +95,25 @@ async def main():
                 print("\nProcessing your request...\n")
 
                 try:
-                    agent.edit_code(path=filepath, instruction=instruction, dry_run=True, use_rag=use_rag, session_chat_history=session_chat_history)
+                    # Run LLM once in dry-run mode to produce the proposed edit
+                    new_source = agent.edit_code(path=filepath, instruction=instruction, dry_run=True, use_rag=use_rag, session_chat_history=session_chat_history)
                 except Exception as e:
                     print(f"An error occurred: {e}")
                     continue
 
-
                 confirm = input("\nDo you want to apply these changes? (y/n): ").strip().lower()
                 if confirm == "y":
                     try:
-                        agent.edit_code(path=filepath, instruction=instruction, dry_run=False, use_rag=use_rag, session_chat_history=session_chat_history)
+                        print(f"[DEBUG] Writing to: {filepath}")
+                        print(f"[DEBUG] Content length: {len(new_source)} chars")
+                        write_file(filepath, new_source)
+                        from agent.tools import read_file
+                        verify = read_file(filepath)
+                        print(f"[DEBUG] File now has {len(verify)} chars on disk")
                         print("Edit applied successfully.")
                     except Exception as e:
                         print(f"Failed to apply edit: {e}")
-                else:                
+                else:
                     print("Edit discarded.")
 
 
