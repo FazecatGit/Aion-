@@ -76,17 +76,29 @@ async def main():
                 print(f"Could not initialize agent: {e}")
                 continue
 
+            current_filepath = None
             while True:
 
-                filepath = input("\nEnter specific file to edit (e.g., main.py) or 'quit': ").strip()
-                if filepath.lower() == "quit":
+                # ask for the file only once; reuse `current_filepath` thereafter
+                if current_filepath is None:
+                    filepath = input("\nEnter specific file to edit (e.g., main.py) or 'quit': ").strip()
+                    if filepath.lower() == "quit":
+                        print("Exiting Code Agent mode. Returning to main menu...")
+                        break
+                    if not filepath:
+                        continue
+                    current_filepath = filepath
+
+                # show which file is in use and accept instruction
+                print(f"\nUsing file: {current_filepath}")
+                instruction = input("Enter your instruction for the code edit (type 'change' to pick another, 'quit' to return): ").strip()
+                if not instruction:
+                    continue
+                if instruction.lower() == "quit":
                     print("Exiting Code Agent mode. Returning to main menu...")
                     break
-                if not filepath:
-                    continue
-
-                instruction = input("Enter your instruction for the code edit: ").strip()
-                if not instruction:
+                if instruction.lower() == "change":
+                    current_filepath = None
                     continue
                     
                 use_rag_input = input("Search your PDFs for context to help write this code? (y/n): ").strip().lower()
