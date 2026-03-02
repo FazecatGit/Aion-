@@ -209,7 +209,7 @@ def apply_block_to_lines(source_lines, search_text, replace_text):
                     matched += 1
                 else:
                     break
-            return best_idx, get_replace(best_idx), max(1, matched)
+            return best_idx, get_replace(best_idx), n
 
     # 4. Fuzzy difflib fallback
     try:
@@ -219,9 +219,7 @@ def apply_block_to_lines(source_lines, search_text, replace_text):
         match = sm.find_longest_match(0, len(source_str), 0, len(search_str))
         if match.size > 40:
             start_line = source_str[:match.a].count('\n')
-            matched_substr = source_str[match.a: match.a + match.size]
-            matched_lines = matched_substr.count('\n') + 1
-            return start_line, get_replace(start_line), matched_lines
+            return start_line, get_replace(start_line), n
     except Exception:
         logger.debug("Fuzzy matching failed: %s", traceback.format_exc())
 

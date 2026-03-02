@@ -68,7 +68,8 @@ class CodeAgent:
         dry_run: bool = True,
         use_rag: bool = False,
         session_chat_history: Optional[List[Dict[str, str]]] = None,
-        rerank_method: str = "cross_encoder"
+        rerank_method: str = "cross_encoder",
+        max_chunks: Optional[int] = None
     ) -> str:
         """Edit code in a file based on instruction using LLM.
         
@@ -92,7 +93,18 @@ class CodeAgent:
         MAX_BLOCK_RATIO = 0.6
 
         # Compute multi_func_hint once, always defined
-        multi_func_hint = len(re.findall(r"\b\w+\(\)", instruction)) >= 2
+        # Triggers on: multiple `word()` patterns, multiple quoted instructions,
+        # numbered steps, or multiple "X function" / "X method" mentions
+        _func_call_matches = re.findall(r"\b\w+\(\)", instruction)
+        _quoted_instructions = re.findall(r'"[^"]{10,}"', instruction)
+        _numbered_steps = re.findall(r'(?:^|\n)\s*\d+[\.\)]\s+\S', instruction)
+        _func_name_mentions = re.findall(r'\b(?:the\s+)?(\w+)\s+(?:function|method)\b', instruction, re.IGNORECASE)
+        multi_func_hint = (
+            len(_func_call_matches) >= 2
+            or len(_quoted_instructions) >= 2
+            or len(_numbered_steps) >= 2
+            or len(set(_func_name_mentions)) >= 2
+        )
 
         # --- Build syntax/runtime error notes ---
         syntax_errors = collect_syntax_errors(file_source, path) if is_python else []
@@ -110,7 +122,9 @@ class CodeAgent:
             use_rag=use_rag,
             session_chat_history=session_chat_history,
             edit_log=self.edit_log,
-            rerank_method=rerank_method
+            rerank_method=rerank_method,
+            file_source=file_source,
+            max_chunks=max_chunks
         )
 
         # Only build runtime errors if no syntax errors were found
@@ -182,24 +196,36 @@ class CodeAgent:
             
             # When fixing multiple functions, instruct LLM to output multiple blocks
             if multi_func_hint:
-                # Extract function names from instruction for clarity
+                # Build a descriptive label list from whatever hint form was detected
                 func_matches = re.findall(r'\b(\w+)\(\)', instruction)
-                func_count = len(func_matches)
-                func_names = ", ".join(func_matches) if func_matches else "listed functions"
-                
+                quoted_items = re.findall(r'"([^"]{5,})"', instruction)
+                func_name_mentions = re.findall(r'\b(?:the\s+)?(\w+)\s+(?:function|method)\b', instruction, re.IGNORECASE)
+
+                if quoted_items:
+                    task_labels = quoted_items
+                elif func_matches:
+                    task_labels = [f"{n}()" for n in func_matches]
+                elif func_name_mentions:
+                    task_labels = list(dict.fromkeys(func_name_mentions))  # deduplicated, preserving order
+                else:
+                    task_labels = ["each fix listed in the instruction"]
+
+                task_count = len(task_labels)
+                task_list = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(task_labels))
+
                 block_instruction = (
-                    f"Now produce ONE SEARCH/REPLACE block for EACH of the {func_count} functions: {func_names}\n"
-                    f"You MUST output {func_count} separate blocks — one COMPLETE block for each function.\n"
-                    "For EACH function, output BOTH the SEARCH and REPLACE sections, back-to-back with no text between them.\n\n"
-                    "TEMPLATE TO REPEAT FOR EACH FUNCTION:\n"
+                    f"Now produce ONE SEARCH/REPLACE block for EACH of the {task_count} tasks:\n{task_list}\n\n"
+                    f"You MUST output {task_count} separate blocks — one COMPLETE block per task.\n"
+                    "For EACH task, output BOTH the SEARCH and REPLACE sections back-to-back with no text between them.\n\n"
+                    "TEMPLATE TO REPEAT FOR EACH TASK:\n"
                     f"```{lang_fence}\n"
                     "<<<<<<< SEARCH\n"
-                    "(exact old code for this function)\n"
+                    "(exact old code for this fix)\n"
                     "=======\n"
-                    "(exact new code for this function)\n"
+                    "(exact new code for this fix)\n"
                     ">>>>>>> REPLACE\n"
                     "```\n\n"
-                    f"Output all {func_count} blocks sequentially with no commentary between them.\n"
+                    f"Output all {task_count} blocks sequentially with no commentary between them.\n"
                 )
             else:
                 block_instruction = "Now produce a SEARCH/REPLACE block. Rules:\n"

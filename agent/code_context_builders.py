@@ -70,7 +70,61 @@ def build_runtime_error_notes(
     return runtime_error_note
 
 
-def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cross_encoder") -> str:
+def assess_instruction_clarity(instruction: str, file_source: str) -> int:
+    """
+    Assess instruction clarity and return optimal max RAG chunks.
+    
+    Returns:
+        0-3: Clear instruction (has comments, specific keywords)
+        3-5: Medium clarity 
+        5-7: Vague instruction (needs full context)
+    """
+    instruction_lower = instruction.lower()
+    file_lower = file_source.lower()
+
+    # If instruction defers to file comments as the spec, keep RAG minimal —
+    # a couple of examples for style are fine, but too many chunks drown the comments out
+    comment_deference_phrases = [
+        "based on comment", "use the comment", "comments are available",
+        "from the comment", "using the comment", "follow the comment",
+        "as per comment", "implement from comment"
+    ]
+    if any(p in instruction_lower for p in comment_deference_phrases):
+        return 3
+
+    clarity_score = 0
+    
+    # Check for clarity indicators
+    clear_keywords = {
+        "implement", "fill", "complete", "body", "function", 
+        "debug", "fix error", "fix bug", "solve", "based on comment"
+    }
+    
+    if any(kw in instruction_lower for kw in clear_keywords):
+        clarity_score += 2
+    
+    # Check for code comments in file (problem spec embedded)
+    comment_ratio = (file_lower.count('//') + file_lower.count('#')) / max(1, len(file_source.split('\n')))
+    if comment_ratio > 0.1:  # >10% of lines are comments
+        clarity_score += 2
+    
+    # Check instruction length
+    word_count = len(instruction.split())
+    if word_count < 10:
+        clarity_score += 1  # Short/specific instruction
+    elif word_count > 30:
+        clarity_score -= 1  # Long/vague instruction
+    
+    # Map score to chunk count
+    if clarity_score >= 3:
+        return 3  # Clear: 0-3 chunks
+    elif clarity_score >= 1:
+        return 5  # Medium: 3-5 chunks
+    else:
+        return 7  # Vague: 5-7 chunks
+
+
+def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cross_encoder", max_chunks: int = 7) -> str:
     """
     Build RAG (Retrieval-Augmented Generation) context from code search.
     Returns reference docs string (empty if use_rag is False or search fails).
@@ -79,6 +133,7 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
         instruction: The editing instruction to search for
         use_rag: Whether to enable RAG
         rerank_method: Reranking method - "cross_encoder" (default), "keyword", or "none"
+        max_chunks: Maximum number of chunks to include (default 7, may be limited by clarity)
     """
     rag_context = ""
     
@@ -90,12 +145,13 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
         results = fast_topic_search(instruction, rerank_method=rerank_method)
         if results:
             rag_context = "REFERENCE DOCS (Guide your edit):\n"
-            for i, doc in enumerate(results[:3]):
+            limited_results = results[:min(max_chunks, len(results))]
+            for i, doc in enumerate(limited_results):
                 score = doc.metadata.get('bm25_score', 'N/A')
                 doc_source = doc.metadata.get('source', 'Unknown')
                 score_str = f"{score:.1f}" if isinstance(score, (int, float)) else str(score)
                 rag_context += f"[{i+1}] {doc_source} (BM25:{score_str})\n{doc.page_content[:300]}...\n\n"
-            print(f"Found {len(results)} chunks!")
+            print(f"Found {len(results)} chunks, using {len(limited_results)}/{max_chunks}!")
         else:
             rag_context = "No exact matches—use general principles.\n"
     except Exception as e:
@@ -154,7 +210,9 @@ def build_all_contexts(
     use_rag: bool,
     session_chat_history: Optional[List[Dict[str, str]]],
     edit_log: dict,
-    rerank_method: str = "cross_encoder"
+    rerank_method: str = "cross_encoder",
+    file_source: str = "",
+    max_chunks: Optional[int] = None
 ) -> tuple[str, str, str, str]:
     """
     Build all context types at once.
@@ -162,9 +220,15 @@ def build_all_contexts(
     
     Args:
         rerank_method: Reranking method for RAG - "cross_encoder", "keyword", or "none"
+        file_source: Full source code (used to assess clarity for RAG chunking)
     """
     runtime_error_note = build_runtime_error_notes(path, ext, is_python, file_lines)
-    rag_context = build_rag_context(instruction, use_rag, rerank_method=rerank_method)
+    
+    # Assess instruction clarity and determine optimal RAG chunk limit (unless overridden)
+    if max_chunks is None:
+        max_chunks = assess_instruction_clarity(instruction, file_source) if file_source else 7
+    rag_context = build_rag_context(instruction, use_rag, rerank_method=rerank_method, max_chunks=max_chunks)
+    
     history_context = build_history_context(session_chat_history)
     edit_history_text = build_edit_history(edit_log, path)
     

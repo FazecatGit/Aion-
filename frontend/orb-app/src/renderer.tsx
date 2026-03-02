@@ -24,6 +24,9 @@ function App() {
   };
   const [baseSize, setBaseSize] = useState(computeSize());
   const [detailsContent, setDetailsContent] = useState<string | null>(null);
+  const [ragChunkPrompt, setRagChunkPrompt] = useState<{ show: boolean; instruction: string; filePath: string } | null>(null);
+  const [customChunkInput, setCustomChunkInput] = useState('');
+
 
   // update baseSize whenever window resizes so orb scales with window size
   useEffect(() => {
@@ -113,6 +116,41 @@ const handleSubmit = async (e: React.FormEvent) => {
     setMessages(prev => [...prev, { role: 'ai', text: 'Error connecting to Aion.' }]);
   }
 
+  setMode('idle');
+};
+
+const handleRagChunkRetry = async (chunks: number) => {
+  if (!ragChunkPrompt) return;
+  
+  setMode('agent-processing');
+  setMessages(prev => [...prev, { role: 'ai', text: `[CODE AGENT] Retrying with ${chunks} RAG chunks...` }]);
+  
+  try {
+    const res = await fetch('http://localhost:8000/agent/edit_with_chunks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        instruction: ragChunkPrompt.instruction, 
+        file_path: ragChunkPrompt.filePath,
+        max_chunks: chunks
+      }),
+    });
+    const data = await res.json();
+    
+    if (data.status === 'pending_review') {
+      const resolvedPath = data.file_path || ragChunkPrompt.filePath;
+      setSelectedFilePath(resolvedPath);
+      setMessages(prev => [...prev, { role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.dry_run_output}`, isDiff: true }]);
+      setPendingAgentEdit({ instruction: ragChunkPrompt.instruction, output: data.dry_run_output, filePath: resolvedPath });
+    } else if (data.status === 'error') {
+      setMessages(prev => [...prev, { role: 'ai', text: `[AGENT ERROR] ${data.message || data.error}` }]);
+    }
+  } catch (err) {
+    setMessages(prev => [...prev, { role: 'ai', text: 'Error retrying with custom chunks.' }]);
+  }
+  
+  setRagChunkPrompt(null);
+  setCustomChunkInput('');
   setMode('idle');
 };
 
@@ -456,12 +494,172 @@ return (
                 >
                   ✗ Decline
                 </button>
+                <button
+                  onClick={() => {
+                    if (pendingAgentEdit) {
+                      setRagChunkPrompt({
+                        show: true,
+                        instruction: pendingAgentEdit.instruction,
+                        filePath: pendingAgentEdit.filePath
+                      });
+                    }
+                  }}
+                  style={{
+                    padding: '6px 12px',
+                    borderRadius: 8,
+                    backgroundColor: '#5533ff',
+                    color: '#fff',
+                    border: 'none',
+                    cursor: 'pointer',
+                    fontSize: '12px'
+                  }}
+                >
+                  🔄 Try with More Context
+                </button>
               </div>
             )}
             </div>
         ))}
         <div ref={messagesEndRef} />
       </div>
+
+      {/* RAG Chunk Selection Modal */}
+      {ragChunkPrompt && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.7)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 100,
+          }}
+          onClick={() => setRagChunkPrompt(null)}
+        >
+          <div
+            style={{
+              backgroundColor: '#1a1a1a',
+              border: '1px solid #444',
+              borderRadius: '12px',
+              padding: '24px',
+              maxWidth: '400px',
+              color: '#fff',
+              boxShadow: '0 10px 40px rgba(0, 0, 0, 0.8)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ marginTop: 0, marginBottom: '16px', color: '#5533ff' }}>More Context Needed</h3>
+            <p style={{ marginBottom: '20px', lineHeight: '1.5' }}>
+              LLM couldn't generate proper code changes. Would you like to retry with more RAG context?
+            </p>
+            
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
+              <button
+                onClick={() => handleRagChunkRetry(5)}
+                style={{
+                  flex: 1,
+                  padding: '10px',
+                  borderRadius: '8px',
+                  border: 'none',
+                  backgroundColor: '#5533ff',
+                  color: '#fff',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                }}
+              >
+                5 Chunks
+              </button>
+              <button
+                onClick={() => handleRagChunkRetry(7)}
+                style={{
+                  flex: 1,
+                  padding: '10px',
+                  borderRadius: '8px',
+                  border: 'none',
+                  backgroundColor: '#5533ff',
+                  color: '#fff',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                }}
+              >
+                7 Chunks
+              </button>
+              <button
+                onClick={() => handleRagChunkRetry(10)}
+                style={{
+                  flex: 1,
+                  padding: '10px',
+                  borderRadius: '8px',
+                  border: 'none',
+                  backgroundColor: '#5533ff',
+                  color: '#fff',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                }}
+              >
+                10 Chunks
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+              <input
+                type="number"
+                min="1"
+                max="20"
+                value={customChunkInput}
+                onChange={(e) => setCustomChunkInput(e.target.value)}
+                placeholder="Custom (1-20)"
+                style={{
+                  flex: 1,
+                  padding: '10px',
+                  borderRadius: '8px',
+                  border: '1px solid #444',
+                  backgroundColor: '#111',
+                  color: '#fff',
+                  fontSize: '14px',
+                  outline: 'none',
+                }}
+              />
+              <button
+                onClick={() => {
+                  const chunks = parseInt(customChunkInput);
+                  if (chunks && chunks > 0 && chunks <= 50) {
+                    handleRagChunkRetry(chunks);
+                  }
+                }}
+                style={{
+                  padding: '10px 16px',
+                  borderRadius: '8px',
+                  border: 'none',
+                  backgroundColor: '#5533ff',
+                  color: '#fff',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                }}
+              >
+                Go
+              </button>
+            </div>
+
+            <button
+              onClick={() => setRagChunkPrompt(null)}
+              style={{
+                width: '100%',
+                padding: '10px',
+                borderRadius: '8px',
+                border: '1px solid #444',
+                backgroundColor: '#1a1a1a',
+                color: '#999',
+                cursor: 'pointer',
+                fontSize: '14px',
+              }}
+            >
+              Skip
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Input bar fixed at bottom center */}
       <form

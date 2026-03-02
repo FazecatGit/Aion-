@@ -245,6 +245,65 @@ async def agent_apply(req: AgentApplyRequest):
         return {"error": str(e), "status": "error", "message": f"Failed to apply changes: {str(e)}"}
 
 
+class AgentEditWithChunksRequest(BaseModel):
+    instruction: str
+    file_path: str
+    max_chunks: int = 7
+
+
+@app.post("/agent/edit_with_chunks")
+async def agent_edit_with_chunks(req: AgentEditWithChunksRequest):
+    """Code agent endpoint with custom RAG chunk limit."""
+    from agent.code_agent import CodeAgent
+    from pathlib import Path
+
+    if not req.file_path:
+        return {"error": "No file path provided", "status": "error"}
+
+    # Resolve path
+    resolved_path = req.file_path
+    if not Path(resolved_path).exists():
+        candidate = Path(resolved_path)
+        if not candidate.is_absolute():
+            matches = list(Path(".").rglob(candidate.name))
+            if matches:
+                resolved_path = str(matches[0].resolve())
+            else:
+                return {"error": f"File not found: {req.file_path}", "status": "error"}
+        else:
+            return {"error": f"File not found: {req.file_path}", "status": "error"}
+
+    try:
+        # Clamp max_chunks to reasonable range
+        max_chunks = max(1, min(req.max_chunks, 50))
+
+        agent = CodeAgent(repo_path=".")
+        result = agent.edit_code(
+            path=resolved_path,
+            instruction=req.instruction,
+            dry_run=True,
+            use_rag=True,
+            rerank_method="auto",
+            max_chunks=max_chunks
+        )
+
+        if isinstance(result, dict):
+            diff = result.get("diff", "")
+            changed = result.get("changed", False)
+            dry_run_output = diff if (changed and diff) else "(No changes — agent could not determine what to modify.)"
+        else:
+            dry_run_output = str(result)
+
+        return {
+            "status": "pending_review",
+            "dry_run_output": dry_run_output,
+            "file_path": resolved_path,
+            "max_chunks": max_chunks
+        }
+    except Exception as e:
+        return {"error": str(e), "status": "error", "message": f"Agent error with {req.max_chunks} chunks: {str(e)}"}
+
+
 @app.post("/clear")
 async def clear():
     session_chat_history.clear()
