@@ -3,9 +3,11 @@ import { createRoot } from 'react-dom/client';
 import Orb from './Orb';
 import './index.css';
 
-type Message = { role: 'user' | 'ai'; text: string; isDiff?: boolean };
-type OrbMode = 'idle' | 'querying' | 'agent-processing';
+type Message    = { role: 'user' | 'ai'; text: string; isDiff?: boolean };
+type OrbMode    = 'idle' | 'querying' | 'agent-processing';
 type ActiveMode = 'query' | 'agent';
+type TestCase   = { id: number; input: string; expected: string };
+type TestResult = { input: string; expected: string; actual: string | null; passed: boolean; error: string | null };
 
 function App() {
   const [mode, setMode] = useState<OrbMode>('idle');
@@ -13,6 +15,7 @@ function App() {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [queryMode, setQueryMode] = useState<'auto'|'fast'|'deep'|'deep_semantic'|'both'>('auto');
+  const [agentTaskMode, setAgentTaskMode] = useState<'auto' | 'fix' | 'solve'>('auto');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [lastUserQuery, setLastUserQuery] = useState<string | null>(null);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
@@ -26,6 +29,13 @@ function App() {
   const [detailsContent, setDetailsContent] = useState<string | null>(null);
   const [ragChunkPrompt, setRagChunkPrompt] = useState<{ show: boolean; instruction: string; filePath: string } | null>(null);
   const [customChunkInput, setCustomChunkInput] = useState('');
+  const [ragSearchMethod, setRagSearchMethod] = useState<'bm25' | 'semantic' | 'both'>('both');
+  // ── Test runner state ──────────────────────────────────────────────────────
+  const [testCases, setTestCases]         = useState<TestCase[]>([]);
+  const [testResults, setTestResults]     = useState<TestResult[]>([]);
+  const [showTestPanel, setShowTestPanel] = useState(false);
+  const [testNextId, setTestNextId]       = useState(1);
+  const lastAgentInstruction              = useRef<string>('');
 
 
   // update baseSize whenever window resizes so orb scales with window size
@@ -62,11 +72,12 @@ const handleSubmit = async (e: React.FormEvent) => {
         return;
       }
       
+      lastAgentInstruction.current = userMsg;
       setMessages(prev => [...prev, { role: 'ai', text: '[CODE AGENT] Processing your code request...' }]);
       const res = await fetch('http://localhost:8000/agent/edit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ instruction: userMsg, file_path: selectedFilePath }),
+        body: JSON.stringify({ instruction: userMsg, file_path: selectedFilePath, task_mode: agentTaskMode }),
       });
       const data = await res.json();
       
@@ -74,7 +85,15 @@ const handleSubmit = async (e: React.FormEvent) => {
         // Show dry_run output and set pending edit; use resolved path returned by server
         const resolvedPath = data.file_path || selectedFilePath || '';
         setSelectedFilePath(resolvedPath);
-        setMessages(prev => [...prev, { role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.dry_run_output}`, isDiff: true }]);
+        const newMsgs: Message[] = [{ role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.dry_run_output}`, isDiff: true }];
+        // Append explanation + citations if the agent returned them
+        if (data.explanation) {
+          const citationBlock = data.citations && data.citations.length > 0
+            ? `\n\n📚 Sources:\n${data.citations.map((c: string, i: number) => `  ${i + 1}. ${c}`).join('\n')}`
+            : '';
+          newMsgs.push({ role: 'ai', text: `[EXPLANATION]\n${data.explanation}${citationBlock}` });
+        }
+        setMessages(prev => [...prev, ...newMsgs]);
         setPendingAgentEdit({ instruction: userMsg, output: data.dry_run_output, filePath: resolvedPath });
       } else if (data.status === 'error') {
         setMessages(prev => [...prev, { role: 'ai', text: `[AGENT ERROR] ${data.message || data.error}` }]);
@@ -119,11 +138,82 @@ const handleSubmit = async (e: React.FormEvent) => {
   setMode('idle');
 };
 
+const handleRunTests = async () => {
+  if (!selectedFilePath || testCases.length === 0) return;
+  setMode('agent-processing');
+  try {
+    const res = await fetch('http://localhost:8000/agent/run_tests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        file_path: selectedFilePath,
+        test_cases: testCases.map(tc => ({ input: tc.input, expected: tc.expected })),
+      }),
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      setTestResults(data.results);
+    } else {
+      setMessages(prev => [...prev, { role: 'ai', text: `[TEST ERROR] ${data.error}` }]);
+    }
+  } catch {
+    setMessages(prev => [...prev, { role: 'ai', text: 'Test run failed — is the server running?' }]);
+  }
+  setMode('idle');
+};
+
+const handleFixWithTests = async () => {
+  if (!selectedFilePath || testCases.length === 0) return;
+  const instruction = lastAgentInstruction.current;
+  if (!instruction) {
+    setMessages(prev => [...prev, { role: 'ai', text: '[TEST] Send the task description first so the agent knows what to implement.' }]);
+    return;
+  }
+  setMode('agent-processing');
+  setMessages(prev => [...prev, { role: 'ai', text: `[AUTO-FIX] Running tests and iterating... (up to 3 attempts)` }]);
+  try {
+    const res = await fetch('http://localhost:8000/agent/fix_with_tests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        file_path: selectedFilePath,
+        instruction,
+        test_cases: testCases.map(tc => ({ input: tc.input, expected: tc.expected })),
+        max_retries: 3,
+        task_mode: agentTaskMode === 'auto' ? 'solve' : agentTaskMode,
+      }),
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      setTestResults(data.test_results);
+      const passed = data.test_results.filter((r: TestResult) => r.passed).length;
+      const total  = data.test_results.length;
+      const label  = data.all_passed ? '✓ All tests pass' : `${passed}/${total} tests pass`;
+      const fixMsgs: Message[] = [
+        { role: 'ai', text: `[AUTO-FIX] ${label} after ${data.attempts} fix attempt(s).\n\n${data.diff || '(no diff)'}`, isDiff: !!data.diff },
+      ];
+      if (data.explanation) {
+        const citationBlock = data.citations && data.citations.length > 0
+          ? `\n\n📚 Sources:\n${data.citations.map((c: string, i: number) => `  ${i + 1}. ${c}`).join('\n')}`
+          : '';
+        fixMsgs.push({ role: 'ai', text: `[EXPLANATION]\n${data.explanation}${citationBlock}` });
+      }
+      setMessages(prev => [...prev, ...fixMsgs]);
+      if (data.file_path) setSelectedFilePath(data.file_path);
+    } else {
+      setMessages(prev => [...prev, { role: 'ai', text: `[AUTO-FIX ERROR] ${data.error}` }]);
+    }
+  } catch {
+    setMessages(prev => [...prev, { role: 'ai', text: 'Auto-fix failed — is the server running?' }]);
+  }
+  setMode('idle');
+};
+
 const handleRagChunkRetry = async (chunks: number) => {
   if (!ragChunkPrompt) return;
   
   setMode('agent-processing');
-  setMessages(prev => [...prev, { role: 'ai', text: `[CODE AGENT] Retrying with ${chunks} RAG chunks...` }]);
+  setMessages(prev => [...prev, { role: 'ai', text: `[CODE AGENT] Retrying with ${chunks} RAG chunks (${ragSearchMethod})...` }]);
   
   try {
     const res = await fetch('http://localhost:8000/agent/edit_with_chunks', {
@@ -132,7 +222,9 @@ const handleRagChunkRetry = async (chunks: number) => {
       body: JSON.stringify({ 
         instruction: ragChunkPrompt.instruction, 
         file_path: ragChunkPrompt.filePath,
-        max_chunks: chunks
+        max_chunks: chunks,
+        task_mode: agentTaskMode,
+        search_method: ragSearchMethod
       }),
     });
     const data = await res.json();
@@ -140,7 +232,14 @@ const handleRagChunkRetry = async (chunks: number) => {
     if (data.status === 'pending_review') {
       const resolvedPath = data.file_path || ragChunkPrompt.filePath;
       setSelectedFilePath(resolvedPath);
-      setMessages(prev => [...prev, { role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.dry_run_output}`, isDiff: true }]);
+      const ragMsgs: Message[] = [{ role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.dry_run_output}`, isDiff: true }];
+      if (data.explanation) {
+        const citationBlock = data.citations && data.citations.length > 0
+          ? `\n\n📚 Sources:\n${data.citations.map((c: string, i: number) => `  ${i + 1}. ${c}`).join('\n')}`
+          : '';
+        ragMsgs.push({ role: 'ai', text: `[EXPLANATION]\n${data.explanation}${citationBlock}` });
+      }
+      setMessages(prev => [...prev, ...ragMsgs]);
       setPendingAgentEdit({ instruction: ragChunkPrompt.instruction, output: data.dry_run_output, filePath: resolvedPath });
     } else if (data.status === 'error') {
       setMessages(prev => [...prev, { role: 'ai', text: `[AGENT ERROR] ${data.message || data.error}` }]);
@@ -272,6 +371,7 @@ return (
                 // In Electron with sandbox:false, .path gives the full OS path
                 const fullPath = (f as any).path || f.name;
                 setSelectedFilePath(fullPath);
+                setTestResults([]);  // clear stale test results when file changes
                 (document.getElementById('agent-file-picker') as HTMLInputElement).value = '';
               }}
             />
@@ -290,11 +390,150 @@ return (
               disabled={mode !== 'idle'}
               style={{ flex: 1, padding: '6px 8px', borderRadius: '6px', backgroundColor: '#111', color: '#fff', border: '1px solid #555', fontSize: '12px', minWidth: 0 }}
             />
+            <select
+              value={agentTaskMode}
+              onChange={e => setAgentTaskMode(e.target.value as any)}
+              disabled={mode !== 'idle'}
+              title="Fix: debug existing code  |  Solve/Build: implement from scratch  |  Auto: detect from prompt"
+              style={{ padding: '6px 8px', borderRadius: '6px', backgroundColor: '#111', color: '#fff', border: '1px solid #555', fontSize: '12px', cursor: 'pointer' }}
+            >
+              <option value="auto">⚙ Auto</option>
+              <option value="fix">🔧 Fix</option>
+              <option value="solve">🏗 Solve/Build</option>
+            </select>
+            <button
+              type="button"
+              onClick={() => setShowTestPanel(p => !p)}
+              disabled={mode !== 'idle'}
+              title="Toggle test case panel"
+              style={{
+                padding: '6px 10px', borderRadius: '6px', border: '1px solid',
+                borderColor: showTestPanel ? '#22bbff' : '#555',
+                backgroundColor: showTestPanel ? 'rgba(34,187,255,0.15)' : '#111',
+                color: showTestPanel ? '#22bbff' : '#aaa',
+                fontSize: '12px', cursor: 'pointer', whiteSpace: 'nowrap'
+              }}
+            >
+              🧪 Tests{testCases.length > 0 ? ` (${testCases.length})` : ''}
+            </button>
           </div>
         )}
       </div>
 
-      {/* Orb + Idle label (fixed center) */}
+      {/* ── Test Panel ────────────────────────────────────────────────────── */}
+      {showTestPanel && activeMode === 'agent' && (
+        <div style={{
+          position: 'fixed', top: '70px', left: '20px', zIndex: 60,
+          width: '380px', maxHeight: 'calc(100vh - 110px)',
+          backgroundColor: 'rgba(15,15,20,0.97)',
+          border: '1px solid rgba(34,187,255,0.3)',
+          borderRadius: '12px', padding: '16px',
+          display: 'flex', flexDirection: 'column', gap: '10px',
+          overflowY: 'auto',
+          boxShadow: '0 8px 32px rgba(0,0,0,0.7)',
+        }}>
+          {/* Header */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ color: '#22bbff', fontWeight: 'bold', fontSize: '13px', letterSpacing: '0.06em' }}>
+              🧪 TEST CASES
+            </span>
+            <button onClick={() => setShowTestPanel(false)}
+              style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', fontSize: '16px' }}>✕</button>
+          </div>
+
+          {/* Test case list */}
+          {testCases.map((tc, i) => {
+            const result = testResults[i] ?? null;
+            const statusColor = result ? (result.passed ? '#44ff88' : '#ff5555') : '#555';
+            const statusIcon  = result ? (result.passed ? '✓' : '✗') : '○';
+            return (
+              <div key={tc.id} style={{
+                padding: '10px', borderRadius: '8px',
+                border: `1px solid ${statusColor}44`,
+                backgroundColor: 'rgba(255,255,255,0.04)',
+                display: 'flex', flexDirection: 'column', gap: '6px'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ color: statusColor, fontSize: '12px', fontWeight: 'bold', minWidth: '16px' }}>{statusIcon}</span>
+                  <span style={{ color: '#888', fontSize: '11px' }}>Test {i + 1}</span>
+                  <button
+                    onClick={() => setTestCases(prev => prev.filter(t => t.id !== tc.id))}
+                    style={{ marginLeft: 'auto', background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '13px' }}
+                  >🗑</button>
+                </div>
+                <input
+                  placeholder="Input (e.g. [[0,0,1],[1,1,0],[1,0,0]])"
+                  value={tc.input}
+                  onChange={e => setTestCases(prev => prev.map(t => t.id === tc.id ? { ...t, input: e.target.value } : t))}
+                  style={{ padding: '5px 8px', borderRadius: '6px', backgroundColor: '#0d0d14', color: '#fff', border: '1px solid #333', fontSize: '12px', fontFamily: 'monospace' }}
+                />
+                <input
+                  placeholder="Expected output (e.g. 3)"
+                  value={tc.expected}
+                  onChange={e => setTestCases(prev => prev.map(t => t.id === tc.id ? { ...t, expected: e.target.value } : t))}
+                  style={{ padding: '5px 8px', borderRadius: '6px', backgroundColor: '#0d0d14', color: '#fff', border: '1px solid #333', fontSize: '12px', fontFamily: 'monospace' }}
+                />
+                {result && !result.passed && (
+                  <div style={{ fontSize: '11px', color: '#ff8877', fontFamily: 'monospace', paddingTop: '2px' }}>
+                    {result.error
+                      ? `⚠ ${result.error.split('\n')[0]}`
+                      : `got: ${result.actual ?? 'null'}`
+                    }
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Add test case */}
+          <button
+            onClick={() => {
+              setTestCases(prev => [...prev, { id: testNextId, input: '', expected: '' }]);
+              setTestNextId(n => n + 1);
+            }}
+            style={{ padding: '7px', borderRadius: '8px', backgroundColor: '#1a1a2e', color: '#22bbff', border: '1px dashed #22bbff44', cursor: 'pointer', fontSize: '12px' }}
+          >
+            + Add Test Case
+          </button>
+
+          {/* Action buttons */}
+          <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+            <button
+              onClick={handleRunTests}
+              disabled={mode !== 'idle' || testCases.length === 0 || !selectedFilePath}
+              style={{
+                flex: 1, padding: '8px', borderRadius: '8px', border: 'none',
+                backgroundColor: mode !== 'idle' ? '#222' : '#1166cc',
+                color: '#fff', cursor: mode !== 'idle' ? 'not-allowed' : 'pointer', fontSize: '13px'
+              }}
+            >
+              ▶ Run Tests
+            </button>
+            <button
+              onClick={handleFixWithTests}
+              disabled={mode !== 'idle' || testCases.length === 0 || !selectedFilePath || testResults.every(r => r.passed)}
+              title={!lastAgentInstruction.current ? 'Send your task description first' : 'Auto-fix code using test failures'}
+              style={{
+                flex: 1, padding: '8px', borderRadius: '8px', border: 'none',
+                backgroundColor: (mode !== 'idle' || testResults.every(r => r.passed)) ? '#222' : '#883300',
+                color: '#fff',
+                cursor: (mode !== 'idle' || testResults.every(r => r.passed)) ? 'not-allowed' : 'pointer',
+                fontSize: '13px'
+              }}
+            >
+              🔁 Auto-fix
+            </button>
+          </div>
+
+          {/* Summary */}
+          {testResults.length > 0 && (
+            <div style={{ fontSize: '12px', textAlign: 'center', paddingTop: '4px',
+              color: testResults.every(r => r.passed) ? '#44ff88' : '#ff8855' }}>
+              {testResults.filter(r => r.passed).length}/{testResults.length} passing
+            </div>
+          )}
+        </div>
+      )}
       <div
         style={{
           position: 'fixed',
@@ -366,16 +605,25 @@ return (
             boxShadow: '0 12px 40px rgba(0, 0, 0, 0.5)',
         }}
         >
-        {messages.map((m, i) => (
+        {messages.map((m, i) => {
+            const isExplanation = m.role === 'ai' && m.text.startsWith('[EXPLANATION]');
+            return (
             <div
             key={i}
             style={{
                 padding: '12px 16px',
-                backgroundColor: m.role === 'user' ? 'rgba(128, 0, 128, 0.5)' : 'rgba(255, 255, 255, 0.12)',  // Purple for user
+                backgroundColor: m.role === 'user'
+                  ? 'rgba(128, 0, 128, 0.5)'
+                  : isExplanation
+                    ? 'rgba(80, 140, 255, 0.12)'
+                    : 'rgba(255, 255, 255, 0.12)',
                 backdropFilter: 'blur(15px)',
                 WebkitBackdropFilter: 'blur(15px)',
                 borderRadius: '18px',
-                border: '1px solid rgba(255, 255, 255, 0.1)',
+                border: isExplanation
+                  ? '1px solid rgba(100, 160, 255, 0.3)'
+                  : '1px solid rgba(255, 255, 255, 0.1)',
+                borderLeft: isExplanation ? '3px solid rgba(100, 160, 255, 0.6)' : undefined,
                 color: 'rgba(255, 255, 255, 0.95)',
                 textShadow: '0 1px 2px rgba(0,0,0,0.5)', 
                 maxWidth: '85%', 
@@ -454,7 +702,8 @@ return (
                         body: JSON.stringify({ 
                           file_path: pendingAgentEdit.filePath,
                           instruction: pendingAgentEdit.instruction,
-                          confirmed: true
+                          confirmed: true,
+                          task_mode: agentTaskMode
                         })
                       });
                       const result = await res.json();
@@ -519,7 +768,8 @@ return (
               </div>
             )}
             </div>
-        ))}
+            );
+        })}
         <div ref={messagesEndRef} />
       </div>
 
@@ -550,8 +800,72 @@ return (
             onClick={(e) => e.stopPropagation()}
           >
             <h3 style={{ marginTop: 0, marginBottom: '16px', color: '#5533ff' }}>More Context Needed</h3>
-            <p style={{ marginBottom: '20px', lineHeight: '1.5' }}>
-              LLM couldn't generate proper code changes. Would you like to retry with more RAG context?
+            <p style={{ marginBottom: '12px', lineHeight: '1.5', fontSize: '13px' }}>
+              LLM couldn't generate proper code changes. Retry with more context:
+            </p>
+            
+            <div style={{ marginBottom: '14px' }}>
+              <p style={{ marginTop: 0, marginBottom: '8px', fontSize: '12px', color: '#aaa' }}>
+                Search Method:
+              </p>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <button
+                  onClick={() => setRagSearchMethod('bm25')}
+                  style={{
+                    flex: 1,
+                    padding: '8px',
+                    borderRadius: '6px',
+                    border: ragSearchMethod === 'bm25' ? '2px solid #22bbff' : '1px solid #555',
+                    backgroundColor: ragSearchMethod === 'bm25' ? 'rgba(34,187,255,0.2)' : '#1a1a1a',
+                    color: ragSearchMethod === 'bm25' ? '#22bbff' : '#aaa',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                    fontWeight: ragSearchMethod === 'bm25' ? 'bold' : 'normal',
+                  }}
+                >
+                  BM25
+                </button>
+                <button
+                  onClick={() => setRagSearchMethod('semantic')}
+                  style={{
+                    flex: 1,
+                    padding: '8px',
+                    borderRadius: '6px',
+                    border: ragSearchMethod === 'semantic' ? '2px solid #22ff99' : '1px solid #555',
+                    backgroundColor: ragSearchMethod === 'semantic' ? 'rgba(34,255,153,0.2)' : '#1a1a1a',
+                    color: ragSearchMethod === 'semantic' ? '#22ff99' : '#aaa',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                    fontWeight: ragSearchMethod === 'semantic' ? 'bold' : 'normal',
+                  }}
+                >
+                  Semantic (🔍)
+                </button>
+                <button
+                  onClick={() => setRagSearchMethod('both')}
+                  style={{
+                    flex: 1,
+                    padding: '8px',
+                    borderRadius: '6px',
+                    border: ragSearchMethod === 'both' ? '2px solid #ffaa22' : '1px solid #555',
+                    backgroundColor: ragSearchMethod === 'both' ? 'rgba(255,170,34,0.2)' : '#1a1a1a',
+                    color: ragSearchMethod === 'both' ? '#ffaa22' : '#aaa',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                    fontWeight: ragSearchMethod === 'both' ? 'bold' : 'normal',
+                  }}
+                >
+                  Both
+                </button>
+              </div>
+            </div>
+            
+            <p style={{ marginTop: '8px', marginBottom: '14px', fontSize: '11px', color: '#666', lineHeight: '1.4' }}>
+              • <strong>BM25</strong>: Keyword search (faster, good for algorithm names)
+              <br/>
+              • <strong>Semantic</strong>: Vector similarity (catches meaning, ChromaDB)
+              <br/>
+              • <strong>Both</strong>: BM25 + semantic fallback
             </p>
             
             <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>

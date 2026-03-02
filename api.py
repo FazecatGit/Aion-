@@ -144,6 +144,7 @@ async def feedback(req: FeedbackRequest):
 class AgentEditRequest(BaseModel):
     instruction: str
     file_path: str
+    task_mode: str = "auto"  # "fix", "solve", or "auto"
 
 
 @app.post("/agent/edit")
@@ -179,7 +180,8 @@ async def agent_edit(req: AgentEditRequest):
             instruction=req.instruction,
             dry_run=True,
             use_rag=True,
-            rerank_method="auto"
+            rerank_method="auto",
+            task_mode=req.task_mode
         )
         # edit_code returns a dict when dry_run=True: {new_source, diff, changed}
         if isinstance(result, dict):
@@ -188,10 +190,17 @@ async def agent_edit(req: AgentEditRequest):
             dry_run_output = diff if (changed and diff) else "(No changes — agent could not determine what to modify.)"
         else:
             dry_run_output = str(result)
+        explanation = ""
+        citations = []
+        if isinstance(result, dict):
+            explanation = result.get("explanation", "")
+            citations = result.get("citations", [])
         return {
             "status": "pending_review",
             "dry_run_output": dry_run_output,
-            "file_path": resolved_path
+            "file_path": resolved_path,
+            "explanation": explanation,
+            "citations": citations,
         }
     except Exception as e:
         return {"error": str(e), "status": "error", "message": f"Agent error: {str(e)}"}
@@ -201,6 +210,7 @@ class AgentApplyRequest(BaseModel):
     instruction: str
     file_path: str
     confirmed: bool = False
+    task_mode: str = "auto"  # "fix", "solve", or "auto"
 
 
 @app.post("/agent/apply")
@@ -234,7 +244,8 @@ async def agent_apply(req: AgentApplyRequest):
             instruction=req.instruction,
             dry_run=False,
             use_rag=True,
-            rerank_method="cross_encoder"  # always use best quality when actually writing
+            rerank_method="cross_encoder",  # always use best quality when actually writing
+            task_mode=req.task_mode
         )
         return {
             "status": "success",
@@ -249,6 +260,8 @@ class AgentEditWithChunksRequest(BaseModel):
     instruction: str
     file_path: str
     max_chunks: int = 7
+    task_mode: str = "auto"  # "fix", "solve", or "auto"
+    search_method: str = "both"  # "bm25", "semantic", or "both"
 
 
 @app.post("/agent/edit_with_chunks")
@@ -284,7 +297,9 @@ async def agent_edit_with_chunks(req: AgentEditWithChunksRequest):
             dry_run=True,
             use_rag=True,
             rerank_method="auto",
-            max_chunks=max_chunks
+            max_chunks=max_chunks,
+            task_mode=req.task_mode,
+            search_method=req.search_method
         )
 
         if isinstance(result, dict):
@@ -302,6 +317,93 @@ async def agent_edit_with_chunks(req: AgentEditWithChunksRequest):
         }
     except Exception as e:
         return {"error": str(e), "status": "error", "message": f"Agent error with {req.max_chunks} chunks: {str(e)}"}
+
+
+# ── Test runner endpoints ──────────────────────────────────────────────────────
+
+class RunTestsRequest(BaseModel):
+    file_path: str
+    test_cases: list  # [{input: str, expected: str}]
+
+
+@app.post("/agent/run_tests")
+async def run_tests_endpoint(req: RunTestsRequest):
+    """Run test cases against the current state of a file and return pass/fail results."""
+    from agent.test_runner import run_tests
+    from agent.tools import read_file as agent_read_file
+    from pathlib import Path
+
+    resolved_path = req.file_path
+    if not Path(resolved_path).exists():
+        candidate = Path(resolved_path)
+        if not candidate.is_absolute():
+            matches = list(Path(".").rglob(candidate.name))
+            if matches:
+                resolved_path = str(matches[0].resolve())
+            else:
+                return {"error": f"File not found: {req.file_path}", "status": "error"}
+        else:
+            return {"error": f"File not found: {req.file_path}", "status": "error"}
+
+    try:
+        source = agent_read_file(resolved_path)
+        results = run_tests(source, resolved_path, req.test_cases)
+        return {
+            "status": "ok",
+            "results": results,
+            "all_passed": all(r["passed"] for r in results),
+        }
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
+
+
+class FixWithTestsRequest(BaseModel):
+    file_path: str
+    instruction: str
+    test_cases: list  # [{input: str, expected: str}]
+    max_retries: int = 3
+    task_mode: str = "solve"
+
+
+@app.post("/agent/fix_with_tests")
+async def fix_with_tests_endpoint(req: FixWithTestsRequest):
+    """Iteratively fix a file until all test cases pass or max_retries is exhausted."""
+    from agent.code_agent import CodeAgent
+    from pathlib import Path
+
+    resolved_path = req.file_path
+    if not Path(resolved_path).exists():
+        candidate = Path(resolved_path)
+        if not candidate.is_absolute():
+            matches = list(Path(".").rglob(candidate.name))
+            if matches:
+                resolved_path = str(matches[0].resolve())
+            else:
+                return {"error": f"File not found: {req.file_path}", "status": "error"}
+        else:
+            return {"error": f"File not found: {req.file_path}", "status": "error"}
+
+    try:
+        agent = CodeAgent(repo_path=".")
+        result = agent.fix_with_tests(
+            path=resolved_path,
+            instruction=req.instruction,
+            test_cases=req.test_cases,
+            max_retries=max(1, min(req.max_retries, 5)),
+            task_mode=req.task_mode,
+        )
+        return {
+            "status": "ok",
+            "all_passed": result["all_passed"],
+            "attempts": result["attempts"],
+            "test_results": result["test_results"],
+            "diff": result["diff"],
+            "file_path": resolved_path,
+            "explanation": result.get("explanation", ""),
+            "citations": result.get("citations", []),
+        }
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
 
 
 @app.post("/clear")

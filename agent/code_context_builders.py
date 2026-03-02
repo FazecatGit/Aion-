@@ -1,14 +1,11 @@
-"""
-Context builders for code editing operations.
-Handles construction of all context notes and information passed to the LLM.
-"""
-
 import sys
 import subprocess
 import logging
 from typing import Optional, List, Dict
+from operator import itemgetter
 
 from brain.fast_search import fast_topic_search
+from brain.config import LLM_MODEL, CHROMA_DIR, EMBEDDING_MODEL
 from .code_editing_helpers import parse_compiler_errors
 
 logger = logging.getLogger("code_agent")
@@ -82,6 +79,16 @@ def assess_instruction_clarity(instruction: str, file_source: str) -> int:
     instruction_lower = instruction.lower()
     file_lower = file_source.lower()
 
+    # Implementation/solve tasks benefit from seeing example patterns in RAG
+    implement_keywords = {
+        "implement", "solve", "write", "build", "create",
+        "given", "return the", "return minimum", "return maximum",
+        "leetcode", "algorithm", "function that", "program that",
+        "find the", "compute", "calculate", "design",
+    }
+    if any(kw in instruction_lower for kw in implement_keywords):
+        return 7  # Give implement tasks maximum RAG context for examples
+
     # If instruction defers to file comments as the spec, keep RAG minimal —
     # a couple of examples for style are fine, but too many chunks drown the comments out
     comment_deference_phrases = [
@@ -124,41 +131,355 @@ def assess_instruction_clarity(instruction: str, file_source: str) -> int:
         return 7  # Vague: 5-7 chunks
 
 
-def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cross_encoder", max_chunks: int = 7) -> str:
+# ---------- Language pre-filter (cheap, no LLM) ----------
+
+# Maps file extensions to keywords that MUST appear in a relevant doc's source path,
+# and keywords that indicate an IRRELEVANT doc for that language.
+_LANG_RELEVANCE = {
+    '.py':   {'relevant': ['python'],
+              'irrelevant': ['c++', 'cplusplus', 'stroustrup', 'golang', 'go_programming',
+                             'rust', 'blender', 'angular', 'typescript', 'swift', 'kotlin']},
+    '.go':   {'relevant': ['go', 'golang'],
+              'irrelevant': ['python', 'c++', 'cplusplus', 'stroustrup', 'rust', 'blender',
+                             'angular', 'typescript', 'swift', 'kotlin']},
+    '.cpp':  {'relevant': ['c++', 'cplusplus', 'stroustrup', 'effective-modern', 'concurrency'],
+              'irrelevant': ['python', 'golang', 'go_programming', 'rust', 'blender',
+                             'angular', 'typescript', 'swift', 'kotlin']},
+    '.c':    {'relevant': ['c_programming', 'c++', 'cplusplus'],
+              'irrelevant': ['python', 'golang', 'go_programming', 'rust', 'blender',
+                             'angular', 'typescript', 'swift', 'kotlin']},
+    '.rs':   {'relevant': ['rust', 'rustaceans'],
+              'irrelevant': ['python', 'golang', 'go_programming', 'c++', 'cplusplus',
+                             'blender', 'angular', 'typescript', 'swift', 'kotlin']},
+    '.ts':   {'relevant': ['typescript', 'angular'],
+              'irrelevant': ['python', 'golang', 'go_programming', 'c++', 'cplusplus',
+                             'rust', 'blender', 'swift', 'kotlin']},
+    '.js':   {'relevant': ['javascript', 'typescript', 'angular'],
+              'irrelevant': ['python', 'golang', 'go_programming', 'c++', 'cplusplus',
+                             'rust', 'blender', 'swift', 'kotlin']},
+}
+
+# Language-agnostic docs are always allowed through (clean code, refactoring, design, legacy)
+_UNIVERSAL_DOCS = ['clean-code', 'clean_code', 'refactoring', 'legacy', 'design']
+
+
+def _language_prefilter(chunks: list, file_ext: str) -> list:
+    """Fast pre-filter: remove chunks from docs clearly written for a different language.
+    
+    Uses source filename matching — no LLM call needed.
+    Language-agnostic docs (clean code, refactoring) are always allowed through.
+    If the file extension has no filter rules, all chunks pass through unchanged.
     """
-    Build RAG (Retrieval-Augmented Generation) context from code search.
-    Returns reference docs string (empty if use_rag is False or search fails).
+    ext = file_ext.lower()
+    rules = _LANG_RELEVANCE.get(ext)
+    if not rules:
+        return chunks  # No filter rules for this language — pass all through
+    
+    irrelevant_keywords = rules['irrelevant']
+    filtered = []
+    for doc in chunks:
+        source = doc.metadata.get('source', '').lower().replace(' ', '_').replace('-', '_')
+        
+        # Always allow language-agnostic docs
+        if any(u in source for u in _UNIVERSAL_DOCS):
+            filtered.append(doc)
+            continue
+        
+        # Filter out docs matching irrelevant language keywords
+        if any(kw.replace('-', '_') in source for kw in irrelevant_keywords):
+            logger.info("[LANG_FILTER] Skipped wrong-language doc: %s", doc.metadata.get('source', 'Unknown'))
+            continue
+        
+        filtered.append(doc)
+    
+    if len(filtered) < len(chunks):
+        logger.info("[LANG_FILTER] Pre-filter: %d/%d chunks passed for %s file", len(filtered), len(chunks), ext)
+    
+    return filtered
+
+
+# ---------- RRF (Reciprocal Rank Fusion) for hybrid retrieval ----------
+
+def _doc_key(doc) -> tuple:
+    """Create a unique key for a doc (matching rag_brain.py implementation)."""
+    meta = doc.metadata or {}
+    source = meta.get("source")
+    page = meta.get("page")
+    if source is not None and page is not None:
+        return (source, page)
+    return (source, page, doc.page_content[:200])
+
+
+def _assign_rank_scores(docs: list, k_param: int = 60) -> dict:
+    """Assign RRF scores based on rank position."""
+    return {
+        _doc_key(doc): 1.0 / (k_param + rank)
+        for rank, doc in enumerate(docs, start=1)
+    }
+
+
+def _merge_score_dicts(*score_dicts) -> dict:
+    """Merge multiple score dictionaries by summing scores."""
+    result = {}
+    for scores in score_dicts:
+        for key, score in scores.items():
+            result[key] = result.get(key, 0) + score
+    return result
+
+
+def _rrf_fusion(semantic_docs: list, keyword_docs: list, k_param: int = 60) -> list:
+    """Fuse semantic and keyword search results using Reciprocal Rank Fusion."""
+    semantic_scores = _assign_rank_scores(semantic_docs, k_param)
+    keyword_scores = _assign_rank_scores(keyword_docs, k_param)
+    rrf_scores = _merge_score_dicts(semantic_scores, keyword_scores)
+    
+    # Build doc map from both sets
+    doc_map = {_doc_key(doc): doc for doc in semantic_docs + keyword_docs}
+    
+    # Sort by RRF score descending
+    sorted_keys = sorted(rrf_scores.items(), key=itemgetter(1), reverse=True)
+    
+    # Return docs in RRF order
+    return [doc_map[key] for key, _ in sorted_keys]
+
+def _grade_chunks(chunks: list, instruction: str, llm, file_ext: str = "") -> list:
+    """Post-retrieval chunk grading with language-aware auto-pass.
+    
+    Chunks from documentation matching the target language are automatically kept
+    (they already passed language pre-filter + cross-encoder reranking).
+    Only chunks from ambiguous/unknown sources get LLM-graded.
+    
+    This avoids the problem where small LLMs (7b) can't distinguish 
+    "useful C++ reference" from "irrelevant C++ reference" and mark everything IRRELEVANT.
+    """
+    if not chunks:
+        return chunks
+    
+    # Map file extension -> keywords that identify matching-language doc sources
+    _EXT_TO_SOURCE_KEYWORDS = {
+        '.py':   ['python'],
+        '.go':   ['go', 'golang'],
+        '.cpp':  ['c++', 'cplusplus', 'stroustrup', 'effective_modern', 'concurrency_in_action'],
+        '.c':    ['c++', 'cplusplus', 'stroustrup', 'c_programming'],
+        '.rs':   ['rust', 'rustaceans'],
+        '.ts':   ['typescript', 'angular'],
+        '.js':   ['javascript', 'typescript', 'angular'],
+        '.java': ['java'],
+        '.cs':   ['c#', 'csharp'],
+        '.rb':   ['ruby'],
+    }
+    # Language-agnostic docs are always auto-passed (design, clean code, refactoring)
+    _UNIVERSAL_KEYWORDS = ['clean_code', 'clean-code', 'refactoring', 'legacy', 'design_patterns']
+    
+    source_keywords = _EXT_TO_SOURCE_KEYWORDS.get(file_ext.lower(), [])
+    
+    # Split chunks into auto-pass (correct language / universal) and needs-grading
+    auto_pass = []
+    needs_grading = []
+    for doc in chunks:
+        source = doc.metadata.get('source', '').lower().replace(' ', '_').replace('-', '_')
+        
+        # Auto-pass: correct language OR universal doc
+        if (source_keywords and any(kw.replace('-', '_') in source for kw in source_keywords)) or \
+           any(u in source for u in _UNIVERSAL_KEYWORDS):
+            doc.metadata['graded'] = True
+            doc.metadata['auto_pass'] = True
+            auto_pass.append(doc)
+        else:
+            needs_grading.append(doc)
+    
+    if auto_pass:
+        logger.info("[CHUNK_GRADING] Auto-passed %d/%d chunks (correct language / universal docs)", 
+                    len(auto_pass), len(chunks))
+    
+    # Only LLM-grade the ambiguous chunks (wrong/unknown language sources)
+    graded_ambiguous = []
+    if needs_grading:
+        _EXT_TO_LANG = {
+            '.py': 'python', '.go': 'go', '.cpp': 'c++', '.c': 'c',
+            '.rs': 'rust', '.js': 'javascript', '.ts': 'typescript',
+            '.java': 'java', '.cs': 'c#', '.rb': 'ruby',
+        }
+        target_lang = _EXT_TO_LANG.get(file_ext.lower(), '')
+        
+        chunk_descriptions = []
+        for i, doc in enumerate(needs_grading):
+            source = doc.metadata.get('source', 'Unknown')
+            preview = doc.page_content[:400].replace('\n', ' ')
+            chunk_descriptions.append(f"  [{i+1}] {source}: {preview}...")
+        
+        chunks_block = "\n".join(chunk_descriptions)
+        
+        grade_prompt = (
+            f"You are grading retrieved document chunks for usefulness to a coding task.\n\n"
+            f"TASK: {instruction}\n"
+            f"TARGET LANGUAGE: {target_lang or 'unknown'}\n\n"
+            f"CHUNKS:\n{chunks_block}\n\n"
+            f"For each chunk, output ONE line: [N] RELEVANT or [N] IRRELEVANT\n\n"
+            f"RELEVANT = contains code, algorithms, data structures, or programming concepts "
+            f"useful for the task. IRRELEVANT = completely unrelated topic or wrong language.\n"
+            f"When in doubt, mark RELEVANT.\n\n"
+            f"Output {len(needs_grading)} lines, one per chunk. No other text."
+        )
+        
+        try:
+            result = llm.invoke(grade_prompt).strip()
+            lines = result.split('\n')
+            
+            for i, doc in enumerate(needs_grading):
+                keep = True
+                for line in lines:
+                    if f"[{i+1}]" in line:
+                        keep = "RELEVANT" in line.upper() and "IRRELEVANT" not in line.upper()
+                        break
+                if keep:
+                    doc.metadata['graded'] = True
+                    graded_ambiguous.append(doc)
+                else:
+                    logger.info("[CHUNK_GRADING] Filtered out ambiguous chunk %d: %s", i+1,
+                              doc.metadata.get('source', 'Unknown'))
+        except Exception as e:
+            logger.warning("[CHUNK_GRADING] Grading failed, keeping ambiguous chunks: %s", e)
+            graded_ambiguous = needs_grading
+    
+    final = auto_pass + graded_ambiguous
+    logger.info("[CHUNK_GRADING] Final: %d/%d chunks kept (%d auto-pass, %d graded)", 
+                len(final), len(chunks), len(auto_pass), len(graded_ambiguous))
+    return final
+
+
+def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cross_encoder", max_chunks: int = 7, file_path: str = "", search_method: str = "both") -> tuple[str, list[str]]:
+    """
+    Build RAG context using RRF (Reciprocal Rank Fusion) hybrid retrieval.
+    Combines BM25 (fast, keyword) and semantic (ChromaDB embeddings) search results.
+    
+    Returns (rag_context_string, citations_list).
     
     Args:
         instruction: The editing instruction to search for
         use_rag: Whether to enable RAG
         rerank_method: Reranking method - "cross_encoder" (default), "keyword", or "none"
-        max_chunks: Maximum number of chunks to include (default 7, may be limited by clarity)
+        max_chunks: Maximum number of chunks to include (default 7)
+        file_path: Path to the file being edited (for language-aware query enhancement)
+        search_method: "bm25" (keyword only), "semantic" (ChromaDB only), or "both" (RRF fusion)
     """
     rag_context = ""
+    citations: list[str] = []
     
     if not use_rag:
-        return rag_context
+        return rag_context, citations
     
-    print("\n[FAST_SEARCH] BM25 for code context...")
-    try:
-        results = fast_topic_search(instruction, rerank_method=rerank_method)
-        if results:
-            rag_context = "REFERENCE DOCS (Guide your edit):\n"
-            limited_results = results[:min(max_chunks, len(results))]
-            for i, doc in enumerate(limited_results):
-                score = doc.metadata.get('bm25_score', 'N/A')
-                doc_source = doc.metadata.get('source', 'Unknown')
-                score_str = f"{score:.1f}" if isinstance(score, (int, float)) else str(score)
-                rag_context += f"[{i+1}] {doc_source} (BM25:{score_str})\n{doc.page_content[:300]}...\n\n"
-            print(f"Found {len(results)} chunks, using {len(limited_results)}/{max_chunks}!")
-        else:
-            rag_context = "No exact matches—use general principles.\n"
-    except Exception as e:
-        logger.debug(f"RAG error: {e}")
-        print(f"RAG error: {e}")
+    # Language-aware query enhancement: inject language keywords to bias search
+    enhanced_query = instruction
+    ext = ""
+    if file_path:
+        import os
+        ext = os.path.splitext(file_path)[1].lower()
+        lang_map = {
+            '.py': 'Python programming',
+            '.go': 'Go Golang programming',
+            '.cpp': 'C++ programming',
+            '.c': 'C programming',
+            '.rs': 'Rust programming',
+            '.js': 'JavaScript programming',
+            '.ts': 'TypeScript programming',
+            '.java': 'Java programming',
+            '.cs': 'C# programming',
+            '.rb': 'Ruby programming',
+            '.php': 'PHP programming',
+            '.swift': 'Swift programming',
+            '.kt': 'Kotlin programming',
+        }
+        if ext in lang_map:
+            enhanced_query = f"{lang_map[ext]} {instruction}"
+            logger.info("[RAG] Enhanced query: %s", lang_map[ext])
+    
+    # --- BM25 Search (keyword-based) ---
+    bm25_results = []
+    if search_method in ("bm25", "both"):
+        logger.info("[RAG] Running BM25 search...")
+        try:
+            results = fast_topic_search(enhanced_query, rerank_method=rerank_method)
+            if results:
+                # Language pre-filter before limiting
+                if file_path:
+                    results = _language_prefilter(results, ext)
+                
+                # Don't grade BM25 yet; we'll grade after RRF fusion
+                bm25_results = results[:min(max_chunks * 2, len(results))]
+                logger.info("[RAG] BM25 returned %d results", len(bm25_results))
+        except Exception as e:
+            logger.warning("[RAG] BM25 search failed: %s", e)
+    
+    # --- ChromaDB Semantic Search ---
+    chroma_results = []
+    if search_method in ("semantic", "both"):
+        logger.info("[RAG] Running ChromaDB semantic search...")
+        try:
+            from langchain_chroma import Chroma
+            from langchain_ollama import OllamaEmbeddings
+            
+            embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+            vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
+            
+            # Get semantic results (more than max_chunks for RRF fusion)
+            semantic_docs = vectorstore.similarity_search(enhanced_query, k=max_chunks * 2)
+            
+            if semantic_docs and file_path:
+                # Apply language pre-filter
+                semantic_docs = _language_prefilter(semantic_docs, ext)
+            
+            chroma_results = semantic_docs[:min(max_chunks * 2, len(semantic_docs))]
+            logger.info("[RAG] ChromaDB returned %d results", len(chroma_results))
+        except Exception as e:
+            logger.warning("[RAG] ChromaDB search failed: %s", e)
+    
+    # --- RRF Fusion (combine BM25 + semantic using Reciprocal Rank Fusion) ---
+    final_results = []
+    if search_method == "both" and bm25_results and chroma_results:
+        logger.info("[RAG] Fusing BM25 and semantic results with RRF...")
+        fused = _rrf_fusion(chroma_results, bm25_results, k_param=60)
+        final_results = fused[:max_chunks * 2]
+        logger.info("[RAG] RRF fused to %d results (before grading)", len(final_results))
+    elif search_method == "both" and bm25_results:
+        logger.info("[RAG] Using BM25 only (no semantic results)")
+        final_results = bm25_results[:max_chunks * 2]
+    elif search_method == "both" and chroma_results:
+        logger.info("[RAG] Using ChromaDB only (no BM25 results)")
+        final_results = chroma_results[:max_chunks * 2]
+    elif search_method == "bm25":
+        final_results = bm25_results[:max_chunks * 2]
+    elif search_method == "semantic":
+        final_results = chroma_results[:max_chunks * 2]
+    
+    # --- Grade fused results for relevance ---
+    if final_results:
+        logger.info("[RAG] Grading %d fused chunks...", len(final_results))
+        try:
+            from langchain_ollama import OllamaLLM as _OllamaLLM
+            grade_llm = _OllamaLLM(model=LLM_MODEL, temperature=0.0)
+            file_ext = ext if file_path else ""
+            graded_results = _grade_chunks(final_results, instruction, grade_llm, file_ext=file_ext)
+            final_results = graded_results[:max_chunks]
+        except Exception as e:
+            logger.warning("[RAG] Chunk grading failed: %s", e)
+            final_results = final_results[:max_chunks]
+    
+    # --- Format output ---
+    if final_results:
+        rag_context = "REFERENCE DOCS (Guide your edit — graded for relevance):\n"
+        for i, doc in enumerate(final_results):
+            score = doc.metadata.get('bm25_score', 'N/A')
+            doc_source = doc.metadata.get('source', 'Unknown')
+            score_str = f"{score:.1f}" if isinstance(score, (int, float)) else str(score)
+            rag_context += f"[{i+1}] {doc_source} (score:{score_str})\n{doc.page_content[:300]}...\n\n"
+            citations.append(f"[{i+1}] {doc_source} (score:{score_str})")
+        print(f"[RAG] Final: {len(final_results)} chunks from hybrid retrieval")
+    else:
+        rag_context = "No relevant matches—use general principles.\n"
+        print("[RAG] No results from any search method")
 
-    return rag_context
+    return rag_context, citations
 
 
 def build_history_context(session_chat_history: Optional[List[Dict[str, str]]]) -> str:
@@ -212,24 +533,26 @@ def build_all_contexts(
     edit_log: dict,
     rerank_method: str = "cross_encoder",
     file_source: str = "",
-    max_chunks: Optional[int] = None
-) -> tuple[str, str, str, str]:
+    max_chunks: Optional[int] = None,
+    search_method: str = "both"
+) -> tuple[str, str, str, str, list[str]]:
     """
     Build all context types at once.
-    Returns tuple of (runtime_error_note, rag_context, history_context, edit_history_text).
+    Returns tuple of (runtime_error_note, rag_context, history_context, edit_history_text, citations).
     
     Args:
         rerank_method: Reranking method for RAG - "cross_encoder", "keyword", or "none"
         file_source: Full source code (used to assess clarity for RAG chunking)
+        search_method: "bm25", "semantic", or "both" (default)
     """
     runtime_error_note = build_runtime_error_notes(path, ext, is_python, file_lines)
     
     # Assess instruction clarity and determine optimal RAG chunk limit (unless overridden)
     if max_chunks is None:
         max_chunks = assess_instruction_clarity(instruction, file_source) if file_source else 7
-    rag_context = build_rag_context(instruction, use_rag, rerank_method=rerank_method, max_chunks=max_chunks)
+    rag_context, citations = build_rag_context(instruction, use_rag, rerank_method=rerank_method, max_chunks=max_chunks, file_path=path, search_method=search_method)
     
     history_context = build_history_context(session_chat_history)
     edit_history_text = build_edit_history(edit_log, path)
     
-    return runtime_error_note, rag_context, history_context, edit_history_text
+    return runtime_error_note, rag_context, history_context, edit_history_text, citations

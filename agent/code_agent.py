@@ -36,6 +36,19 @@ class CodeAgent:
         self.edit_log: dict[str, list] = {}
 
     @staticmethod
+    def _is_implement_task(instruction: str) -> bool:
+        """Return True when the instruction is asking to build/implement something new
+        rather than fix/edit existing code."""
+        IMPLEMENT_KEYWORDS = {
+            "implement", "solve", "write", "build", "create", "code",
+            "given", "return the", "return minimum", "return maximum",
+            "leetcode", "algorithm", "function that", "program that",
+            "find the", "compute", "calculate", "design",
+        }
+        instruction_lower = instruction.lower()
+        return any(kw in instruction_lower for kw in IMPLEMENT_KEYWORDS)
+
+    @staticmethod
     def _resolve_rerank_method(instruction: str, rerank_method: str) -> str:
         """Auto-select rerank method based on instruction complexity.
         
@@ -69,7 +82,9 @@ class CodeAgent:
         use_rag: bool = False,
         session_chat_history: Optional[List[Dict[str, str]]] = None,
         rerank_method: str = "cross_encoder",
-        max_chunks: Optional[int] = None
+        max_chunks: Optional[int] = None,
+        task_mode: str = "auto",
+        search_method: str = "both"
     ) -> str:
         """Edit code in a file based on instruction using LLM.
         
@@ -80,11 +95,23 @@ class CodeAgent:
             use_rag: If True, include RAG context from code search
             session_chat_history: Optional conversation history for context
             rerank_method: Reranking method for RAG - "cross_encoder", "keyword", or "none"
+            task_mode: "fix" forces fix mode, "solve" forces implement mode, "auto" detects from instruction
+            search_method: "bm25", "semantic", or "both" (default) for RAG search method
         """
         file_source = read_file(path)
         ext = os.path.splitext(path)[1].lower()
         is_python = ext == ".py"
         lang_fence = "python" if is_python else (ext.lstrip('.') if ext else "text")
+
+        # Human-readable language name for prompts (prevents model from defaulting to Python)
+        _LANG_NAMES = {
+            '.py': 'Python', '.go': 'Go', '.cpp': 'C++', '.c': 'C',
+            '.rs': 'Rust', '.js': 'JavaScript', '.ts': 'TypeScript',
+            '.java': 'Java', '.cs': 'C#', '.rb': 'Ruby', '.php': 'PHP',
+            '.swift': 'Swift', '.kt': 'Kotlin',
+        }
+        lang_name = _LANG_NAMES.get(ext, ext.lstrip('.').upper() if ext else 'the same language as the file')
+        lang_directive = f"LANGUAGE REQUIREMENT: You MUST write {lang_name} code. The file is a {lang_name} file ({ext}). Do NOT use any other programming language.\n\n"
 
         # Resolve "auto" rerank method based on instruction complexity
         rerank_method = self._resolve_rerank_method(instruction, rerank_method)
@@ -113,7 +140,7 @@ class CodeAgent:
             logger.info("Found %s syntax error(s) in %s", len(syntax_errors), path)
 
         # Build all context (runtime errors, RAG, history, edit log) in one call
-        runtime_error_note, rag_context, history_context, edit_history_text = build_all_contexts(
+        runtime_error_note, rag_context, history_context, edit_history_text, rag_citations = build_all_contexts(
             path=path,
             ext=ext,
             is_python=is_python,
@@ -124,7 +151,8 @@ class CodeAgent:
             edit_log=self.edit_log,
             rerank_method=rerank_method,
             file_source=file_source,
-            max_chunks=max_chunks
+            max_chunks=max_chunks,
+            search_method=search_method
         )
 
         # Only build runtime errors if no syntax errors were found
@@ -182,14 +210,37 @@ class CodeAgent:
 
         llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
 
+        if task_mode == "solve":
+            is_implement = True
+            logger.info("[AGENT] task_mode=solve — build mode active")
+        elif task_mode == "fix":
+            is_implement = False
+            logger.info("[AGENT] task_mode=fix — fix mode active")
+        else:
+            is_implement = self._is_implement_task(instruction)
+            if is_implement:
+                logger.info("[AGENT] task_mode=auto detected implementation task — switching to build mode")
+
         # --- Two-stage: analysis then edit ---
         logger.info("Waiting for LLM to analyze the issue...")
         try:
-            analysis_prompt = (
-                f"Look at this code and describe what needs to change to fix: {instruction}\n\n"
-                f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
-                f"{context_block}" 
-            )
+            if is_implement:
+                analysis_prompt = (
+                    f"You are solving a programming task. Read the requirement carefully and plan the solution.\n\n"
+                    f"{lang_directive}"
+                    f"TASK: {instruction}\n\n"
+                    f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
+                    "Describe step-by-step what algorithm or logic you will implement to satisfy the requirement. "
+                    "Be specific about data structures, loop structure, and edge cases.\n\n"
+                    f"{context_block}"
+                )
+            else:
+                analysis_prompt = (
+                    f"Look at this code and describe what needs to change to fix: {instruction}\n\n"
+                    f"{lang_directive}"
+                    f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
+                    f"{context_block}"
+                )
             analysis = llm.invoke(analysis_prompt).strip()
 
             logger.info("Analysis received; requesting SEARCH/REPLACE from LLM...")
@@ -230,19 +281,36 @@ class CodeAgent:
             else:
                 block_instruction = "Now produce a SEARCH/REPLACE block. Rules:\n"
             
-            edit_prompt = (
-                f"Given this analysis:\n{analysis}\n\n"
-                f"{block_instruction}"
-                "1. SEARCH must EXACTLY match existing code character-for-character including indentation.\n"
-                "2. Include a few lines of surrounding context so SEARCH is unique in the file.\n"
-                "3. When ADDING code, keep the surrounding lines in REPLACE so they are not deleted.\n"
-                "4. Output ONLY the blocks — no explanatory text, no comments.\n\n"
-                "CRITICAL RULE: Your SEARCH blocks must contain ONLY the specific lines being changed (max 20-30 lines each). "
-                "Output all blocks back-to-back with no commentary between them.\n\n"
-                f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
-                f"INSTRUCTION: {instruction}\n\n"
-                f"{context_block}"
-            )
+            if is_implement:
+                edit_prompt = (
+                    f"Given this plan:\n{analysis}\n\n"
+                    f"{lang_directive}"
+                    f"{block_instruction}"
+                    "You are IMPLEMENTING a complete solution inside an existing stub function.\n"
+                    "1. SEARCH must EXACTLY match the existing stub lines character-for-character including indentation.\n"
+                    "2. REPLACE must contain the FULL working implementation — do not leave the body empty.\n"
+                    "3. Include a few surrounding lines in SEARCH to make it unique.\n"
+                    "4. Output ONLY the block(s) — no explanatory text.\n\n"
+                    "CRITICAL: Write a real, complete algorithm in REPLACE. Do not output a placeholder or pass.\n\n"
+                    f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
+                    f"TASK: {instruction}\n\n"
+                    f"{context_block}"
+                )
+            else:
+                edit_prompt = (
+                    f"Given this analysis:\n{analysis}\n\n"
+                    f"{lang_directive}"
+                    f"{block_instruction}"
+                    "1. SEARCH must EXACTLY match existing code character-for-character including indentation.\n"
+                    "2. Include a few lines of surrounding context so SEARCH is unique in the file.\n"
+                    "3. When ADDING code, keep the surrounding lines in REPLACE so they are not deleted.\n"
+                    "4. Output ONLY the blocks — no explanatory text, no comments.\n\n"
+                    "CRITICAL RULE: Your SEARCH blocks must contain ONLY the specific lines being changed (max 20-30 lines each). "
+                    "Output all blocks back-to-back with no commentary between them.\n\n"
+                    f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
+                    f"INSTRUCTION: {instruction}\n\n"
+                    f"{context_block}"
+                )
             raw_output = llm.invoke(edit_prompt).strip()
         except Exception as e:
             logger.error("LLM invocation failed: %s", e)
@@ -422,15 +490,29 @@ class CodeAgent:
         # --- Whole-function rewrite fallback ---
         if new_source == file_source and blocks:
             logger.warning("Verbatim retry also failed — falling back to whole-function rewrite")
-            rewrite_prompt = (
-                f"Rewrite the following code to apply this change: {instruction}\n\n"
-                f"CURRENT CODE:\n```{lang_fence}\n{verbatim}\n```\n\n"
-                "Rules:\n"
-                "1. Output ONLY the rewritten code — no explanation, no markdown fence.\n"
-                "2. Preserve ALL existing logic except what the instruction explicitly changes.\n"
-                "3. Keep exact indentation of the original.\n"
-                f"{context_block}"
-            )
+            if is_implement:
+                rewrite_prompt = (
+                    f"Implement a complete solution for the following task inside the function stub below.\n\n"
+                    f"{lang_directive}"
+                    f"TASK: {instruction}\n\n"
+                    f"FUNCTION STUB:\n```{lang_fence}\n{verbatim}\n```\n\n"
+                    "Rules:\n"
+                    "1. Output ONLY the complete rewritten function — no explanation, no markdown fence.\n"
+                    "2. Write a real, working algorithm. Do NOT leave the body empty or return a placeholder.\n"
+                    "3. Keep exact indentation of the original.\n"
+                    f"{context_block}"
+                )
+            else:
+                rewrite_prompt = (
+                    f"Rewrite the following code to apply this change: {instruction}\n\n"
+                    f"{lang_directive}"
+                    f"CURRENT CODE:\n```{lang_fence}\n{verbatim}\n```\n\n"
+                    "Rules:\n"
+                    "1. Output ONLY the rewritten code — no explanation, no markdown fence.\n"
+                    "2. Preserve ALL existing logic except what the instruction explicitly changes.\n"
+                    "3. Keep exact indentation of the original.\n"
+                    f"{context_block}"
+                )
             try:
                 rewritten = llm.invoke(rewrite_prompt).strip()
                 rewritten = strip_markdown(rewritten) if "```" in rewritten else rewritten
@@ -454,14 +536,95 @@ class CodeAgent:
                 logger.error("Whole-function rewrite LLM call failed: %s", e)
                 logger.debug(traceback.format_exc())
 
+        # --- Self-correction: LLM grades its own output and fixes logical errors ---
+        if is_implement and new_source != file_source:
+            logger.info("[AGENT] Self-correction: grading generated code against requirement...")
+            try:
+                grade_prompt = (
+                    f"You just wrote code to satisfy this requirement:\n"
+                    f"REQUIREMENT: {instruction}\n\n"
+                    f"YOUR CODE:\n```{lang_fence}\n{new_source}\n```\n\n"
+                    "Does this code correctly and completely satisfy the requirement?\n"
+                    "Respond with EXACTLY one of these two formats:\n"
+                    "  CORRECT: <brief reason>\n"
+                    "  ISSUE: <specific description of the bug or missing logic>\n\n"
+                    "Only output one line. No other text."
+                )
+                grade_result = llm.invoke(grade_prompt).strip()
+                logger.info("[AGENT] Self-grade result: %s", grade_result[:200])
+
+                if grade_result.upper().startswith("ISSUE:"):
+                    issue_description = grade_result[len("ISSUE:"):].strip()
+                    logger.info("[AGENT] Self-correction triggered — fixing: %s", issue_description)
+                    correction_prompt = (
+                        f"Your previous code has a logical error:\n"
+                        f"ISSUE: {issue_description}\n\n"
+                        f"ORIGINAL REQUIREMENT: {instruction}\n\n"
+                        f"CURRENT CODE:\n```{lang_fence}\n{new_source}\n```\n\n"
+                        "Fix ONLY the described issue. Output a SEARCH/REPLACE block.\n"
+                        "1. SEARCH must match the current code character-for-character.\n"
+                        "2. REPLACE must contain the corrected logic.\n"
+                        "3. Output ONLY the block — no explanation.\n\n"
+                        f"FORMAT:\n{FORMAT_BLOCK}"
+                    )
+                    raw_correction = llm.invoke(correction_prompt).strip()
+                    correction_blocks = parse_multiple_blocks(raw_correction)
+                    if not correction_blocks:
+                        raw_correction = strip_markdown(raw_correction)
+                        correction_blocks = parse_multiple_blocks(raw_correction)
+                    if correction_blocks:
+                        corrected_lines = new_source.split('\n')
+                        for s_text, r_text in correction_blocks:
+                            m_idx, r_lines, m_len = apply_block_to_lines(corrected_lines, s_text, r_text)
+                            if m_idx != -1:
+                                corrected_lines = (
+                                    corrected_lines[:m_idx] + r_lines + corrected_lines[m_idx + m_len:]
+                                )
+                                logger.info("[AGENT] Self-correction block applied")
+                            else:
+                                logger.warning("[AGENT] Self-correction block could not be located. Skipping.")
+                        new_source = "\n".join(corrected_lines)
+                        logger.info("[AGENT] Self-correction complete")
+                    else:
+                        logger.warning("[AGENT] Self-correction produced no valid blocks.")
+                else:
+                    logger.info("[AGENT] Self-correction: code graded as correct.")
+            except Exception as e:
+                logger.warning("[AGENT] Self-correction failed: %s", e)
+                logger.debug(traceback.format_exc())
+
         diff = show_diff(file_source, new_source)
         logger.info("--- DIFF PREVIEW ---")
         logger.info('\n%s', diff or "No changes detected.")
         logger.info("--------------------")
 
+        # Generate explanation of what the agent did and why
+        explanation = ""
+        if new_source != file_source and is_implement:
+            try:
+                explain_prompt = (
+                    f"You just implemented code for this task:\\n"
+                    f"TASK: {instruction[:300]}\\n\\n"
+                    f"Briefly explain (3-4 lines max):\\n"
+                    f"1. What approach/algorithm you used\\n"
+                    f"2. Why you chose it\\n"
+                    f"3. Any edge cases handled\\n"
+                    f"Be concise. No code."
+                )
+                explanation = llm.invoke(explain_prompt).strip()
+                logger.info("[AGENT] Generated explanation: %s", explanation[:200])
+            except Exception as e:
+                logger.debug("Explanation generation failed: %s", e)
+
         if dry_run:
             logger.info("Dry run mode enabled; no file written.")
-            return {"new_source": new_source, "diff": diff, "changed": new_source != file_source}
+            return {
+                "new_source": new_source,
+                "diff": diff,
+                "changed": new_source != file_source,
+                "explanation": explanation,
+                "citations": rag_citations,
+            }
 
         try:
             write_file(path, new_source)
@@ -496,6 +659,146 @@ class CodeAgent:
 
         logger.info("Wrote file %s", path)
         return new_source
+
+    def fix_with_tests(
+        self,
+        path: str,
+        instruction: str,
+        test_cases: list,
+        max_retries: int = 3,
+        task_mode: str = "solve",
+    ) -> dict:
+        """Iteratively fix code until all test cases pass or max_retries is exhausted.
+
+        Features:
+          - Self-reasoning: LLM traces through failing tests to identify root cause
+          - Degradation detector: stops if pass count drops between iterations
+          - Temperature escalation: bumps temperature when stuck at same pass count
+          - Explanation + citations: returns what the agent did and which RAG docs it used
+
+        Returns dict with final_source, test_results, all_passed, attempts, diff,
+               explanation, citations.
+        """
+        from .test_runner import run_tests, build_test_failure_note
+
+        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+        original_source = read_file(path)
+        source = original_source
+        all_results: list = []
+        attempts = 0
+        best_pass_count = 0
+        best_source = source
+        explanation_parts: list[str] = []
+        citations: list[str] = []
+        current_temperature = 0.0
+
+        for attempt in range(max_retries + 1):
+            logger.info("[FIX_WITH_TESTS] Attempt %d — running %d test case(s)...", attempt, len(test_cases))
+            results = run_tests(source, path, test_cases, llm)
+            all_results = results
+
+            pass_count = sum(1 for r in results if r["passed"])
+            failures = [r for r in results if not r["passed"]]
+
+            if not failures:
+                logger.info("[FIX_WITH_TESTS] All tests passed on attempt %d ✓", attempt)
+                explanation_parts.append(f"Attempt {attempt}: All {len(results)} tests passed.")
+                best_source = source
+                break
+
+            explanation_parts.append(
+                f"Attempt {attempt}: {pass_count}/{len(results)} tests passing."
+            )
+
+            # --- Degradation detector ---
+            if attempt > 0 and pass_count < best_pass_count:
+                logger.warning(
+                    "[FIX_WITH_TESTS] Degradation detected: %d passing → %d passing. "
+                    "Reverting to best state and stopping.",
+                    best_pass_count, pass_count
+                )
+                explanation_parts.append(
+                    f"Degradation detected ({best_pass_count} → {pass_count} passing). "
+                    "Reverted to best state and stopped."
+                )
+                source = best_source
+                # Re-run tests on best source to get accurate final results
+                all_results = run_tests(source, path, test_cases, llm)
+                break
+
+            if pass_count > best_pass_count:
+                best_pass_count = pass_count
+                best_source = source
+
+            if attempt >= max_retries:
+                logger.warning(
+                    "[FIX_WITH_TESTS] Reached max retries (%d) with %d test(s) still failing.",
+                    max_retries, len(failures)
+                )
+                break
+
+            # --- Temperature escalation ---
+            # If pass count is stagnant (same as last iteration), bump temperature
+            if attempt > 0 and pass_count == best_pass_count and current_temperature < 0.4:
+                current_temperature = min(current_temperature + 0.15, 0.4)
+                llm = OllamaLLM(model=LLM_MODEL, temperature=current_temperature)
+                logger.info(
+                    "[FIX_WITH_TESTS] Pass count stagnant — escalating temperature to %.2f",
+                    current_temperature
+                )
+                explanation_parts.append(
+                    f"Escalated temperature to {current_temperature:.2f} for creative problem-solving."
+                )
+
+            # --- Self-reasoning: trace through test to find root cause ---
+            failure_note = build_test_failure_note(results, instruction, source=source, llm=llm)
+            augmented_instruction = f"{instruction}\n\n{failure_note}"
+            attempts += 1
+
+            # Write current source so edit_code reads the right state
+            write_file(path, source)
+
+            edit_result = self.edit_code(
+                path=path,
+                instruction=augmented_instruction,
+                dry_run=True,
+                use_rag=True,
+                task_mode=task_mode,
+            )
+
+            if isinstance(edit_result, dict) and edit_result.get("changed"):
+                source = edit_result.get("new_source", source)
+                logger.info("[FIX_WITH_TESTS] Code updated on attempt %d, re-running tests...", attempt)
+            else:
+                logger.warning("[FIX_WITH_TESTS] LLM made no changes on attempt %d — stopping.", attempt)
+                explanation_parts.append(f"Attempt {attempt}: No code changes produced — stopped.")
+                break
+
+        # Use best source if final source is worse
+        final_pass_count = sum(1 for r in all_results if r["passed"])
+        if final_pass_count < best_pass_count:
+            source = best_source
+            all_results = run_tests(source, path, test_cases, llm)
+
+        # Persist final source
+        write_file(path, source)
+        diff = show_diff(original_source, source)
+
+        # Build explanation summary
+        explanation = (
+            f"Agent worked on: {instruction[:120]}{'...' if len(instruction) > 120 else ''}\n"
+            + "\n".join(explanation_parts)
+        )
+
+        return {
+            "final_source": source,
+            "test_results": all_results,
+            "all_passed": all(r["passed"] for r in all_results),
+            "attempts": attempts,
+            "diff": diff,
+            "explanation": explanation,
+            "citations": citations,
+        }
 
     def list_db_code(self, limit: int = 20):
         docs = get_code_documents(limit=limit)
