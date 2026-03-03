@@ -4,12 +4,13 @@ import logging
 import sys
 import traceback
 from datetime import datetime
+from types import SimpleNamespace
 import os
 
 from langchain_ollama import OllamaLLM
 from typing import List, Dict, Optional
 
-from brain.config import LLM_MODEL
+from brain.config import LLM_MODEL, LANG_NAMES, LANG_FENCE, IMPLEMENT_KEYWORDS
 from brain.fast_search import fast_topic_search
 from db.db_reader import get_code_documents
 from .tools import read_file, write_file, run_git_command, show_diff, run_python_file, run_shell_command, list_files
@@ -18,12 +19,10 @@ from .code_editing_helpers import (
     detect_indent_char, extract_function, apply_block_to_lines,
     is_oversized_block, find_first_mismatch, whole_function_replace,
     strip_markdown, parse_multiple_blocks, build_syntax_error_note,
-    build_runtime_error_note, build_post_error_note
+    build_runtime_error_note, build_post_error_note,
+    validate_code_structure, build_structural_issue_note
 )
 from .code_context_builders import build_all_contexts
-
-#recognize function/class definitions in multiple languages for better context extraction
-FUNC_PATTERN = re.compile(r"\s*(def|class|func)\s+\w+")
 
 logger = logging.getLogger("code_agent")
 if not logger.handlers:
@@ -39,12 +38,6 @@ class CodeAgent:
     def _is_implement_task(instruction: str) -> bool:
         """Return True when the instruction is asking to build/implement something new
         rather than fix/edit existing code."""
-        IMPLEMENT_KEYWORDS = {
-            "implement", "solve", "write", "build", "create", "code",
-            "given", "return the", "return minimum", "return maximum",
-            "leetcode", "algorithm", "function that", "program that",
-            "find the", "compute", "calculate", "design",
-        }
         instruction_lower = instruction.lower()
         return any(kw in instruction_lower for kw in IMPLEMENT_KEYWORDS)
 
@@ -101,16 +94,9 @@ class CodeAgent:
         file_source = read_file(path)
         ext = os.path.splitext(path)[1].lower()
         is_python = ext == ".py"
-        lang_fence = "python" if is_python else (ext.lstrip('.') if ext else "text")
+        lang_fence = LANG_FENCE.get(ext, ext.lstrip('.') if ext else 'text')
 
-        # Human-readable language name for prompts (prevents model from defaulting to Python)
-        _LANG_NAMES = {
-            '.py': 'Python', '.go': 'Go', '.cpp': 'C++', '.c': 'C',
-            '.rs': 'Rust', '.js': 'JavaScript', '.ts': 'TypeScript',
-            '.java': 'Java', '.cs': 'C#', '.rb': 'Ruby', '.php': 'PHP',
-            '.swift': 'Swift', '.kt': 'Kotlin',
-        }
-        lang_name = _LANG_NAMES.get(ext, ext.lstrip('.').upper() if ext else 'the same language as the file')
+        lang_name = LANG_NAMES.get(ext, ext.lstrip('.').upper() if ext else 'the same language as the file')
         lang_directive = f"LANGUAGE REQUIREMENT: You MUST write {lang_name} code. The file is a {lang_name} file ({ext}). Do NOT use any other programming language.\n\n"
 
         # Resolve "auto" rerank method based on instruction complexity
@@ -245,42 +231,10 @@ class CodeAgent:
 
             logger.info("Analysis received; requesting SEARCH/REPLACE from LLM...")
             
-            # When fixing multiple functions, instruct LLM to output multiple blocks
-            if multi_func_hint:
-                # Build a descriptive label list from whatever hint form was detected
-                func_matches = re.findall(r'\b(\w+)\(\)', instruction)
-                quoted_items = re.findall(r'"([^"]{5,})"', instruction)
-                func_name_mentions = re.findall(r'\b(?:the\s+)?(\w+)\s+(?:function|method)\b', instruction, re.IGNORECASE)
+            block_instruction = self._build_block_instruction(
+                multi_func_hint, instruction, lang_fence
+            )
 
-                if quoted_items:
-                    task_labels = quoted_items
-                elif func_matches:
-                    task_labels = [f"{n}()" for n in func_matches]
-                elif func_name_mentions:
-                    task_labels = list(dict.fromkeys(func_name_mentions))  # deduplicated, preserving order
-                else:
-                    task_labels = ["each fix listed in the instruction"]
-
-                task_count = len(task_labels)
-                task_list = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(task_labels))
-
-                block_instruction = (
-                    f"Now produce ONE SEARCH/REPLACE block for EACH of the {task_count} tasks:\n{task_list}\n\n"
-                    f"You MUST output {task_count} separate blocks — one COMPLETE block per task.\n"
-                    "For EACH task, output BOTH the SEARCH and REPLACE sections back-to-back with no text between them.\n\n"
-                    "TEMPLATE TO REPEAT FOR EACH TASK:\n"
-                    f"```{lang_fence}\n"
-                    "<<<<<<< SEARCH\n"
-                    "(exact old code for this fix)\n"
-                    "=======\n"
-                    "(exact new code for this fix)\n"
-                    ">>>>>>> REPLACE\n"
-                    "```\n\n"
-                    f"Output all {task_count} blocks sequentially with no commentary between them.\n"
-                )
-            else:
-                block_instruction = "Now produce a SEARCH/REPLACE block. Rules:\n"
-            
             if is_implement:
                 edit_prompt = (
                     f"Given this plan:\n{analysis}\n\n"
@@ -415,6 +369,43 @@ class CodeAgent:
 
         new_source = "\n".join(source_lines)
 
+        # --- Structural validation (all languages: brace balance, unreachable code, indentation) ---
+        structural_issues = validate_code_structure(new_source, ext)
+        if structural_issues and new_source != file_source:
+            logger.warning("Structural issues after edit: %s", [i['msg'] for i in structural_issues])
+            structural_note = build_structural_issue_note(structural_issues, source_lines)
+            try:
+                repair_prompt = (
+                    f"CURRENT FILE STATE:\n```{lang_fence}\n{new_source}\n```\n\n"
+                    "Your previous edits introduced structural issues. "
+                    "Fix them without reverting the intended changes.\n\n"
+                    f"{structural_note}"
+                    "Output ONE SEARCH/REPLACE block per issue.\n"
+                    "Each SEARCH block must match the CURRENT FILE STATE exactly."
+                )
+                raw_repair = llm.invoke(repair_prompt).strip()
+                repair_blocks = parse_multiple_blocks(raw_repair)
+                if not repair_blocks:
+                    repair_blocks = parse_multiple_blocks(strip_markdown(raw_repair))
+                for search_text, replace_text in repair_blocks:
+                    if is_oversized_block(search_text, source_lines, None, prefix="Structural-repair"):
+                        continue
+                    match_start_idx, replace_lines, matched_len = apply_block_to_lines(
+                        source_lines, search_text, replace_text
+                    )
+                    if match_start_idx != -1:
+                        logger.info("Structural repair block applied at line %s", match_start_idx)
+                        source_lines = (
+                            source_lines[:match_start_idx]
+                            + replace_lines
+                            + source_lines[match_start_idx + matched_len:]
+                        )
+                    else:
+                        logger.warning("Structural repair block could not be located. Skipping.")
+                new_source = "\n".join(source_lines)
+            except Exception as e:
+                logger.warning("Structural repair LLM call failed: %s", e)
+
         if new_source == file_source and blocks:
             logger.warning("Blocks parsed but no changes landed — triggering verbatim retry")
 
@@ -536,69 +527,126 @@ class CodeAgent:
                 logger.error("Whole-function rewrite LLM call failed: %s", e)
                 logger.debug(traceback.format_exc())
 
-        # --- Self-correction: LLM grades its own output and fixes logical errors ---
-        if is_implement and new_source != file_source:
-            logger.info("[AGENT] Self-correction: grading generated code against requirement...")
-            try:
-                grade_prompt = (
-                    f"You just wrote code to satisfy this requirement:\n"
-                    f"REQUIREMENT: {instruction}\n\n"
-                    f"YOUR CODE:\n```{lang_fence}\n{new_source}\n```\n\n"
-                    "Does this code correctly and completely satisfy the requirement?\n"
-                    "Respond with EXACTLY one of these two formats:\n"
-                    "  CORRECT: <brief reason>\n"
-                    "  ISSUE: <specific description of the bug or missing logic>\n\n"
-                    "Only output one line. No other text."
+        # --- Self-correction ---
+        new_source = self._self_correct_output(
+            llm, new_source, file_source, is_implement, instruction, lang_fence, FORMAT_BLOCK
+        )
+
+        # --- Finalize: diff, explanation, write ---
+        return self._finalize_edit(
+            file_source, new_source, path, ext, dry_run,
+            instruction, is_implement, llm, rag_citations, session_chat_history
+        )
+
+    # ─── Extracted helper methods for edit_code ─────────────────────────────
+
+    @staticmethod
+    def _build_block_instruction(multi_func_hint, instruction, lang_fence):
+        """Build single or multi-block SEARCH/REPLACE instruction for the edit prompt."""
+        if not multi_func_hint:
+            return "Now produce a SEARCH/REPLACE block. Rules:\n"
+
+        func_matches = re.findall(r'\b(\w+)\(\)', instruction)
+        quoted_items = re.findall(r'"([^"]{5,})"', instruction)
+        func_name_mentions = re.findall(
+            r'\b(?:the\s+)?(\w+)\s+(?:function|method)\b', instruction, re.IGNORECASE
+        )
+
+        if quoted_items:
+            task_labels = quoted_items
+        elif func_matches:
+            task_labels = [f"{n}()" for n in func_matches]
+        elif func_name_mentions:
+            task_labels = list(dict.fromkeys(func_name_mentions))
+        else:
+            task_labels = ["each fix listed in the instruction"]
+
+        task_count = len(task_labels)
+        task_list = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(task_labels))
+
+        return (
+            f"Now produce ONE SEARCH/REPLACE block for EACH of the {task_count} tasks:\n{task_list}\n\n"
+            f"You MUST output {task_count} separate blocks — one COMPLETE block per task.\n"
+            "For EACH task, output BOTH the SEARCH and REPLACE sections back-to-back "
+            "with no text between them.\n\n"
+            "TEMPLATE TO REPEAT FOR EACH TASK:\n"
+            f"```{lang_fence}\n"
+            "<<<<<<< SEARCH\n(exact old code for this fix)\n=======\n"
+            "(exact new code for this fix)\n>>>>>>> REPLACE\n```\n\n"
+            f"Output all {task_count} blocks sequentially with no commentary between them.\n"
+        )
+
+    @staticmethod
+    def _self_correct_output(llm, new_source, file_source, is_implement,
+                             instruction, lang_fence, FORMAT_BLOCK):
+        """Self-correction: LLM grades its own output and fixes logical errors."""
+        if not (is_implement and new_source != file_source):
+            return new_source
+
+        logger.info("[AGENT] Self-correction: grading generated code...")
+        try:
+            grade_prompt = (
+                f"You just wrote code to satisfy this requirement:\n"
+                f"REQUIREMENT: {instruction}\n\n"
+                f"YOUR CODE:\n```{lang_fence}\n{new_source}\n```\n\n"
+                "Does this code correctly and completely satisfy the requirement?\n"
+                "Respond with EXACTLY one of these two formats:\n"
+                "  CORRECT: <brief reason>\n"
+                "  ISSUE: <specific description of the bug or missing logic>\n\n"
+                "Only output one line. No other text."
+            )
+            grade_result = llm.invoke(grade_prompt).strip()
+            logger.info("[AGENT] Self-grade: %s", grade_result[:200])
+
+            if grade_result.upper().startswith("ISSUE:"):
+                issue = grade_result[len("ISSUE:"):].strip()
+                logger.info("[AGENT] Self-correction triggered: %s", issue)
+                correction_prompt = (
+                    f"Your previous code has a logical error:\n"
+                    f"ISSUE: {issue}\n\n"
+                    f"ORIGINAL REQUIREMENT: {instruction}\n\n"
+                    f"CURRENT CODE:\n```{lang_fence}\n{new_source}\n```\n\n"
+                    "Fix ONLY the described issue. Output a SEARCH/REPLACE block.\n"
+                    "1. SEARCH must match the current code character-for-character.\n"
+                    "2. REPLACE must contain the corrected logic.\n"
+                    "3. Output ONLY the block — no explanation.\n\n"
+                    f"FORMAT:\n{FORMAT_BLOCK}"
                 )
-                grade_result = llm.invoke(grade_prompt).strip()
-                logger.info("[AGENT] Self-grade result: %s", grade_result[:200])
-
-                if grade_result.upper().startswith("ISSUE:"):
-                    issue_description = grade_result[len("ISSUE:"):].strip()
-                    logger.info("[AGENT] Self-correction triggered — fixing: %s", issue_description)
-                    correction_prompt = (
-                        f"Your previous code has a logical error:\n"
-                        f"ISSUE: {issue_description}\n\n"
-                        f"ORIGINAL REQUIREMENT: {instruction}\n\n"
-                        f"CURRENT CODE:\n```{lang_fence}\n{new_source}\n```\n\n"
-                        "Fix ONLY the described issue. Output a SEARCH/REPLACE block.\n"
-                        "1. SEARCH must match the current code character-for-character.\n"
-                        "2. REPLACE must contain the corrected logic.\n"
-                        "3. Output ONLY the block — no explanation.\n\n"
-                        f"FORMAT:\n{FORMAT_BLOCK}"
-                    )
-                    raw_correction = llm.invoke(correction_prompt).strip()
-                    correction_blocks = parse_multiple_blocks(raw_correction)
-                    if not correction_blocks:
-                        raw_correction = strip_markdown(raw_correction)
-                        correction_blocks = parse_multiple_blocks(raw_correction)
-                    if correction_blocks:
-                        corrected_lines = new_source.split('\n')
-                        for s_text, r_text in correction_blocks:
-                            m_idx, r_lines, m_len = apply_block_to_lines(corrected_lines, s_text, r_text)
-                            if m_idx != -1:
-                                corrected_lines = (
-                                    corrected_lines[:m_idx] + r_lines + corrected_lines[m_idx + m_len:]
-                                )
-                                logger.info("[AGENT] Self-correction block applied")
-                            else:
-                                logger.warning("[AGENT] Self-correction block could not be located. Skipping.")
-                        new_source = "\n".join(corrected_lines)
-                        logger.info("[AGENT] Self-correction complete")
-                    else:
-                        logger.warning("[AGENT] Self-correction produced no valid blocks.")
+                raw = llm.invoke(correction_prompt).strip()
+                blocks = parse_multiple_blocks(raw)
+                if not blocks:
+                    blocks = parse_multiple_blocks(strip_markdown(raw))
+                if blocks:
+                    lines = new_source.split('\n')
+                    for s_text, r_text in blocks:
+                        m_idx, r_lines, m_len = apply_block_to_lines(lines, s_text, r_text)
+                        if m_idx != -1:
+                            lines = lines[:m_idx] + r_lines + lines[m_idx + m_len:]
+                            logger.info("[AGENT] Self-correction block applied")
+                        else:
+                            logger.warning("[AGENT] Self-correction block could not be located.")
+                    new_source = "\n".join(lines)
+                    logger.info("[AGENT] Self-correction complete")
                 else:
-                    logger.info("[AGENT] Self-correction: code graded as correct.")
-            except Exception as e:
-                logger.warning("[AGENT] Self-correction failed: %s", e)
-                logger.debug(traceback.format_exc())
+                    logger.warning("[AGENT] Self-correction produced no valid blocks.")
+            else:
+                logger.info("[AGENT] Code graded as correct.")
+        except Exception as e:
+            logger.warning("[AGENT] Self-correction failed: %s", e)
+            logger.debug(traceback.format_exc())
 
+        return new_source
+
+    def _finalize_edit(self, file_source, new_source, path, ext, dry_run,
+                       instruction, is_implement, llm, rag_citations,
+                       session_chat_history):
+        """Generate diff, explanation, and optionally write the edited file."""
         diff = show_diff(file_source, new_source)
         logger.info("--- DIFF PREVIEW ---")
         logger.info('\n%s', diff or "No changes detected.")
         logger.info("--------------------")
 
-        # Generate explanation of what the agent did and why
+        # Generate explanation
         explanation = ""
         if new_source != file_source and is_implement:
             try:
@@ -612,12 +660,12 @@ class CodeAgent:
                     f"Be concise. No code."
                 )
                 explanation = llm.invoke(explain_prompt).strip()
-                logger.info("[AGENT] Generated explanation: %s", explanation[:200])
+                logger.info("[AGENT] Explanation: %s", explanation[:200])
             except Exception as e:
                 logger.debug("Explanation generation failed: %s", e)
 
         if dry_run:
-            logger.info("Dry run mode enabled; no file written.")
+            logger.info("Dry run mode; no file written.")
             return {
                 "new_source": new_source,
                 "diff": diff,
@@ -630,19 +678,18 @@ class CodeAgent:
             write_file(path, new_source)
             try:
                 run_git_command(["diff", "--", path])
-            except Exception as e:
-                logger.debug("git diff failed: %s", e)
+            except Exception:
+                pass
         except Exception as e:
             logger.error("Failed to write file %s: %s", path, e)
-            logger.debug(traceback.format_exc())
             return file_source
 
         if ext == ".go":
             try:
                 subprocess.run(["gofmt", "-w", path], timeout=5, check=True)
                 logger.info("gofmt applied to %s", path)
-            except Exception as e:
-                logger.debug("gofmt failed: %s", e)
+            except Exception:
+                pass
 
         try:
             self.edit_log.setdefault(path, []).append({
@@ -651,7 +698,7 @@ class CodeAgent:
                 "timestamp": datetime.now().isoformat()
             })
         except Exception:
-            logger.debug("Failed to append to edit_log for %s", path)
+            pass
 
         if session_chat_history is not None:
             session_chat_history.append({"role": "User", "content": instruction})
@@ -684,6 +731,7 @@ class CodeAgent:
         llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
         original_source = read_file(path)
         source = original_source
+        ext = os.path.splitext(path)[1].lower()
         all_results: list = []
         attempts = 0
         best_pass_count = 0
@@ -691,6 +739,7 @@ class CodeAgent:
         explanation_parts: list[str] = []
         citations: list[str] = []
         current_temperature = 0.0
+        prev_error_signature = None  # Track repeated errors to break loops
 
         for attempt in range(max_retries + 1):
             logger.info("[FIX_WITH_TESTS] Attempt %d — running %d test case(s)...", attempt, len(test_cases))
@@ -699,6 +748,29 @@ class CodeAgent:
 
             pass_count = sum(1 for r in results if r["passed"])
             failures = [r for r in results if not r["passed"]]
+
+            # --- Structural validation ---
+            structural_issues = validate_code_structure(source, ext)
+            if structural_issues:
+                logger.warning("[FIX_WITH_TESTS] Structural issues: %s",
+                               [i['msg'] for i in structural_issues])
+
+            # --- Identical-error loop detector ---
+            error_sig = frozenset(
+                tuple((r['input'], str(r.get('actual', r.get('error', '')))))
+                for r in results if not r['passed']
+            ) | frozenset(i['msg'] for i in structural_issues)
+            if error_sig and error_sig == prev_error_signature:
+                logger.warning(
+                    "[FIX_WITH_TESTS] Identical errors repeating — stopping to avoid infinite loop"
+                )
+                explanation_parts.append(
+                    "Same errors repeating across attempts. Stopped to avoid infinite loop."
+                )
+                source = best_source
+                all_results = run_tests(source, path, test_cases, llm)
+                break
+            prev_error_signature = error_sig
 
             if not failures:
                 logger.info("[FIX_WITH_TESTS] All tests passed on attempt %d ✓", attempt)
@@ -753,6 +825,12 @@ class CodeAgent:
             # --- Self-reasoning: trace through test to find root cause ---
             failure_note = build_test_failure_note(results, instruction, source=source, llm=llm)
             augmented_instruction = f"{instruction}\n\n{failure_note}"
+
+            # Include structural issues in the instruction so LLM can fix them
+            if structural_issues:
+                structural_note = build_structural_issue_note(structural_issues, source.split('\n'))
+                augmented_instruction += f"\n\n{structural_note}"
+
             attempts += 1
 
             # Write current source so edit_code reads the right state

@@ -48,6 +48,83 @@ RERANK_BATCH_SIZE = 32 # For cross-encoder reranking
 CHROMA_PERSIST_DIR = CHROMA_DIR		      # where vectors live
 CHROMA_COLLECTION_NAME = "aion-code"     # collection for code docs
 CHROMA_CHUNK_SIZE = 512                 # optional, for new ingest
+
+# ─── Language Maps (shared across agent modules) ───────────────────────────────
+
+# Human-readable language names
+LANG_NAMES: dict[str, str] = {
+    '.py': 'Python', '.go': 'Go', '.cpp': 'C++', '.c': 'C',
+    '.rs': 'Rust', '.js': 'JavaScript', '.ts': 'TypeScript',
+    '.java': 'Java', '.cs': 'C#', '.rb': 'Ruby', '.php': 'PHP',
+    '.swift': 'Swift', '.kt': 'Kotlin',
+}
+
+# Markdown code-fence language identifiers
+LANG_FENCE: dict[str, str] = {
+    '.py': 'python', '.go': 'go', '.cpp': 'cpp', '.c': 'c',
+    '.rs': 'rust', '.js': 'javascript', '.ts': 'typescript',
+    '.java': 'java', '.cs': 'csharp', '.rb': 'ruby', '.php': 'php',
+    '.swift': 'swift', '.kt': 'kotlin',
+}
+
+# Compiler / syntax-check commands per extension
+LANG_CHECK_CMD: dict[str, list[str]] = {
+    '.go':  ['go', 'build'],
+    '.rs':  ['rustc', '--edition', '2021'],
+    '.cpp': ['g++', '-fsyntax-only'],
+    '.c':   ['gcc', '-fsyntax-only'],
+    '.ts':  ['tsc', '--noEmit'],
+}
+
+# Query enhancement keywords for RAG search
+LANG_QUERY_ENHANCEMENT: dict[str, str] = {
+    '.py': 'Python programming', '.go': 'Go Golang programming',
+    '.cpp': 'C++ programming', '.c': 'C programming',
+    '.rs': 'Rust programming', '.js': 'JavaScript programming',
+    '.ts': 'TypeScript programming', '.java': 'Java programming',
+    '.cs': 'C# programming', '.rb': 'Ruby programming',
+    '.php': 'PHP programming', '.swift': 'Swift programming',
+    '.kt': 'Kotlin programming',
+}
+
+# Document source keywords for language-aware chunk filtering
+LANG_DOC_KEYWORDS: dict[str, list[str]] = {
+    '.py':   ['python'],
+    '.go':   ['go', 'golang'],
+    '.cpp':  ['c++', 'cplusplus', 'stroustrup', 'effective_modern', 'concurrency_in_action'],
+    '.c':    ['c_programming', 'c++', 'cplusplus'],
+    '.rs':   ['rust', 'rustaceans'],
+    '.ts':   ['typescript', 'angular'],
+    '.js':   ['javascript', 'typescript', 'angular'],
+    '.java': ['java'],
+    '.cs':   ['c#', 'csharp'],
+    '.rb':   ['ruby'],
+}
+
+# Keywords that indicate a doc is for the WRONG language
+LANG_IRRELEVANT_DOC_KEYWORDS: dict[str, list[str]] = {
+    '.py':  ['c++', 'cplusplus', 'stroustrup', 'golang', 'go_programming', 'rust', 'blender', 'angular', 'typescript', 'swift', 'kotlin'],
+    '.go':  ['python', 'c++', 'cplusplus', 'stroustrup', 'rust', 'blender', 'angular', 'typescript', 'swift', 'kotlin'],
+    '.cpp': ['python', 'golang', 'go_programming', 'rust', 'blender', 'angular', 'typescript', 'swift', 'kotlin'],
+    '.c':   ['python', 'golang', 'go_programming', 'rust', 'blender', 'angular', 'typescript', 'swift', 'kotlin'],
+    '.rs':  ['python', 'golang', 'go_programming', 'c++', 'cplusplus', 'blender', 'angular', 'typescript', 'swift', 'kotlin'],
+    '.ts':  ['python', 'golang', 'go_programming', 'c++', 'cplusplus', 'rust', 'blender', 'swift', 'kotlin'],
+    '.js':  ['python', 'golang', 'go_programming', 'c++', 'cplusplus', 'rust', 'blender', 'swift', 'kotlin'],
+}
+
+# Language-agnostic docs always pass through filters
+UNIVERSAL_DOC_KEYWORDS: list[str] = ['clean-code', 'clean_code', 'refactoring', 'legacy', 'design', 'design_patterns']
+
+# Keywords that identify implementation/solve tasks
+IMPLEMENT_KEYWORDS: set[str] = {
+    'implement', 'solve', 'write', 'build', 'create', 'code',
+    'given', 'return the', 'return minimum', 'return maximum',
+    'leetcode', 'algorithm', 'function that', 'program that',
+    'find the', 'compute', 'calculate', 'design',
+}
+
+# Languages that use braces for code blocks
+BRACE_LANGUAGES: set[str] = {'.go', '.c', '.cpp', '.rs', '.js', '.ts', '.java', '.cs', '.kt', '.swift'}
 CHROMA_CHUNK_OVERLAP = 64               # optional for new ingest
 
 # fitler settings for query pipeline

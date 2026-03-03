@@ -3,22 +3,65 @@ import sys
 import subprocess
 import tempfile
 import logging
-from typing import List, Dict, Optional
+import shutil
+from typing import List, Dict, Optional, Tuple
 
 from langchain_ollama import OllamaLLM
-from brain.config import LLM_MODEL
+from brain.config import LLM_MODEL, LANG_FENCE
 from .code_editing_helpers import strip_markdown
 
 logger = logging.getLogger("code_agent")
 
-LANG_FENCE = {
-    ".go":  "go",
-    ".py":  "python",
-    ".js":  "javascript",
-    ".ts":  "typescript",
-    ".cpp": "cpp",
-    ".c":   "c",
-}
+
+def _find_cpp_compiler() -> Tuple[Optional[str], str]:
+    """Find an available C++ compiler on the system.
+    
+    Returns: (compiler_path, compiler_name) or (None, error_message)
+    """
+    # Try g++ first (MinGW on Windows or GCC on Unix)
+    if shutil.which("g++"):
+        return "g++", "g++"
+    
+    # Try clang++ (LLVM/Clang)
+    if shutil.which("clang++"):
+        return "clang++", "clang++"
+    
+    # Try cl.exe (MSVC on Windows)
+    if shutil.which("cl"):
+        return "cl", "MSVC"
+    
+    # No compiler found
+    error = (
+        "No C++ compiler found. Please install one of:\n"
+        "  Windows: MinGW (g++), LLVM (clang++), or Visual Studio (cl.exe)\n"
+        "  macOS: Xcode Command Line Tools (g++ or clang++)\n"
+        "  Linux: GCC (g++) or Clang (clang++)\n"
+        "\nTo install MinGW on Windows: https://www.mingw-w64.org/downloads/"
+    )
+    return None, error
+
+
+def _find_c_compiler() -> Tuple[Optional[str], str]:
+    """Find an available C compiler on the system.
+    
+    Returns: (compiler_path, compiler_name) or (None, error_message)
+    """
+    if shutil.which("gcc"):
+        return "gcc", "gcc"
+    if shutil.which("clang"):
+        return "clang", "clang"
+    if shutil.which("cl"):
+        return "cl", "MSVC"
+    
+    error = (
+        "No C compiler found. Please install one of:\n"
+        "  Windows: MinGW (gcc), LLVM (clang), or Visual Studio (cl.exe)\n"
+        "  macOS: Xcode Command Line Tools (gcc or clang)\n"
+        "  Linux: GCC (gcc) or Clang (clang)"
+    )
+    return None, error
+
+
 
 
 def _generate_harness(source: str, ext: str, test_inputs: List[str], llm: OllamaLLM) -> str:
@@ -106,13 +149,38 @@ def run_tests(
             elif ext == ".cpp":
                 harness_path = os.path.join(tmpdir, "harness.cpp")
                 exe_path = os.path.join(tmpdir, "harness.exe" if os.name == "nt" else "harness")
-                # Compile first, then run
-                compile_cmd = ["g++", "-std=c++17", "-O2", "-o", exe_path, harness_path]
+                compiler, compiler_info = _find_cpp_compiler()
+                if not compiler:
+                    logger.error("[TEST_RUNNER] %s", compiler_info)
+                    return [
+                        {
+                            "input": tc["input"],
+                            "expected": tc["expected"],
+                            "actual": None,
+                            "passed": False,
+                            "error": compiler_info,
+                        }
+                        for tc in test_cases
+                    ]
+                compile_cmd = [compiler, "-std=c++17", "-O2", "-o", exe_path, harness_path]
                 cmd = None  # will be set after compile
             elif ext == ".c":
                 harness_path = os.path.join(tmpdir, "harness.c")
                 exe_path = os.path.join(tmpdir, "harness.exe" if os.name == "nt" else "harness")
-                compile_cmd = ["gcc", "-std=c11", "-O2", "-o", exe_path, harness_path]
+                compiler, compiler_info = _find_c_compiler()
+                if not compiler:
+                    logger.error("[TEST_RUNNER] %s", compiler_info)
+                    return [
+                        {
+                            "input": tc["input"],
+                            "expected": tc["expected"],
+                            "actual": None,
+                            "passed": False,
+                            "error": compiler_info,
+                        }
+                        for tc in test_cases
+                    ]
+                compile_cmd = [compiler, "-std=c11", "-O2", "-o", exe_path, harness_path]
                 cmd = None
             else:
                 err = f"Unsupported language for test runner: '{ext}'"

@@ -5,19 +5,15 @@ from typing import Optional, List, Dict
 from operator import itemgetter
 
 from brain.fast_search import fast_topic_search
-from brain.config import LLM_MODEL, CHROMA_DIR, EMBEDDING_MODEL
+from brain.config import (
+    LLM_MODEL, CHROMA_DIR, EMBEDDING_MODEL,
+    LANG_CHECK_CMD, LANG_FENCE, LANG_DOC_KEYWORDS,
+    LANG_IRRELEVANT_DOC_KEYWORDS, LANG_QUERY_ENHANCEMENT,
+    UNIVERSAL_DOC_KEYWORDS, IMPLEMENT_KEYWORDS,
+)
 from .code_editing_helpers import parse_compiler_errors
 
 logger = logging.getLogger("code_agent")
-
-LANG_CHECK_CMD = {
-    ".go":  ["go", "build"],
-    ".rs":  ["rustc", "--edition", "2021"],
-    ".cpp": ["g++", "-fsyntax-only"],
-    ".c":   ["gcc", "-fsyntax-only"],
-    ".ts":  ["tsc", "--noEmit"],
-}
-
 
 def build_runtime_error_notes(
     path: str,
@@ -80,13 +76,7 @@ def assess_instruction_clarity(instruction: str, file_source: str) -> int:
     file_lower = file_source.lower()
 
     # Implementation/solve tasks benefit from seeing example patterns in RAG
-    implement_keywords = {
-        "implement", "solve", "write", "build", "create",
-        "given", "return the", "return minimum", "return maximum",
-        "leetcode", "algorithm", "function that", "program that",
-        "find the", "compute", "calculate", "design",
-    }
-    if any(kw in instruction_lower for kw in implement_keywords):
+    if any(kw in instruction_lower for kw in IMPLEMENT_KEYWORDS):
         return 7  # Give implement tasks maximum RAG context for examples
 
     # If instruction defers to file comments as the spec, keep RAG minimal —
@@ -133,35 +123,6 @@ def assess_instruction_clarity(instruction: str, file_source: str) -> int:
 
 # ---------- Language pre-filter (cheap, no LLM) ----------
 
-# Maps file extensions to keywords that MUST appear in a relevant doc's source path,
-# and keywords that indicate an IRRELEVANT doc for that language.
-_LANG_RELEVANCE = {
-    '.py':   {'relevant': ['python'],
-              'irrelevant': ['c++', 'cplusplus', 'stroustrup', 'golang', 'go_programming',
-                             'rust', 'blender', 'angular', 'typescript', 'swift', 'kotlin']},
-    '.go':   {'relevant': ['go', 'golang'],
-              'irrelevant': ['python', 'c++', 'cplusplus', 'stroustrup', 'rust', 'blender',
-                             'angular', 'typescript', 'swift', 'kotlin']},
-    '.cpp':  {'relevant': ['c++', 'cplusplus', 'stroustrup', 'effective-modern', 'concurrency'],
-              'irrelevant': ['python', 'golang', 'go_programming', 'rust', 'blender',
-                             'angular', 'typescript', 'swift', 'kotlin']},
-    '.c':    {'relevant': ['c_programming', 'c++', 'cplusplus'],
-              'irrelevant': ['python', 'golang', 'go_programming', 'rust', 'blender',
-                             'angular', 'typescript', 'swift', 'kotlin']},
-    '.rs':   {'relevant': ['rust', 'rustaceans'],
-              'irrelevant': ['python', 'golang', 'go_programming', 'c++', 'cplusplus',
-                             'blender', 'angular', 'typescript', 'swift', 'kotlin']},
-    '.ts':   {'relevant': ['typescript', 'angular'],
-              'irrelevant': ['python', 'golang', 'go_programming', 'c++', 'cplusplus',
-                             'rust', 'blender', 'swift', 'kotlin']},
-    '.js':   {'relevant': ['javascript', 'typescript', 'angular'],
-              'irrelevant': ['python', 'golang', 'go_programming', 'c++', 'cplusplus',
-                             'rust', 'blender', 'swift', 'kotlin']},
-}
-
-# Language-agnostic docs are always allowed through (clean code, refactoring, design, legacy)
-_UNIVERSAL_DOCS = ['clean-code', 'clean_code', 'refactoring', 'legacy', 'design']
-
 
 def _language_prefilter(chunks: list, file_ext: str) -> list:
     """Fast pre-filter: remove chunks from docs clearly written for a different language.
@@ -171,20 +132,19 @@ def _language_prefilter(chunks: list, file_ext: str) -> list:
     If the file extension has no filter rules, all chunks pass through unchanged.
     """
     ext = file_ext.lower()
-    rules = _LANG_RELEVANCE.get(ext)
-    if not rules:
+    irrelevant_keywords = LANG_IRRELEVANT_DOC_KEYWORDS.get(ext)
+    if not irrelevant_keywords:
         return chunks  # No filter rules for this language — pass all through
-    
-    irrelevant_keywords = rules['irrelevant']
+
     filtered = []
     for doc in chunks:
         source = doc.metadata.get('source', '').lower().replace(' ', '_').replace('-', '_')
-        
+
         # Always allow language-agnostic docs
-        if any(u in source for u in _UNIVERSAL_DOCS):
+        if any(u in source for u in UNIVERSAL_DOC_KEYWORDS):
             filtered.append(doc)
             continue
-        
+
         # Filter out docs matching irrelevant language keywords
         if any(kw.replace('-', '_') in source for kw in irrelevant_keywords):
             logger.info("[LANG_FILTER] Skipped wrong-language doc: %s", doc.metadata.get('source', 'Unknown'))
@@ -255,23 +215,7 @@ def _grade_chunks(chunks: list, instruction: str, llm, file_ext: str = "") -> li
     if not chunks:
         return chunks
     
-    # Map file extension -> keywords that identify matching-language doc sources
-    _EXT_TO_SOURCE_KEYWORDS = {
-        '.py':   ['python'],
-        '.go':   ['go', 'golang'],
-        '.cpp':  ['c++', 'cplusplus', 'stroustrup', 'effective_modern', 'concurrency_in_action'],
-        '.c':    ['c++', 'cplusplus', 'stroustrup', 'c_programming'],
-        '.rs':   ['rust', 'rustaceans'],
-        '.ts':   ['typescript', 'angular'],
-        '.js':   ['javascript', 'typescript', 'angular'],
-        '.java': ['java'],
-        '.cs':   ['c#', 'csharp'],
-        '.rb':   ['ruby'],
-    }
-    # Language-agnostic docs are always auto-passed (design, clean code, refactoring)
-    _UNIVERSAL_KEYWORDS = ['clean_code', 'clean-code', 'refactoring', 'legacy', 'design_patterns']
-    
-    source_keywords = _EXT_TO_SOURCE_KEYWORDS.get(file_ext.lower(), [])
+    source_keywords = LANG_DOC_KEYWORDS.get(file_ext.lower(), [])
     
     # Split chunks into auto-pass (correct language / universal) and needs-grading
     auto_pass = []
@@ -281,7 +225,7 @@ def _grade_chunks(chunks: list, instruction: str, llm, file_ext: str = "") -> li
         
         # Auto-pass: correct language OR universal doc
         if (source_keywords and any(kw.replace('-', '_') in source for kw in source_keywords)) or \
-           any(u in source for u in _UNIVERSAL_KEYWORDS):
+           any(u in source for u in UNIVERSAL_DOC_KEYWORDS):
             doc.metadata['graded'] = True
             doc.metadata['auto_pass'] = True
             auto_pass.append(doc)
@@ -295,12 +239,7 @@ def _grade_chunks(chunks: list, instruction: str, llm, file_ext: str = "") -> li
     # Only LLM-grade the ambiguous chunks (wrong/unknown language sources)
     graded_ambiguous = []
     if needs_grading:
-        _EXT_TO_LANG = {
-            '.py': 'python', '.go': 'go', '.cpp': 'c++', '.c': 'c',
-            '.rs': 'rust', '.js': 'javascript', '.ts': 'typescript',
-            '.java': 'java', '.cs': 'c#', '.rb': 'ruby',
-        }
-        target_lang = _EXT_TO_LANG.get(file_ext.lower(), '')
+        target_lang = LANG_FENCE.get(file_ext.lower(), '')
         
         chunk_descriptions = []
         for i, doc in enumerate(needs_grading):
@@ -375,24 +314,9 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
     if file_path:
         import os
         ext = os.path.splitext(file_path)[1].lower()
-        lang_map = {
-            '.py': 'Python programming',
-            '.go': 'Go Golang programming',
-            '.cpp': 'C++ programming',
-            '.c': 'C programming',
-            '.rs': 'Rust programming',
-            '.js': 'JavaScript programming',
-            '.ts': 'TypeScript programming',
-            '.java': 'Java programming',
-            '.cs': 'C# programming',
-            '.rb': 'Ruby programming',
-            '.php': 'PHP programming',
-            '.swift': 'Swift programming',
-            '.kt': 'Kotlin programming',
-        }
-        if ext in lang_map:
-            enhanced_query = f"{lang_map[ext]} {instruction}"
-            logger.info("[RAG] Enhanced query: %s", lang_map[ext])
+        if ext in LANG_QUERY_ENHANCEMENT:
+            enhanced_query = f"{LANG_QUERY_ENHANCEMENT[ext]} {instruction}"
+            logger.info("[RAG] Enhanced query: %s", LANG_QUERY_ENHANCEMENT[ext])
     
     # --- BM25 Search (keyword-based) ---
     bm25_results = []

@@ -8,6 +8,8 @@ import logging
 import traceback
 from difflib import SequenceMatcher
 
+from brain.config import BRACE_LANGUAGES
+
 logger = logging.getLogger("code_agent")
 
 # --- Pattern Recognition ---
@@ -342,4 +344,151 @@ def build_post_error_note(post_errors: list, file_lines: list) -> str:
             f"ERROR: {err['msg']} at Line {se_line}, Col {err['offset']}\n"
             f"EXACT BROKEN SNIPPET:\n```\n{snippet}\n```\n\n"
         )
+    return note
+
+
+# --- Structural Validation (all languages) ---
+
+def _strip_string_literals(line: str) -> str:
+    """Remove string/char literals from a line to avoid false positives in brace counting."""
+    result = []
+    in_string = False
+    string_char = None
+    escaped = False
+    for ch in line:
+        if escaped:
+            escaped = False
+            continue
+        if ch == '\\':
+            escaped = True
+            if not in_string:
+                result.append(ch)
+            continue
+        if in_string:
+            if ch == string_char:
+                in_string = False
+            continue
+        if ch in ('"', "'", '`'):
+            in_string = True
+            string_char = ch
+            continue
+        result.append(ch)
+    return ''.join(result)
+
+
+def validate_code_structure(source: str, ext: str) -> list:
+    """Validate structural integrity of code: brace balance, unreachable code, indentation.
+
+    Works for all brace-based languages (Go, C, C++, Rust, JS, TS, Java, etc.).
+    Returns list of issue dicts: {'type', 'msg', 'lineno', 'severity'}.
+    """
+    issues = []
+    lines = source.split('\n')
+
+    # --- 1. Brace balance ---
+    if ext in BRACE_LANGUAGES:
+        brace_stack = []  # stores (line_number, char) for each opening brace
+        for i, line in enumerate(lines):
+            stripped = _strip_string_literals(line)
+            # Remove single-line comments
+            comment_idx = stripped.find('//')
+            if comment_idx != -1:
+                stripped = stripped[:comment_idx]
+            for ch in stripped:
+                if ch == '{':
+                    brace_stack.append(i + 1)
+                elif ch == '}':
+                    if brace_stack:
+                        brace_stack.pop()
+                    else:
+                        issues.append({
+                            'type': 'extra_closing_brace',
+                            'msg': f'Extra closing brace at line {i + 1} — no matching opening brace',
+                            'lineno': i + 1,
+                            'severity': 'error',
+                        })
+        for open_line in brace_stack:
+            issues.append({
+                'type': 'unclosed_brace',
+                'msg': f'Unclosed opening brace from line {open_line} — missing closing brace',
+                'lineno': open_line,
+                'severity': 'error',
+            })
+
+    # --- 2. Unreachable code detection ---
+    _RETURN_KW = {'return', 'break', 'continue'}
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        word = stripped.split('(')[0].split(' ')[0]
+        if word not in _RETURN_KW:
+            continue
+        indent = len(line) - len(line.lstrip())
+        # Look at the next non-empty, non-comment line
+        for j in range(i + 1, min(i + 10, len(lines))):
+            next_line = lines[j]
+            next_stripped = next_line.strip()
+            if not next_stripped or next_stripped.startswith('//') or next_stripped.startswith('#'):
+                continue
+            # Closing brace/bracket at same or lower indent is fine
+            if next_stripped in ('}', ')', ']'):
+                break
+            # New function/class definition is fine
+            if FUNC_PATTERN.match(next_line):
+                break
+            next_indent = len(next_line) - len(next_line.lstrip())
+            if next_indent >= indent:
+                issues.append({
+                    'type': 'unreachable_code',
+                    'msg': f'Unreachable code at line {j + 1} (after `{word}` at line {i + 1})',
+                    'lineno': j + 1,
+                    'severity': 'warning',
+                })
+            break
+
+    # --- 3. Indentation consistency ---
+    has_tabs = False
+    has_spaces = False
+    for line in lines:
+        if not line or not line.strip():
+            continue
+        if line[0] == '\t':
+            has_tabs = True
+        elif line.startswith('  '):
+            has_spaces = True
+    if has_tabs and has_spaces:
+        issues.append({
+            'type': 'mixed_indentation',
+            'msg': 'File mixes tabs and spaces for indentation',
+            'lineno': 0,
+            'severity': 'warning',
+        })
+
+    return issues
+
+
+def build_structural_issue_note(issues: list, file_lines: list) -> str:
+    """Build a formatted prompt note describing structural code issues for LLM repair."""
+    if not issues:
+        return ""
+
+    note = "STRUCTURAL ISSUES DETECTED (fix ALL of them):\n\n"
+    for issue in issues:
+        lineno = issue.get('lineno', 0)
+        if lineno > 0:
+            start = max(0, lineno - 3)
+            end = min(len(file_lines), lineno + 2)
+            snippet = '\n'.join(f"{start+i+1}: {l}" for i, l in enumerate(file_lines[start:end]))
+            note += (
+                f"  {issue['type'].upper()}: {issue['msg']}\n"
+                f"  CONTEXT:\n```\n{snippet}\n```\n\n"
+            )
+        else:
+            note += f"  {issue['type'].upper()}: {issue['msg']}\n\n"
+
+    note += (
+        "Fix each structural issue with a SEARCH/REPLACE block.\n"
+        "Common fixes: remove unreachable code after return, add/remove braces to balance, fix indentation.\n"
+    )
     return note
