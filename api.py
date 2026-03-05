@@ -11,12 +11,14 @@ from brain.fast_search import initialize_bm25
 from brain.ingest import ingest_docs
 from brain.ingest import ingest_file
 from brain.augmented_generation_query import query_brain_comprehensive, session_chat_history
+from brain.chat_session_store import ChatSessionStore
 from brain.pdf_utils import load_pdfs
 from brain.config import DATA_DIR
 
 warnings.filterwarnings("ignore")
 
 raw_docs = []
+chat_store = ChatSessionStore()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -32,22 +34,45 @@ class QueryRequest(BaseModel):
     question: str
     verbose: bool = False
     mode: Literal['auto', 'fast', 'deep', 'deep_semantic', 'both'] = 'auto'
+    session_id: Optional[str] = None
 
 
 class FeedbackRequest(BaseModel):
     question: str
     prev_mode: Optional[Literal['auto', 'fast', 'deep', 'deep_semantic', 'both']] = 'auto'
+    session_id: Optional[str] = None
 
 @app.post("/query")
 async def query(req: QueryRequest):
-    # pass along mode override; query_brain_comprehensive handles 'both'
+    # Build context from persistent session if session_id provided
+    if req.session_id:
+        history = chat_store.get_context_window(req.session_id, req.question)
+    else:
+        history = session_chat_history
+
     results = await query_brain_comprehensive(
         req.question,
         verbose=req.verbose,
         raw_docs=raw_docs,
-        session_chat_history=session_chat_history,
+        session_chat_history=history,
         mode_override=req.mode
     )
+
+    # Persist turns to Chroma session store
+    if req.session_id:
+        chat_store.add_turn(req.session_id, "User", req.question)
+        answer_text = ""
+        if isinstance(results, dict):
+            if "deep" in results:
+                answer_text = results["deep"].get("answer", "")
+            else:
+                answer_text = results.get("answer", "")
+        if answer_text:
+            chat_store.add_turn(req.session_id, "Assistant", answer_text)
+        # Trigger smart summarization when chat gets long
+        if chat_store.should_summarize(req.session_id):
+            chat_store.trigger_summarization(req.session_id)
+
     return results
 
 @app.post("/ingest")
@@ -139,13 +164,26 @@ async def feedback(req: FeedbackRequest):
         'both': 'deep_semantic',
     }
     next_mode = escalation.get(req.prev_mode or 'auto', 'deep')
+
+    if req.session_id:
+        history = chat_store.get_context_window(req.session_id, req.question)
+    else:
+        history = session_chat_history
+
     results = await query_brain_comprehensive(
         req.question,
         verbose=False,
         raw_docs=raw_docs,
-        session_chat_history=session_chat_history,
+        session_chat_history=history,
         mode_override=next_mode
     )
+
+    # Persist the retry answer
+    if req.session_id:
+        answer_text = results.get("answer", "") if isinstance(results, dict) else ""
+        if answer_text:
+            chat_store.add_turn(req.session_id, "Assistant", f"[DEEP RETRY] {answer_text}")
+
     return results
 
 
@@ -154,6 +192,7 @@ class AgentEditRequest(BaseModel):
     file_path: str
     task_mode: str = "auto"  # "fix", "solve", or "auto"
     session_id: Optional[str] = None
+    context_files: list = []  # additional file paths for cross-file context
 
 
 @app.post("/agent/edit")
@@ -183,10 +222,24 @@ async def agent_edit(req: AgentEditRequest):
                     "message": f"File not found: {req.file_path}"}
 
     try:
+        # Build cross-file context from additional context files
+        augmented_instruction = req.instruction
+        if req.context_files:
+            context_block = "\n\nRELATED FILES (read-only context):\n"
+            for cf in req.context_files[:10]:
+                cf_path = Path(cf)
+                if cf_path.exists() and cf_path.is_file():
+                    try:
+                        content = cf_path.read_text(encoding="utf-8", errors="replace")[:3000]
+                        context_block += f"\n--- {cf} ---\n{content}\n"
+                    except Exception:
+                        pass
+            augmented_instruction += context_block
+
         agent = CodeAgent(repo_path=".")
         result = agent.edit_code(
             path=resolved_path,
-            instruction=req.instruction,
+            instruction=augmented_instruction,
             dry_run=True,
             use_rag=True,
             rerank_method="auto",
@@ -211,6 +264,12 @@ async def agent_edit(req: AgentEditRequest):
         session_chat_history.append({"role": "User", "content": req.instruction})
         if explanation:
             session_chat_history.append({"role": "Assistant", "content": explanation})
+
+        # Also persist to chat session store for cross-restart memory
+        if req.session_id:
+            chat_store.add_turn(req.session_id, "User", f"[AGENT] {req.instruction}")
+            if explanation:
+                chat_store.add_turn(req.session_id, "Assistant", explanation)
         
         return {
             "status": "pending_review",
@@ -338,6 +397,66 @@ async def agent_edit_with_chunks(req: AgentEditWithChunksRequest):
         return {"error": str(e), "status": "error", "message": f"Agent error with {req.max_chunks} chunks: {str(e)}"}
 
 
+# ── Multi-Agent orchestration endpoint ─────────────────────────────────────────
+
+class OrchestrateRequest(BaseModel):
+    instruction: str
+    file_path: str
+    task_mode: str = "auto"
+    session_id: Optional[str] = None
+    max_attempts: int = 3
+    include_related: bool = True   # multi-file context
+    context_files: list = []       # additional file paths for cross-file context
+
+
+@app.post("/agent/orchestrate")
+async def agent_orchestrate(req: OrchestrateRequest):
+    """
+    Multi-agent pipeline: Planner → Code Agent → Critic (with retry loop).
+    Also gathers related files for cross-file context.
+    """
+    from agent.multi_agent_graph import run_multi_agent
+    from pathlib import Path
+
+    resolved_path = req.file_path
+    if not Path(resolved_path).exists():
+        candidate = Path(resolved_path)
+        if not candidate.is_absolute():
+            matches = list(Path(".").rglob(candidate.name))
+            if matches:
+                resolved_path = str(matches[0].resolve())
+            else:
+                return {"error": f"File not found: {req.file_path}", "status": "error"}
+        else:
+            return {"error": f"File not found: {req.file_path}", "status": "error"}
+
+    try:
+        result = run_multi_agent(
+            instruction=req.instruction,
+            file_path=resolved_path,
+            task_mode=req.task_mode,
+            session_id=req.session_id,
+            max_attempts=max(1, min(req.max_attempts, 5)),
+            include_related=req.include_related,
+            extra_context_files=req.context_files,
+        )
+
+        # Persist agent conversation to chat session store
+        if req.session_id:
+            chat_store.add_turn(req.session_id, "User", f"[AGENT] {req.instruction}")
+            explanation = result.get("explanation", "")
+            if explanation:
+                chat_store.add_turn(req.session_id, "Assistant", explanation)
+        # Also push to in-memory history for query follow-ups
+        session_chat_history.append({"role": "User", "content": req.instruction})
+        if result.get("explanation"):
+            session_chat_history.append({"role": "Assistant", "content": result["explanation"]})
+
+        return result
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
+
+
 # ── Test runner endpoints ──────────────────────────────────────────────────────
 
 class RunTestsRequest(BaseModel):
@@ -440,3 +559,51 @@ async def clear_memory():
     memory = get_session_memory()
     memory.clear_all()
     return {"status": "memory_cleared"}
+
+
+# ── Persistent chat session endpoints ────────────────────────────────────────
+
+class CreateSessionRequest(BaseModel):
+    title: str = "New Chat"
+
+class RenameSessionRequest(BaseModel):
+    session_id: str
+    title: str
+
+class DeleteSessionRequest(BaseModel):
+    session_id: str
+
+class GetSessionHistoryRequest(BaseModel):
+    session_id: str
+
+
+@app.get("/sessions")
+async def list_sessions():
+    """List all chat sessions."""
+    return {"sessions": chat_store.list_sessions()}
+
+
+@app.post("/sessions/create")
+async def create_session(req: CreateSessionRequest):
+    """Create a new named chat session."""
+    session_id = chat_store.create_session(req.title)
+    return {"session_id": session_id, "title": req.title}
+
+
+@app.post("/sessions/rename")
+async def rename_session(req: RenameSessionRequest):
+    ok = chat_store.rename_session(req.session_id, req.title)
+    return {"status": "ok" if ok else "error"}
+
+
+@app.post("/sessions/delete")
+async def delete_session(req: DeleteSessionRequest):
+    count = chat_store.delete_session(req.session_id)
+    return {"status": "ok", "deleted": count}
+
+
+@app.post("/sessions/history")
+async def get_session_history(req: GetSessionHistoryRequest):
+    """Get full conversation history for a session."""
+    turns = chat_store.get_turns(req.session_id)
+    return {"turns": turns}

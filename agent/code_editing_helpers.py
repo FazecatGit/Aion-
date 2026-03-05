@@ -74,10 +74,106 @@ def detect_indent_char(source: str) -> str:
     return ' '
 
 
+# Also match C/C++/Java-style function definitions: type name(...) {
+# Handles: void foo(, int main(, static std::vector<int> bar(, const char* baz(
+_C_FUNC_PATTERN = re.compile(
+    r"^\s*"
+    r"(?:(?:static|inline|virtual|extern|const|volatile|unsigned|signed)\s+)*"  # optional qualifiers
+    r"(?:[\w:*&<>]+\s+)+"   # return type tokens (at least one word + space)
+    r"(\w+)\s*\("            # function name + opening paren
+)
+
+def _find_function_range(lines: list, start_hint: int) -> tuple:
+    """Given a start line that's inside/at a function, find (start, end) of that function."""
+    # Walk backwards to find the function signature
+    start_idx = start_hint
+    while start_idx > 0:
+        if FUNC_PATTERN.match(lines[start_idx]) or _C_FUNC_PATTERN.match(lines[start_idx]):
+            break
+        start_idx -= 1
+
+    is_python_style = FUNC_PATTERN.match(lines[start_idx]) if start_idx < len(lines) else False
+
+    indent = (
+        len(lines[start_idx]) - len(lines[start_idx].lstrip())
+        if start_idx < len(lines) and (FUNC_PATTERN.match(lines[start_idx]) or _C_FUNC_PATTERN.match(lines[start_idx]))
+        else 0
+    )
+
+    if is_python_style:
+        # Indent-based end detection (Python, Ruby, etc.)
+        end_idx = start_idx + 1
+        while end_idx < len(lines):
+            line = lines[end_idx]
+            if (FUNC_PATTERN.match(line) or _C_FUNC_PATTERN.match(line)) and (len(line) - len(line.lstrip())) <= indent:
+                break
+            end_idx += 1
+        return start_idx, end_idx
+
+    # Brace-based end detection (C/C++/Java/Go/JS)
+    end_idx = start_idx + 1
+    brace_depth = 0
+    seen_open = False
+    for i in range(start_idx, len(lines)):
+        for ch in lines[i]:
+            if ch == '{':
+                brace_depth += 1
+                seen_open = True
+            elif ch == '}':
+                brace_depth -= 1
+        if seen_open and brace_depth <= 0:
+            end_idx = i + 1
+            return start_idx, end_idx
+
+    # Fallback: walk to next top-level function
+    end_idx = start_idx + 1
+    while end_idx < len(lines):
+        line = lines[end_idx]
+        if (FUNC_PATTERN.match(line) or _C_FUNC_PATTERN.match(line)) and (len(line) - len(line.lstrip())) <= indent:
+            break
+        end_idx += 1
+
+    return start_idx, end_idx
+
+
+def _find_call_sites(lines: list, func_name: str, func_start: int, func_end: int, context_window: int = 5) -> list:
+    """
+    Find lines outside (func_start, func_end) that call func_name.
+    Returns list of (region_start, region_end) line ranges including surrounding context.
+    """
+    call_pattern = re.compile(rf'\b{re.escape(func_name)}\s*\(')
+    regions = []
+    for i, line in enumerate(lines):
+        if func_start <= i < func_end:
+            continue  # skip the function definition itself
+        if call_pattern.search(line):
+            # Find the enclosing function for this call site
+            enc_start, enc_end = _find_function_range(lines, i)
+            regions.append((enc_start, enc_end))
+
+    # Merge strictly overlapping regions (not merely adjacent)
+    if not regions:
+        return []
+    regions.sort()
+    merged = [regions[0]]
+    for s, e in regions[1:]:
+        if s < merged[-1][1]:  # strict overlap only
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
 def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple:
-    """Extract the relevant function/class from source based on instruction."""
+    """Extract the relevant function/class from source based on instruction.
+
+    Now also includes call sites of the target function so the LLM can
+    produce multi-site SEARCH/REPLACE blocks (e.g. fix a function signature
+    AND update its callers).
+    """
     lines = source.split('\n')
     target_idx = None
+    func_name = None  # track the matched function name for call-site discovery
 
     if hint_blocks:
         try:
@@ -104,41 +200,91 @@ def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple:
             r"|\b([\w_]+)\s*\(\)",
             instruction, re.I
         )
-        name = next((g for g in m.groups() if g), None) if m else None
-        if name:
+        func_name = next((g for g in m.groups() if g), None) if m else None
+        if func_name:
+            # Try Python/Go style first
             for i, l in enumerate(lines):
-                if re.match(rf"\s*(def|func)\s+{re.escape(name)}\b", l, re.I):
+                if re.match(rf"\s*(def|func)\s+{re.escape(func_name)}\b", l, re.I):
                     target_idx = i
                     break
+            # Try C/C++/Java style: type funcName(...)
+            if target_idx is None:
+                for i, l in enumerate(lines):
+                    cm = _C_FUNC_PATTERN.match(l)
+                    if cm and cm.group(1) == func_name:
+                        target_idx = i
+                        break
+                    # Also match bare name at start like: void funcName(...)
+                    if re.search(rf'\b{re.escape(func_name)}\s*\(', l) and '{' in source[sum(len(lines[j])+1 for j in range(i)):sum(len(lines[j])+1 for j in range(min(i+3, len(lines))))]:
+                        # Verify this looks like a definition, not a call (has a type before it or is at top-level indent)
+                        stripped = l.lstrip()
+                        if not stripped.startswith('if') and not stripped.startswith('while') and not stripped.startswith('for') and not stripped.startswith('return'):
+                            target_idx = i
+                            break
 
     if target_idx is None:
         start_idx = 0
     else:
         start_idx = target_idx
-        while start_idx > 0 and not FUNC_PATTERN.match(lines[start_idx]):
+        while start_idx > 0 and not FUNC_PATTERN.match(lines[start_idx]) and not _C_FUNC_PATTERN.match(lines[start_idx]):
             start_idx -= 1
-        if not FUNC_PATTERN.match(lines[start_idx]) and start_idx != 0:
+        if not FUNC_PATTERN.match(lines[start_idx]) and not _C_FUNC_PATTERN.match(lines[start_idx]) and start_idx != 0:
             for i in range(target_idx, -1, -1):
-                if FUNC_PATTERN.match(lines[i]):
+                if FUNC_PATTERN.match(lines[i]) or _C_FUNC_PATTERN.match(lines[i]):
                     start_idx = i
                     break
 
-    indent = (
-        len(lines[start_idx]) - len(lines[start_idx].lstrip())
-        if start_idx < len(lines) and FUNC_PATTERN.match(lines[start_idx])
-        else 0
-    )
-
-    end_idx = start_idx + 1
-    while end_idx < len(lines):
-        line = lines[end_idx]
-        if FUNC_PATTERN.match(line) and (len(line) - len(line.lstrip())) <= indent:
-            break
-        end_idx += 1
+    func_start, func_end = _find_function_range(lines, start_idx)
 
     if target_idx is None and start_idx == 0:
         return "", 0, len(lines)
-    return '\n'.join(lines[start_idx:end_idx]), start_idx, end_idx
+
+    # ── Call-site expansion ───────────────────────────────────────────
+    # If we identified a function name, find its call sites outside the
+    # function body and include them in the snippet so the LLM can
+    # produce multi-site edits (signature + callers).
+    if func_name:
+        call_regions = _find_call_sites(lines, func_name, func_start, func_end)
+    else:
+        call_regions = []
+
+    if call_regions:
+        # Build a composite snippet: function definition + call-site regions
+        # with clear section markers so the LLM knows what it's looking at.
+        # NEVER merge across categories — keep func def and each call site separate.
+        parts = []
+
+        # 1. Always emit the function definition first
+        parts.append(f"// ── FUNCTION DEFINITION (lines {func_start+1}-{func_end}) ──")
+        parts.append('\n'.join(lines[func_start:func_end]))
+        parts.append("")
+
+        # 2. Emit each call-site region, skipping any that overlap with func def
+        emitted_call_sites = 0
+        for cs, ce in call_regions:
+            # Skip if fully contained within function definition
+            if cs >= func_start and ce <= func_end:
+                continue
+            # Trim overlap with function definition
+            if cs < func_end and ce > func_end:
+                cs = func_end
+            parts.append(f"// ── CALL SITE (lines {cs+1}-{ce}) ──")
+            parts.append('\n'.join(lines[cs:ce]))
+            parts.append("")
+            emitted_call_sites += 1
+
+        if emitted_call_sites == 0:
+            # All call sites were inside the function itself — no expansion needed
+            return '\n'.join(lines[func_start:func_end]), func_start, func_end
+
+        composite = '\n'.join(parts)
+        overall_start = func_start
+        overall_end = max(func_end, max(ce for _, ce in call_regions))
+        logger.info("[EXTRACT] Expanded snippet: function '%s' (%d-%d) + %d call-site region(s)",
+                    func_name, func_start+1, func_end, emitted_call_sites)
+        return composite, overall_start, overall_end
+
+    return '\n'.join(lines[func_start:func_end]), func_start, func_end
 
 
 def reindent_block(replace_lines: list, file_indent: int, llm_base_indent: int) -> list:

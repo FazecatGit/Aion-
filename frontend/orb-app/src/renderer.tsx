@@ -8,6 +8,7 @@ type OrbMode    = 'idle' | 'querying' | 'agent-processing';
 type ActiveMode = 'query' | 'agent';
 type TestCase   = { id: number; input: string; expected: string };
 type TestResult = { input: string; expected: string; actual: string | null; passed: boolean; error: string | null };
+type ChatSession = { session_id: string; title: string; created_at?: string; turn_count?: number };
 
 function App() {
   const [mode, setMode] = useState<OrbMode>('idle');
@@ -36,8 +37,16 @@ function App() {
   const [showTestPanel, setShowTestPanel] = useState(false);
   const [testNextId, setTestNextId]       = useState(1);
   const lastAgentInstruction              = useRef<string>('');
-  // ── Session memory ─────────────────────────────────────────────────────────
-  const [sessionId] = useState<string>(() => crypto.randomUUID());
+  // ── Session management ─────────────────────────────────────────────────────
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [sessionId, setSessionId] = useState<string>(() => crypto.randomUUID());
+  const [showSidebar, setShowSidebar] = useState(false);
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const sessionCreatedRef = useRef(false);  // track if current session was persisted
+  const [useMultiAgent, setUseMultiAgent] = useState(false);  // multi-agent orchestration toggle
+  // ── Multi-file context ─────────────────────────────────────────────────────
+  const [contextFiles, setContextFiles] = useState<string[]>([]);  // additional files for cross-file context
 
 
   // update baseSize whenever window resizes so orb scales with window size
@@ -48,6 +57,89 @@ function App() {
     window.addEventListener('resize', update);
     return () => window.removeEventListener('resize', update);
   }, []);
+
+  // ── Load sessions from server on mount ───────────────────────────────────
+  const loadSessions = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/sessions');
+      const data = await res.json();
+      setSessions(data.sessions || []);
+    } catch { /* server not up yet */ }
+  };
+  useEffect(() => { loadSessions(); }, []);
+
+  // ── Session helpers ─────────────────────────────────────────────────────
+  const createServerSession = async (title: string): Promise<string> => {
+    try {
+      const res = await fetch('http://localhost:8000/sessions/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+      const data = await res.json();
+      loadSessions();
+      return data.session_id;
+    } catch { return sessionId; }
+  };
+
+  const switchSession = async (sid: string) => {
+    setSessionId(sid);
+    setMessages([]);
+    setLastUserQuery(null);
+    setPendingAgentEdit(null);
+    setDetailsContent(null);
+    sessionCreatedRef.current = true; // already exists on server
+    // Load history from server
+    try {
+      const res = await fetch('http://localhost:8000/sessions/history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sid }),
+      });
+      const data = await res.json();
+      const restored: Message[] = (data.turns || []).map((t: { role: string; content: string }) => ({
+        role: t.role === 'User' ? 'user' as const : 'ai' as const,
+        text: t.content,
+      }));
+      setMessages(restored);
+    } catch { /* couldn't load history */ }
+  };
+
+  const handleNewChat = async () => {
+    const newId = crypto.randomUUID();
+    setSessionId(newId);
+    setMessages([]);
+    setLastUserQuery(null);
+    setPendingAgentEdit(null);
+    setDetailsContent(null);
+    sessionCreatedRef.current = false;
+  };
+
+  const handleDeleteSession = async (sid: string) => {
+    try {
+      await fetch('http://localhost:8000/sessions/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sid }),
+      });
+      setSessions(prev => prev.filter(s => s.session_id !== sid));
+      if (sid === sessionId) handleNewChat();
+    } catch { /* ignore */ }
+  };
+
+  const handleRenameSession = async (sid: string, newTitle: string) => {
+    if (!newTitle.trim()) return;
+    try {
+      await fetch('http://localhost:8000/sessions/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sid, title: newTitle.trim() }),
+      });
+      setSessions(prev => prev.map(s => s.session_id === sid ? { ...s, title: newTitle.trim() } : s));
+    } catch { /* ignore */ }
+    setEditingSessionId(null);
+    setEditTitle('');
+  };
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -60,6 +152,15 @@ const handleSubmit = async (e: React.FormEvent) => {
   const userMsg = input.trim();
   setInput('');
   setMessages(prev => [...prev, { role: 'user', text: userMsg }]);
+
+  // Auto-create persistent session on first message
+  let sid = sessionId;
+  if (!sessionCreatedRef.current) {
+    const title = userMsg.length > 40 ? userMsg.slice(0, 40) + '…' : userMsg;
+    sid = await createServerSession(title);
+    setSessionId(sid);
+    sessionCreatedRef.current = true;
+  }
   
   // Set mode based on active mode
   const orbMode = activeMode === 'agent' ? 'agent-processing' : 'querying';
@@ -75,15 +176,36 @@ const handleSubmit = async (e: React.FormEvent) => {
       }
       
       lastAgentInstruction.current = userMsg;
-      setMessages(prev => [...prev, { role: 'ai', text: '[CODE AGENT] Processing your code request...' }]);
-      const res = await fetch('http://localhost:8000/agent/edit', {
+      const endpoint = useMultiAgent ? '/agent/orchestrate' : '/agent/edit';
+      const label = useMultiAgent ? '[MULTI-AGENT] Planner → Agent → Critic pipeline running...' : '[CODE AGENT] Processing your code request...';
+      setMessages(prev => [...prev, { role: 'ai', text: label }]);
+      const res = await fetch(`http://localhost:8000${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ instruction: userMsg, file_path: selectedFilePath, task_mode: agentTaskMode, session_id: sessionId }),
+        body: JSON.stringify({ instruction: userMsg, file_path: selectedFilePath, task_mode: agentTaskMode, session_id: sid, context_files: contextFiles }),
       });
       const data = await res.json();
-      
-      if (data.status === 'pending_review') {
+
+      if (useMultiAgent && data.status === 'ok') {
+        // Multi-agent returns {diff, explanation, citations, plan, verdict, attempts, related_files}
+        const planSteps = data.plan?.steps?.map((s: string, i: number) => `  ${i + 1}. ${s}`).join('\n') || '';
+        const relatedNote = data.related_files?.length > 0 ? `\n📎 Related files read: ${data.related_files.join(', ')}` : '';
+        const orchestrateMsgs: Message[] = [];
+        if (planSteps) orchestrateMsgs.push({ role: 'ai', text: `[PLAN]\n${planSteps}` });
+        if (data.diff) orchestrateMsgs.push({ role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.diff}`, isDiff: true });
+        if (data.explanation) {
+          const citationBlock = data.citations?.length > 0
+            ? `\n\n📚 Sources:\n${data.citations.map((c: string, i: number) => `  ${i + 1}. ${c}`).join('\n')}`
+            : '';
+          orchestrateMsgs.push({ role: 'ai', text: `[EXPLANATION]\n${data.explanation}${citationBlock}${relatedNote}` });
+        }
+        orchestrateMsgs.push({ role: 'ai', text: `[VERDICT] ${data.verdict} — ${data.attempts} attempt(s)` });
+        setMessages(prev => [...prev, ...orchestrateMsgs]);
+        if (data.diff && data.file_path) {
+          setPendingAgentEdit({ instruction: userMsg, output: data.diff, filePath: data.file_path });
+          setSelectedFilePath(data.file_path);
+        }
+      } else if (data.status === 'pending_review') {
         // Show dry_run output and set pending edit; use resolved path returned by server
         const resolvedPath = data.file_path || selectedFilePath || '';
         setSelectedFilePath(resolvedPath);
@@ -107,7 +229,7 @@ const handleSubmit = async (e: React.FormEvent) => {
       const res = await fetch('http://localhost:8000/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: userMsg, mode: queryMode }),
+        body: JSON.stringify({ question: userMsg, mode: queryMode, session_id: sid }),
       });
       const data = await res.json();
 
@@ -274,6 +396,85 @@ return (
       padding: '20px',
     }}
     >
+      {/* ── Session Sidebar ─────────────────────────────────────────────── */}
+      <div
+        style={{
+          position: 'fixed', top: 0, left: 0, bottom: 0,
+          width: showSidebar ? '260px' : '0px',
+          backgroundColor: 'rgba(10,10,15,0.98)',
+          borderRight: showSidebar ? '1px solid rgba(85,51,255,0.3)' : 'none',
+          zIndex: 80, overflowY: 'auto', overflowX: 'hidden',
+          transition: 'width 0.25s ease',
+          display: 'flex', flexDirection: 'column',
+        }}
+      >
+        {showSidebar && (
+          <>
+            <div style={{ padding: '16px 14px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ color: '#5533ff', fontWeight: 'bold', fontSize: '13px', letterSpacing: '0.08em' }}>CHATS</span>
+              <button onClick={handleNewChat}
+                style={{ background: 'none', border: '1px dashed #5533ff55', color: '#5533ff', padding: '4px 10px', borderRadius: '6px', cursor: 'pointer', fontSize: '12px' }}>
+                + New
+              </button>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px 12px' }}>
+              {sessions.map(s => (
+                <div key={s.session_id}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: '6px',
+                    padding: '8px 10px', marginBottom: '4px', borderRadius: '8px', cursor: 'pointer',
+                    backgroundColor: s.session_id === sessionId ? 'rgba(85,51,255,0.2)' : 'transparent',
+                    border: s.session_id === sessionId ? '1px solid rgba(85,51,255,0.4)' : '1px solid transparent',
+                  }}
+                  onClick={() => { if (editingSessionId !== s.session_id) switchSession(s.session_id); }}
+                >
+                  {editingSessionId === s.session_id ? (
+                    <input
+                      autoFocus
+                      value={editTitle}
+                      onChange={e => setEditTitle(e.target.value)}
+                      onBlur={() => handleRenameSession(s.session_id, editTitle)}
+                      onKeyDown={e => { if (e.key === 'Enter') handleRenameSession(s.session_id, editTitle); if (e.key === 'Escape') { setEditingSessionId(null); setEditTitle(''); } }}
+                      style={{ flex: 1, padding: '2px 6px', backgroundColor: '#111', border: '1px solid #555', borderRadius: '4px', color: '#fff', fontSize: '12px', outline: 'none' }}
+                      onClick={e => e.stopPropagation()}
+                    />
+                  ) : (
+                    <span style={{ flex: 1, fontSize: '12px', color: s.session_id === sessionId ? '#fff' : '#aaa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {s.title || 'Untitled'}
+                    </span>
+                  )}
+                  <button onClick={e => { e.stopPropagation(); setEditingSessionId(s.session_id); setEditTitle(s.title || ''); }}
+                    style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', fontSize: '11px', padding: '2px' }}
+                    title="Rename">✏</button>
+                  <button onClick={e => { e.stopPropagation(); handleDeleteSession(s.session_id); }}
+                    style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '11px', padding: '2px' }}
+                    title="Delete">🗑</button>
+                </div>
+              ))}
+              {sessions.length === 0 && (
+                <div style={{ color: '#555', fontSize: '12px', textAlign: 'center', paddingTop: '20px' }}>No saved chats yet</div>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Sidebar toggle button */}
+      <button
+        onClick={() => setShowSidebar(prev => !prev)}
+        style={{
+          position: 'fixed', top: '50%', left: showSidebar ? '260px' : '0px',
+          transform: 'translateY(-50%)',
+          zIndex: 81, padding: '8px 4px', borderRadius: '0 8px 8px 0',
+          backgroundColor: 'rgba(85,51,255,0.3)', border: 'none', color: '#fff',
+          cursor: 'pointer', fontSize: '14px', transition: 'left 0.25s ease',
+          backdropFilter: 'blur(10px)',
+        }}
+        title={showSidebar ? 'Hide sessions' : 'Show sessions'}
+      >
+        {showSidebar ? '◀' : '▶'}
+      </button>
+
       {/* Top spacer (for nicer vertical balance) */}
       <div style={{ flex: 1 }} />
 
@@ -443,9 +644,85 @@ return (
             >
               🧪 Tests{testCases.length > 0 ? ` (${testCases.length})` : ''}
             </button>
+            <button
+              type="button"
+              onClick={() => setUseMultiAgent(p => !p)}
+              disabled={mode !== 'idle'}
+              title="Multi-agent: Planner → Code Agent → Critic with retries and cross-file context"
+              style={{
+                padding: '6px 10px', borderRadius: '6px', border: '1px solid',
+                borderColor: useMultiAgent ? '#ff00ff' : '#555',
+                backgroundColor: useMultiAgent ? 'rgba(255,0,255,0.15)' : '#111',
+                color: useMultiAgent ? '#ff00ff' : '#aaa',
+                fontSize: '12px', cursor: 'pointer', whiteSpace: 'nowrap'
+              }}
+            >
+              🔗 Multi-Agent{useMultiAgent ? ' ✓' : ''}
+            </button>
+            <input
+              id="context-file-picker"
+              type="file"
+              multiple
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const files = (e.target as HTMLInputElement).files;
+                if (!files) return;
+                const paths: string[] = [];
+                for (let i = 0; i < files.length; i++) {
+                  const fullPath = (files[i] as any).path || files[i].name;
+                  if (fullPath && fullPath !== selectedFilePath) paths.push(fullPath);
+                }
+                setContextFiles(prev => {
+                  const existing = new Set(prev);
+                  const merged = [...prev];
+                  for (const p of paths) { if (!existing.has(p)) merged.push(p); }
+                  return merged.slice(0, 10);
+                });
+                (document.getElementById('context-file-picker') as HTMLInputElement).value = '';
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => (document.getElementById('context-file-picker') as HTMLInputElement)?.click()}
+              disabled={mode !== 'idle'}
+              title="Add context files for cross-file editing (up to 10)"
+              style={{
+                padding: '6px 10px', borderRadius: '6px', border: '1px solid',
+                borderColor: contextFiles.length > 0 ? '#22ff88' : '#555',
+                backgroundColor: contextFiles.length > 0 ? 'rgba(34,255,136,0.15)' : '#111',
+                color: contextFiles.length > 0 ? '#22ff88' : '#aaa',
+                fontSize: '12px', cursor: 'pointer', whiteSpace: 'nowrap'
+              }}
+            >
+              📂 Context{contextFiles.length > 0 ? ` (${contextFiles.length})` : ''}
+            </button>
           </div>
         )}
       </div>
+
+      {/* ── Context Files Bar ─────────────────────────────────────────────── */}
+      {contextFiles.length > 0 && activeMode === 'agent' && (
+        <div style={{
+          position: 'fixed', top: '52px', left: '20px', zIndex: 55,
+          display: 'flex', gap: '4px', flexWrap: 'wrap', maxWidth: 'calc(100vw - 40px)',
+        }}>
+          {contextFiles.map((cf, i) => (
+            <span key={i} style={{
+              fontSize: '10px', padding: '3px 8px', borderRadius: '10px',
+              backgroundColor: 'rgba(34,255,136,0.12)', border: '1px solid rgba(34,255,136,0.3)',
+              color: '#22ff88', display: 'inline-flex', alignItems: 'center', gap: '4px',
+            }}>
+              {cf.split(/[/\\]/).pop()}
+              <button onClick={() => setContextFiles(prev => prev.filter((_, j) => j !== i))}
+                style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', fontSize: '10px', padding: '0 2px' }}>✕</button>
+            </span>
+          ))}
+          <button onClick={() => setContextFiles([])}
+            style={{ fontSize: '10px', padding: '3px 6px', borderRadius: '10px', backgroundColor: 'rgba(255,50,50,0.15)', border: '1px solid rgba(255,50,50,0.3)', color: '#ff5555', cursor: 'pointer' }}>
+            Clear All
+          </button>
+        </div>
+      )}
 
       {/* ── Test Panel ────────────────────────────────────────────────────── */}
       {showTestPanel && activeMode === 'agent' && (
@@ -488,11 +765,12 @@ return (
                     style={{ marginLeft: 'auto', background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '13px' }}
                   >🗑</button>
                 </div>
-                <input
-                  placeholder="Input (e.g. [[0,0,1],[1,1,0],[1,0,0]])"
+                <textarea
+                  placeholder="Input — e.g. [[1,0,0],[0,0,1],[1,0,0]]&#10;Separate multiple args with newlines"
                   value={tc.input}
                   onChange={e => setTestCases(prev => prev.map(t => t.id === tc.id ? { ...t, input: e.target.value } : t))}
-                  style={{ padding: '5px 8px', borderRadius: '6px', backgroundColor: '#0d0d14', color: '#fff', border: '1px solid #333', fontSize: '12px', fontFamily: 'monospace' }}
+                  rows={2}
+                  style={{ padding: '5px 8px', borderRadius: '6px', backgroundColor: '#0d0d14', color: '#fff', border: '1px solid #333', fontSize: '12px', fontFamily: 'monospace', resize: 'vertical', minHeight: '36px' }}
                 />
                 <input
                   placeholder="Expected output (e.g. 3)"
@@ -617,7 +895,7 @@ return (
             zIndex: 30,
             width: '80%',
             maxWidth: '960px',
-            maxHeight: '40vh',
+            maxHeight: '70vh',
             overflowY: 'auto',
             display: 'flex',
             flexDirection: 'column',
@@ -685,7 +963,7 @@ return (
                       const res = await fetch('http://localhost:8000/feedback', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ question: lastUserQuery, prev_mode: queryMode })
+                        body: JSON.stringify({ question: lastUserQuery, prev_mode: queryMode, session_id: sessionId })
                       });
                       const deep = await res.json();
                       // append deep answer and summary

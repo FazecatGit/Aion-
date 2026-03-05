@@ -200,9 +200,13 @@ class CodeAgent:
             func_start, func_end = 0, len(file_lines)
         else:
             focused, func_start, func_end = extract_function(file_source, instruction)
-            if focused and len(focused.splitlines()) < 60:
+            has_call_sites = focused and '// ── CALL SITE' in focused
+            if focused and len(focused.splitlines()) < 120:
                 original_snippet = focused
-                original_header = "ORIGINAL FILE TO EDIT (relevant function):\n"
+                if has_call_sites:
+                    original_header = "ORIGINAL FILE TO EDIT (function + its call sites — you may need SEARCH/REPLACE blocks for BOTH the function AND its callers):\n"
+                else:
+                    original_header = "ORIGINAL FILE TO EDIT (relevant function):\n"
             else:
                 original_snippet = file_source
                 original_header = "ORIGINAL FILE TO EDIT:\n"
