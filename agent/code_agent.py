@@ -20,7 +20,8 @@ from .code_editing_helpers import (
     is_oversized_block, find_first_mismatch, whole_function_replace,
     strip_markdown, parse_multiple_blocks, build_syntax_error_note,
     build_runtime_error_note, build_post_error_note,
-    validate_code_structure, build_structural_issue_note
+    validate_code_structure, build_structural_issue_note,
+    FUNC_PATTERN, _C_FUNC_PATTERN
 )
 from .code_context_builders import build_all_contexts
 from .session_memory import SessionMemory
@@ -80,6 +81,73 @@ class CodeAgent:
         logger.info("[AGENT] rerank auto-selected: %s (complex=%s)", chosen, is_complex)
         return chosen
 
+    @staticmethod
+    def _clarify_instruction(instruction: str, source: str, ext: str) -> str:
+        """Normalize casual/vague user instructions into precise technical requirements.
+
+        Many users describe tasks in natural, imprecise language:
+          - "make it faster" → "Optimize the time complexity of the existing algorithm"
+          - "it's broken when empty" → "Fix the function to handle empty input without crashing"
+
+        This step runs a lightweight LLM pass to extract a clean, unambiguous instruction
+        while preserving the user's original intent.  Skipped for instructions that are
+        already clear programming task descriptions.
+        """
+        # Heuristic: skip clarification for instructions that are already precise
+        # (e.g. LeetCode problem statements, instructions with code keywords)
+        PRECISE_SIGNALS = {
+            'search/replace', 'implement', 'function that', 'return the', 'return minimum',
+            'return maximum', 'given an array', 'given a string', 'given a linked list',
+            'given n', 'two pointers', 'dynamic programming', 'binary search',
+            'time complexity', 'space complexity',
+        }
+        lower = instruction.lower()
+        if any(sig in lower for sig in PRECISE_SIGNALS):
+            return instruction
+        # Also skip if the instruction is very short (1-3 words) — not enough to clarify
+        if len(instruction.split()) <= 3:
+            return instruction
+        # Also skip if the instruction is already long and detailed (>60 words)
+        if len(instruction.split()) > 60:
+            return instruction
+
+        # Detect vague/casual language that needs clarification
+        VAGUE_SIGNALS = {
+            'make it', 'broken', "doesn't work", "don't work", 'not working',
+            'something wrong', 'messed up', 'weird', 'acting up', 'help me',
+            'can you', 'could you', 'fix this', 'fix it', 'make this', 'change this',
+            'do something', 'it should', 'supposed to', 'need it to', 'want it to',
+            'the thing', 'that part', 'this part', 'stuff',
+        }
+        needs_clarification = any(sig in lower for sig in VAGUE_SIGNALS)
+
+        if not needs_clarification:
+            return instruction
+
+        try:
+            llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+            lang_name = LANG_FENCE.get(ext, ext.lstrip('.'))
+            prompt = (
+                f"A user gave this instruction about their {lang_name} code:\n"
+                f"USER: \"{instruction}\"\n\n"
+                f"CODE:\n```{lang_name}\n{source[:2000]}\n```\n\n"
+                "Rewrite the user's instruction as a clear, precise technical requirement.\n"
+                "Rules:\n"
+                "1. Keep the user's EXACT intent — do not add requirements they didn't ask for.\n"
+                "2. Reference specific function/variable names from the code when possible.\n"
+                "3. Be concise — one to three sentences maximum.\n"
+                "4. Output ONLY the rewritten instruction — no explanation, no quotes.\n"
+            )
+            clarified = llm.invoke(prompt).strip()
+            # Sanity check: reject if LLM produced something much longer or nonsensical
+            if clarified and len(clarified) < len(instruction) * 5 and len(clarified) > 5:
+                logger.info("[AGENT] Instruction clarified: '%s' → '%s'", instruction[:80], clarified[:120])
+                return clarified
+        except Exception as e:
+            logger.debug("[AGENT] Instruction clarification failed: %s", e)
+
+        return instruction
+
     def edit_code(
         self,
         path: str,
@@ -118,6 +186,9 @@ class CodeAgent:
 
         file_lines = file_source.split('\n')
         MAX_BLOCK_RATIO = 0.6
+
+        # --- Instruction clarification: normalize casual/vague language ---
+        instruction = self._clarify_instruction(instruction, file_source, ext)
 
         # Compute multi_func_hint once, always defined
         # Triggers on: multiple `word()` patterns, multiple quoted instructions,
@@ -286,6 +357,10 @@ class CodeAgent:
                     "3. Include a few surrounding lines in SEARCH to make it unique.\n"
                     "4. Output ONLY the block(s) — no explanatory text.\n\n"
                     "CRITICAL: Write a real, complete algorithm in REPLACE. Do not output a placeholder or pass.\n\n"
+                    "PRESERVATION RULE: Only modify the specific function(s) relevant to the task. "
+                    "Do NOT delete, rewrite, or omit any other functions, classes, or code in the file. "
+                    "If the file contains other code that is unrelated to this task, leave it COMPLETELY untouched. "
+                    "Your SEARCH block should target ONLY the specific function being implemented.\n\n"
                     f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
                     f"TASK: {instruction}\n\n"
                     f"{context_block}"
@@ -301,6 +376,8 @@ class CodeAgent:
                     "4. Output ONLY the blocks — no explanatory text, no comments.\n\n"
                     "CRITICAL RULE: Your SEARCH blocks must contain ONLY the specific lines being changed (max 20-30 lines each). "
                     "Output all blocks back-to-back with no commentary between them.\n\n"
+                    "PRESERVATION RULE: Only modify code directly relevant to the instruction. "
+                    "Do NOT delete, rewrite, or omit any unrelated functions, classes, or code in the file.\n\n"
                     f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
                     f"INSTRUCTION: {instruction}\n\n"
                     f"{context_block}"
@@ -531,6 +608,7 @@ class CodeAgent:
                     "1. Output ONLY the complete rewritten function — no explanation, no markdown fence.\n"
                     "2. Write a real, working algorithm. Do NOT leave the body empty or return a placeholder.\n"
                     "3. Keep exact indentation of the original.\n"
+                    "4. Output ONLY this function — do NOT include other functions from the file.\n"
                     f"{context_block}"
                 )
             else:
@@ -542,6 +620,7 @@ class CodeAgent:
                     "1. Output ONLY the rewritten code — no explanation, no markdown fence.\n"
                     "2. Preserve ALL existing logic except what the instruction explicitly changes.\n"
                     "3. Keep exact indentation of the original.\n"
+                    "4. Do NOT remove, rewrite, or omit any code outside the targeted function.\n"
                     f"{context_block}"
                 )
             try:
@@ -552,7 +631,18 @@ class CodeAgent:
                     original_span_lines = file_lines[func_start:func_end]
                     rewritten_lines = rewritten.strip().split('\n')
                     line_ratio = len(rewritten_lines) / max(1, len(original_span_lines))
-                    if line_ratio < 0.70 and len(original_span_lines) > 30:
+
+                    # Guard: if the span covers the entire file and has multiple functions,
+                    # the rewrite would destroy unrelated code — refuse and keep original.
+                    is_full_file = func_start == 0 and func_end >= len(file_lines)
+                    func_count = sum(1 for l in file_lines if FUNC_PATTERN.match(l) or _C_FUNC_PATTERN.match(l))
+                    if is_full_file and func_count > 1:
+                        logger.warning(
+                            "Whole-function rewrite rejected — span covers the entire file "
+                            "(%d functions detected). Refusing to destroy unrelated code.",
+                            func_count
+                        )
+                    elif line_ratio < 0.70 and len(original_span_lines) > 30:
                         logger.warning(
                             "Whole-function rewrite rejected — rewritten has only %.0f%% of original lines "
                             "(%d vs %d), likely data loss. Refusing to apply.",

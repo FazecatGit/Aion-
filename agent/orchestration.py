@@ -59,6 +59,8 @@ def plan_task(
         "EDGE_CASES:\n"
         "- <edge case to handle>\n"
         "- <edge case to handle>\n\n"
+        "IMPORTANT: Only plan changes to the specific function(s) relevant to the task. "
+        "If the file contains other functions or classes, they must NOT be modified or removed.\n\n"
         "Be specific about data structures, loop bounds, and conditions. Max 6 steps."
     )
 

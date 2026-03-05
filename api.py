@@ -259,24 +259,41 @@ async def agent_edit(req: AgentEditRequest):
             explanation = result.get("explanation", "")
             citations = result.get("citations", [])
         
+        # Build the full assistant response matching what the frontend displays
+        response_parts = []
+        if dry_run_output and dry_run_output != "(No changes — agent could not determine what to modify.)":
+            response_parts.append(f"[DRY RUN PREVIEW]\n\n{dry_run_output}")
+        if explanation:
+            citation_block = ""
+            if citations:
+                citation_block = "\n\n📚 Sources:\n" + "\n".join(f"  {i+1}. {c}" for i, c in enumerate(citations))
+            response_parts.append(f"[EXPLANATION]\n{explanation}{citation_block}")
+        full_response = "\n\n".join(response_parts) if response_parts else explanation
+
         # Store agent interaction into the shared query chat history
         # so follow-up questions in query mode have context
         session_chat_history.append({"role": "User", "content": req.instruction})
-        if explanation:
-            session_chat_history.append({"role": "Assistant", "content": explanation})
+        if full_response:
+            session_chat_history.append({"role": "Assistant", "content": full_response})
 
         # Also persist to chat session store for cross-restart memory
         if req.session_id:
             chat_store.add_turn(req.session_id, "User", f"[AGENT] {req.instruction}")
-            if explanation:
-                chat_store.add_turn(req.session_id, "Assistant", explanation)
+            if full_response:
+                chat_store.add_turn(req.session_id, "Assistant", full_response)
         
+        # Extract new_source for the Apply button to write directly
+        new_source = None
+        if isinstance(result, dict):
+            new_source = result.get("new_source")
+
         return {
             "status": "pending_review",
             "dry_run_output": dry_run_output,
             "file_path": resolved_path,
             "explanation": explanation,
             "citations": citations,
+            "new_source": new_source,
         }
     except Exception as e:
         return {"error": str(e), "status": "error", "message": f"Agent error: {str(e)}"}
@@ -288,6 +305,7 @@ class AgentApplyRequest(BaseModel):
     confirmed: bool = False
     task_mode: str = "auto"  # "fix", "solve", or "auto"
     session_id: Optional[str] = None
+    new_source: Optional[str] = None  # pre-computed source to write directly
 
 
 @app.post("/agent/apply")
@@ -315,6 +333,24 @@ async def agent_apply(req: AgentApplyRequest):
                     "message": f"File not found: {req.file_path}"}
 
     try:
+        # If new_source was provided (from dry_run preview), write it directly
+        # instead of re-running the LLM (which would be non-deterministic).
+        if req.new_source is not None:
+            import os, subprocess
+            with open(resolved_path, "w", encoding="utf-8") as f:
+                f.write(req.new_source)
+            # Run gofmt for Go files
+            ext = os.path.splitext(resolved_path)[1].lower()
+            if ext == ".go":
+                try:
+                    subprocess.run(["gofmt", "-w", resolved_path], timeout=5, check=True)
+                except Exception:
+                    pass
+            return {
+                "status": "success",
+                "message": f"Changes applied to {resolved_path}",
+            }
+
         agent = CodeAgent(repo_path=".")
         result = agent.edit_code(
             path=resolved_path,
@@ -387,11 +423,16 @@ async def agent_edit_with_chunks(req: AgentEditWithChunksRequest):
         else:
             dry_run_output = str(result)
 
+        new_source = None
+        if isinstance(result, dict):
+            new_source = result.get("new_source")
+
         return {
             "status": "pending_review",
             "dry_run_output": dry_run_output,
             "file_path": resolved_path,
-            "max_chunks": max_chunks
+            "max_chunks": max_chunks,
+            "new_source": new_source,
         }
     except Exception as e:
         return {"error": str(e), "status": "error", "message": f"Agent error with {req.max_chunks} chunks: {str(e)}"}
@@ -441,17 +482,49 @@ async def agent_orchestrate(req: OrchestrateRequest):
             extra_context_files=req.context_files,
         )
 
+        # Build the full assistant response matching what the frontend displays
+        response_parts = []
+        plan = result.get("plan", {})
+        plan_steps = plan.get("steps", [])
+        if plan_steps:
+            formatted_steps = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(plan_steps))
+            response_parts.append(f"[PLAN]\n{formatted_steps}")
+        diff = result.get("diff", "")
+        if diff:
+            response_parts.append(f"[DRY RUN PREVIEW]\n\n{diff}")
+        explanation = result.get("explanation", "")
+        if explanation:
+            citations = result.get("citations", [])
+            related_files = result.get("related_files", [])
+            citation_block = ""
+            if citations:
+                citation_block = "\n\n📚 Sources:\n" + "\n".join(f"  {i+1}. {c}" for i, c in enumerate(citations))
+            related_note = ""
+            if related_files:
+                related_note = f"\n📎 Related files read: {', '.join(str(f) for f in related_files)}"
+            response_parts.append(f"[EXPLANATION]\n{explanation}{citation_block}{related_note}")
+        verdict = result.get("verdict", "")
+        attempts = result.get("attempts", 0)
+        if verdict:
+            verdict_text = f"[VERDICT] {verdict} — {attempts} attempt(s)"
+            critic_feedback = result.get("critic_feedback", "")
+            if verdict == "FAIL" and critic_feedback:
+                verdict_text += f"\n\n[CRITIC FEEDBACK]\n{critic_feedback}"
+            response_parts.append(verdict_text)
+        full_response = "\n\n".join(response_parts) if response_parts else explanation
+
         # Persist agent conversation to chat session store
         if req.session_id:
             chat_store.add_turn(req.session_id, "User", f"[AGENT] {req.instruction}")
-            explanation = result.get("explanation", "")
-            if explanation:
-                chat_store.add_turn(req.session_id, "Assistant", explanation)
+            if full_response:
+                chat_store.add_turn(req.session_id, "Assistant", full_response)
         # Also push to in-memory history for query follow-ups
         session_chat_history.append({"role": "User", "content": req.instruction})
-        if result.get("explanation"):
-            session_chat_history.append({"role": "Assistant", "content": result["explanation"]})
+        if full_response:
+            session_chat_history.append({"role": "Assistant", "content": full_response})
 
+        # Always return the full multi-agent result; frontend uses `status`
+        # field ("pending_review" when changes exist) to show approval buttons.
         return result
     except Exception as e:
         return {"error": str(e), "status": "error"}
@@ -607,3 +680,64 @@ async def get_session_history(req: GetSessionHistoryRequest):
     """Get full conversation history for a session."""
     turns = chat_store.get_turns(req.session_id)
     return {"turns": turns}
+
+
+# ── Voice I/O endpoints ─────────────────────────────────────────────────────
+
+@app.post("/voice/transcribe")
+async def voice_transcribe(audio: UploadFile = File(...)):
+    """Transcribe an audio file to text via Whisper."""
+    try:
+        from agent.voice_io import transcribe_file
+        import tempfile, os
+        # Frontend always sends WAV now (Web Audio API PCM encoder — no ffmpeg needed)
+        suffix = os.path.splitext(audio.filename or ".wav")[1] or ".wav"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(await audio.read())
+            tmp_path = tmp.name
+        try:
+            result = transcribe_file(tmp_path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        # transcribe_file returns {"text": str, "language": str, "segments": list}
+        text = result["text"] if isinstance(result, dict) else str(result)
+        return {"status": "ok", "text": text}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+class TTSRequest(BaseModel):
+    text: str
+
+@app.post("/voice/speak")
+async def voice_speak(req: TTSRequest):
+    """Convert text to speech (plays on server or returns audio path)."""
+    try:
+        from agent.voice_io import speak_text
+        speak_text(req.text)
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ── OCR endpoints ────────────────────────────────────────────────────────────
+
+@app.post("/ocr/extract")
+async def ocr_extract(
+    image: UploadFile = File(...),
+    mode: str = "auto",
+):
+    """Extract text from a screenshot image.
+
+    mode: 'auto', 'code', 'diagram', 'text'
+    """
+    try:
+        from agent.ocr_capture import extract_text_from_image
+        image_bytes = await image.read()
+        result = extract_text_from_image(image_bytes, mode=mode)
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}

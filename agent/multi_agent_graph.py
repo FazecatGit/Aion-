@@ -116,7 +116,7 @@ def execute_node(state: AgentState) -> dict:
         result = agent.edit_code(
             path=state["file_path"],
             instruction=augmented,
-            dry_run=False,  # Apply changes to disk so retries see the updated file
+            dry_run=True, # user approved changes before writing to disk
             use_rag=True,
             task_mode=state.get("task_mode", "auto"),
             session_id=state.get("session_id"),
@@ -370,8 +370,21 @@ def run_multi_agent(
     graph = get_agent_graph()
     final_state = graph.invoke(initial_state)
 
+    # Restore the original file on disk — the pipeline may have written
+    # intermediate sources during retries. The user must approve via the
+    # frontend before any changes are persisted.
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(source)
+        logger.info("[MULTI_AGENT] Original file restored after pipeline")
+    except Exception as e:
+        logger.warning("[MULTI_AGENT] Could not restore original file: %s", e)
+
+    new_source = final_state.get("current_source", source)
+    has_changes = new_source != source
+
     return {
-        "status": "ok" if not final_state.get("error") else "error",
+        "status": "pending_review" if has_changes else "ok",
         "diff": final_state.get("diff", ""),
         "explanation": final_state.get("explanation", ""),
         "citations": final_state.get("citations", []),
@@ -380,6 +393,7 @@ def run_multi_agent(
         "attempts": final_state.get("attempt", 0),
         "error": final_state.get("error"),
         "related_files": [rf["path"] for rf in related_files],
-        "new_source": final_state.get("current_source", source),
+        "new_source": new_source,
         "file_path": file_path,
+        "critic_feedback": final_state.get("critic_feedback", ""),
     }

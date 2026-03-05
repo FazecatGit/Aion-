@@ -1,0 +1,66 @@
+{
+  "name": "aion-vscode",
+  "displayName": "Aion – Local AI Coding Agent",
+  "description": "Query Aion from VSCode: inline edits, RAG retrieval, agent pipeline — fully offline.",
+  "version": "0.1.0",
+  "publisher": "aion-local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aion.ask",
+        "title": "Aion: Ask a Question (RAG)"
+      },
+      {
+        "command": "aion.editSelection",
+        "title": "Aion: Edit Selected Code"
+      },
+      {
+        "command": "aion.applyEdit",
+        "title": "Aion: Apply Pending Edit"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "aion.ask",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      },
+      {
+        "command": "aion.editSelection",
+        "key": "ctrl+shift+e",
+        "mac": "cmd+shift+e"
+      }
+    ],
+    "configuration": {
+      "title": "Aion",
+      "properties": {
+        "aion.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "URL of the Aion backend server."
+        },
+        "aion.timeout": {
+          "type": "number",
+          "default": 120000,
+          "description": "Request timeout in milliseconds."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p tsconfig.json",
+    "watch": "tsc -watch -p tsconfig.json",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}

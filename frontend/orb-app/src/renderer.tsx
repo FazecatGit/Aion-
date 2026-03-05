@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import Orb from './Orb';
 import './index.css';
 
-type Message    = { role: 'user' | 'ai'; text: string; isDiff?: boolean };
+type Message    = { role: 'user' | 'ai'; text: string; isDiff?: boolean; imageData?: string };
 type OrbMode    = 'idle' | 'querying' | 'agent-processing';
 type ActiveMode = 'query' | 'agent';
 type TestCase   = { id: number; input: string; expected: string };
@@ -20,7 +20,7 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [lastUserQuery, setLastUserQuery] = useState<string | null>(null);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
-  const [pendingAgentEdit, setPendingAgentEdit] = useState<{ instruction: string; output: string; filePath: string } | null>(null);
+  const [pendingAgentEdit, setPendingAgentEdit] = useState<{ instruction: string; output: string; filePath: string; newSource?: string } | null>(null);
   const computeSize = () => {
     const maxDim = Math.max(window.innerWidth, window.innerHeight);
     const raw = 2000 / maxDim;           // 2000 is arbitrary scale factor
@@ -47,6 +47,17 @@ function App() {
   const [useMultiAgent, setUseMultiAgent] = useState(false);  // multi-agent orchestration toggle
   // ── Multi-file context ─────────────────────────────────────────────────────
   const [contextFiles, setContextFiles] = useState<string[]>([]);  // additional files for cross-file context
+  // ── Voice IO ───────────────────────────────────────────────────────────────
+  const [isRecording, setIsRecording] = useState(false);
+  const [voiceLoading, setVoiceLoading] = useState(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
+  const pcmChunksRef = useRef<Float32Array[]>([]);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  // ── OCR ────────────────────────────────────────────────────────────────────
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [enlargedImage, setEnlargedImage] = useState<string | null>(null);
 
 
   // update baseSize whenever window resizes so orb scales with window size
@@ -145,6 +156,122 @@ function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // ── WAV encoder (no ffmpeg needed — pure PCM → WAV) ──────────────────────
+  const encodeWAV = (samples: Float32Array, sampleRate: number): Blob => {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    const writeStr = (offset: number, str: string) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);          // subchunk size
+    view.setUint16(20, 1, true);           // PCM
+    view.setUint16(22, 1, true);           // mono
+    view.setUint32(24, sampleRate, true);  // sample rate
+    view.setUint32(28, sampleRate * 2, true); // byte rate
+    view.setUint16(32, 2, true);           // block align
+    view.setUint16(34, 16, true);          // bits per sample
+    writeStr(36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+    let offset = 44;
+    for (let i = 0; i < samples.length; i++, offset += 2) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return new Blob([buffer], { type: 'audio/wav' });
+  };
+
+  // ── Voice recording (Web Audio API → WAV — no ffmpeg) ────────────────────
+  const startVoiceRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const SAMPLE_RATE = 16000;
+      const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+      const source = ctx.createMediaStreamSource(stream);
+      // ScriptProcessor captures raw PCM floats
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      pcmChunksRef.current = [];
+      processor.onaudioprocess = (e) => {
+        pcmChunksRef.current.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      };
+      source.connect(processor);
+      processor.connect(ctx.destination);
+      audioContextRef.current = ctx;
+      audioStreamRef.current = stream;
+      processorRef.current = processor;
+      sourceRef.current = source;
+      setIsRecording(true);
+    } catch (err: any) {
+      setMessages(prev => [...prev, { role: 'ai', text: `Microphone error: ${err.message}` }]);
+    }
+  };
+
+  const stopVoiceRecording = async () => {
+    setIsRecording(false);
+    // Disconnect graph
+    processorRef.current?.disconnect();
+    sourceRef.current?.disconnect();
+    audioStreamRef.current?.getTracks().forEach(t => t.stop());
+    await audioContextRef.current?.close();
+    // Merge PCM chunks
+    const chunks = pcmChunksRef.current;
+    if (!chunks.length) return;
+    const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+    const merged = new Float32Array(totalLen);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+    const wavBlob = encodeWAV(merged, 16000);
+    setVoiceLoading(true);
+    try {
+      const form = new FormData();
+      form.append('audio', wavBlob, 'recording.wav');
+      const res = await fetch('http://localhost:8000/voice/transcribe', { method: 'POST', body: form });
+      const data = await res.json();
+      if (data.status === 'ok' && data.text) {
+        setInput(prev => (prev ? prev + ' ' : '') + data.text.trim());
+      } else {
+        setMessages(prev => [...prev, { role: 'ai', text: `Voice transcription error: ${data.error || 'unknown'}` }]);
+      }
+    } catch (err: any) {
+      setMessages(prev => [...prev, { role: 'ai', text: `Voice error: ${err.message}` }]);
+    } finally {
+      setVoiceLoading(false);
+      pcmChunksRef.current = [];
+    }
+  };
+
+  // ── OCR capture ────────────────────────────────────────────────────────────
+  const handleOCRCapture = async (file: File) => {
+    setOcrLoading(true);
+    try {
+      const imageData = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.readAsDataURL(file);
+      });
+      const form = new FormData();
+      form.append('image', file, file.name);
+      const res = await fetch('http://localhost:8000/ocr/extract', { method: 'POST', body: form });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        const label = data.content_type === 'code'
+          ? '```\n' + data.text + '\n```'
+          : data.text;
+        setMessages(prev => [...prev,
+          { role: 'user', text: `[Screenshot — ${data.content_type}]`, imageData },
+          { role: 'ai',   text: `[OCR RESULT — ${data.content_type}]\n${label}` },
+        ]);
+      } else {
+        setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${data.error || 'unknown'}` }]);
+      }
+    } catch (err: any) {
+      setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${err.message}` }]);
+    } finally {
+      setOcrLoading(false);
+    }
+  };
+
 const handleSubmit = async (e: React.FormEvent) => {
   e.preventDefault();
   if (!input.trim()) return;
@@ -186,8 +313,8 @@ const handleSubmit = async (e: React.FormEvent) => {
       });
       const data = await res.json();
 
-      if (useMultiAgent && data.status === 'ok') {
-        // Multi-agent returns {diff, explanation, citations, plan, verdict, attempts, related_files}
+      if (useMultiAgent && (data.status === 'ok' || data.status === 'pending_review')) {
+        // Multi-agent returns {diff, explanation, citations, plan, verdict, attempts, related_files, new_source, critic_feedback}
         const planSteps = data.plan?.steps?.map((s: string, i: number) => `  ${i + 1}. ${s}`).join('\n') || '';
         const relatedNote = data.related_files?.length > 0 ? `\n📎 Related files read: ${data.related_files.join(', ')}` : '';
         const orchestrateMsgs: Message[] = [];
@@ -195,14 +322,19 @@ const handleSubmit = async (e: React.FormEvent) => {
         if (data.diff) orchestrateMsgs.push({ role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.diff}`, isDiff: true });
         if (data.explanation) {
           const citationBlock = data.citations?.length > 0
-            ? `\n\n📚 Sources:\n${data.citations.map((c: string, i: number) => `  ${i + 1}. ${c}`).join('\n')}`
+            ? `\n\n Sources:\n${data.citations.map((c: string, i: number) => `  ${i + 1}. ${c}`).join('\n')}`
             : '';
           orchestrateMsgs.push({ role: 'ai', text: `[EXPLANATION]\n${data.explanation}${citationBlock}${relatedNote}` });
         }
-        orchestrateMsgs.push({ role: 'ai', text: `[VERDICT] ${data.verdict} — ${data.attempts} attempt(s)` });
+        // Build verdict message with critic feedback for transparency
+        let verdictText = `[VERDICT] ${data.verdict} — ${data.attempts} attempt(s)`;
+        if (data.verdict === 'FAIL' && data.critic_feedback) {
+          verdictText += `\n\n[CRITIC FEEDBACK]\n${data.critic_feedback}`;
+        }
+        orchestrateMsgs.push({ role: 'ai', text: verdictText });
         setMessages(prev => [...prev, ...orchestrateMsgs]);
         if (data.diff && data.file_path) {
-          setPendingAgentEdit({ instruction: userMsg, output: data.diff, filePath: data.file_path });
+          setPendingAgentEdit({ instruction: userMsg, output: data.diff, filePath: data.file_path, newSource: data.new_source });
           setSelectedFilePath(data.file_path);
         }
       } else if (data.status === 'pending_review') {
@@ -218,7 +350,7 @@ const handleSubmit = async (e: React.FormEvent) => {
           newMsgs.push({ role: 'ai', text: `[EXPLANATION]\n${data.explanation}${citationBlock}` });
         }
         setMessages(prev => [...prev, ...newMsgs]);
-        setPendingAgentEdit({ instruction: userMsg, output: data.dry_run_output, filePath: resolvedPath });
+        setPendingAgentEdit({ instruction: userMsg, output: data.dry_run_output, filePath: resolvedPath, newSource: data.new_source });
       } else if (data.status === 'error') {
         setMessages(prev => [...prev, { role: 'ai', text: `[AGENT ERROR] ${data.message || data.error}` }]);
       } else {
@@ -365,7 +497,7 @@ const handleRagChunkRetry = async (chunks: number) => {
         ragMsgs.push({ role: 'ai', text: `[EXPLANATION]\n${data.explanation}${citationBlock}` });
       }
       setMessages(prev => [...prev, ...ragMsgs]);
-      setPendingAgentEdit({ instruction: ragChunkPrompt.instruction, output: data.dry_run_output, filePath: resolvedPath });
+      setPendingAgentEdit({ instruction: ragChunkPrompt.instruction, output: data.dry_run_output, filePath: resolvedPath, newSource: data.new_source });
     } else if (data.status === 'error') {
       setMessages(prev => [...prev, { role: 'ai', text: `[AGENT ERROR] ${data.message || data.error}` }]);
     }
@@ -936,6 +1068,21 @@ return (
             }}
             >
             <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5, wordBreak: 'break-word', fontFamily: m.isDiff ? 'monospace' : 'inherit' }}>
+              {m.imageData && (
+                <div style={{ marginBottom: '8px' }}>
+                  <img
+                    src={m.imageData}
+                    alt="screenshot"
+                    onClick={() => setEnlargedImage(m.imageData!)}
+                    style={{
+                      maxWidth: '220px', maxHeight: '140px',
+                      borderRadius: '8px', border: '1px solid rgba(255,255,255,0.2)',
+                      cursor: 'zoom-in', display: 'block', objectFit: 'cover',
+                    }}
+                    title="Click to enlarge"
+                  />
+                </div>
+              )}
               {m.isDiff
                 ? m.text.split('\n').map((line, li) => (
                     <span key={li} style={{
@@ -1010,6 +1157,7 @@ return (
                           confirmed: true,
                           task_mode: agentTaskMode,
                           session_id: sessionId,
+                          new_source: pendingAgentEdit.newSource || undefined,
                         })
                       });
                       const result = await res.json();
@@ -1281,6 +1429,40 @@ return (
         </div>
       )}
 
+      {/* Enlarged image modal */}
+      {enlargedImage && (
+        <div
+          onClick={() => setEnlargedImage(null)}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 200,
+            backgroundColor: 'rgba(0,0,0,0.88)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            cursor: 'zoom-out',
+          }}
+        >
+          <img
+            src={enlargedImage}
+            alt="enlarged screenshot"
+            style={{
+              maxWidth: '90vw', maxHeight: '90vh',
+              borderRadius: '12px', border: '1px solid rgba(255,255,255,0.15)',
+              boxShadow: '0 16px 64px rgba(0,0,0,0.8)',
+            }}
+            onClick={e => e.stopPropagation()}
+          />
+          <button
+            onClick={() => setEnlargedImage(null)}
+            style={{
+              position: 'fixed', top: '20px', right: '24px',
+              background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)',
+              borderRadius: '50%', width: '36px', height: '36px',
+              color: '#fff', fontSize: '18px', cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+          >✕</button>
+        </div>
+      )}
+
       {/* Input bar fixed at bottom center */}
       <form
         onSubmit={handleSubmit}
@@ -1337,6 +1519,63 @@ return (
         >
           {activeMode === 'agent' ? '🤖 Agent' : '🔍 Query'}
         </button>
+        {/* Voice input button */}
+        <button
+          type="button"
+          onMouseDown={startVoiceRecording}
+          onMouseUp={stopVoiceRecording}
+          onTouchStart={startVoiceRecording}
+          onTouchEnd={stopVoiceRecording}
+          disabled={mode !== 'idle' || voiceLoading}
+          title="Hold to record voice (Whisper transcription)"
+          style={{
+            padding: '10px 12px',
+            borderRadius: '12px',
+            border: '2px solid',
+            borderColor: isRecording ? '#ff4444' : voiceLoading ? '#ff9900' : '#444',
+            backgroundColor: isRecording ? 'rgba(255,68,68,0.2)' : voiceLoading ? 'rgba(255,153,0,0.15)' : '#111',
+            color: isRecording ? '#ff4444' : voiceLoading ? '#ff9900' : '#888',
+            cursor: mode !== 'idle' ? 'not-allowed' : 'pointer',
+            fontSize: '16px',
+            transition: 'all 0.15s',
+            animation: isRecording ? 'pulse 0.8s infinite' : 'none',
+          }}
+        >
+          {voiceLoading ? '⏳' : isRecording ? '⏹' : '🎤'}
+        </button>
+
+        {/* OCR capture button */}
+        <input
+          id="ocr-image-picker"
+          type="file"
+          accept="image/*"
+          style={{ display: 'none' }}
+          onChange={async (e) => {
+            const f = (e.target as HTMLInputElement).files?.[0];
+            if (f) await handleOCRCapture(f);
+            (document.getElementById('ocr-image-picker') as HTMLInputElement).value = '';
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => (document.getElementById('ocr-image-picker') as HTMLInputElement)?.click()}
+          disabled={mode !== 'idle' || ocrLoading}
+          title="OCR: capture a screenshot or image → extract text"
+          style={{
+            padding: '10px 12px',
+            borderRadius: '12px',
+            border: '2px solid',
+            borderColor: ocrLoading ? '#ff9900' : '#444',
+            backgroundColor: ocrLoading ? 'rgba(255,153,0,0.15)' : '#111',
+            color: ocrLoading ? '#ff9900' : '#888',
+            cursor: mode !== 'idle' || ocrLoading ? 'not-allowed' : 'pointer',
+            fontSize: '16px',
+            transition: 'all 0.15s',
+          }}
+        >
+          {ocrLoading ? '⏳' : '📷'}
+        </button>
+
         <input
           type="text"
           value={input}
@@ -1376,3 +1615,9 @@ return (
 }
 
 createRoot(document.getElementById('root')!).render(<App />);
+
+// Inject pulse keyframe for recording animation
+const styleEl = document.createElement('style');
+styleEl.textContent = `@keyframes pulse { 0%,100%{box-shadow:0 0 0 0 rgba(255,68,68,0.5)} 50%{box-shadow:0 0 0 6px rgba(255,68,68,0.0)} }`;
+document.head.appendChild(styleEl);
+
