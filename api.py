@@ -648,6 +648,8 @@ class DeleteSessionRequest(BaseModel):
 
 class GetSessionHistoryRequest(BaseModel):
     session_id: str
+    offset: int = 0    # pagination: skip first N turns
+    limit: int = 0     # 0 = all turns (default for backward compat)
 
 
 @app.get("/sessions")
@@ -677,9 +679,14 @@ async def delete_session(req: DeleteSessionRequest):
 
 @app.post("/sessions/history")
 async def get_session_history(req: GetSessionHistoryRequest):
-    """Get full conversation history for a session."""
+    """Get conversation history for a session with optional pagination."""
     turns = chat_store.get_turns(req.session_id)
-    return {"turns": turns}
+    total = len(turns)
+    if req.limit > 0:
+        turns = turns[req.offset:req.offset + req.limit]
+    elif req.offset > 0:
+        turns = turns[req.offset:]
+    return {"turns": turns, "total": total, "offset": req.offset}
 
 
 # ── Voice I/O endpoints ─────────────────────────────────────────────────────
@@ -738,6 +745,141 @@ async def ocr_extract(
         from agent.ocr_capture import extract_text_from_image
         image_bytes = await image.read()
         result = extract_text_from_image(image_bytes, mode=mode)
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ── Tool Hooks: Linting, Testing, Logs, Git ──────────────────────────────────
+
+class LintRequest(BaseModel):
+    file_path: str
+    fix: bool = False
+
+class PytestRequest(BaseModel):
+    target: str = "."
+    with_coverage: bool = False
+    cwd: Optional[str] = None
+
+class LogParseRequest(BaseModel):
+    log_path: str
+    tail: int = 500
+
+class GitDiffRequest(BaseModel):
+    ref: str = "HEAD"
+    file_path: Optional[str] = None
+
+class GitLogRequest(BaseModel):
+    count: int = 20
+
+class GitBlameRequest(BaseModel):
+    file_path: str
+    line_number: int
+
+
+@app.post("/tools/lint")
+async def lint_endpoint(req: LintRequest):
+    """Run language-appropriate linter on a file."""
+    try:
+        from agent.tool_hooks import lint_file
+        result = lint_file(req.file_path, fix=req.fix)
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/tools/type_check")
+async def type_check_endpoint(req: LintRequest):
+    """Run type checker (mypy for Python, tsc for TypeScript)."""
+    try:
+        from agent.tool_hooks import run_mypy, run_tsc_check, _detect_language
+        lang = _detect_language(req.file_path)
+        if lang == "python":
+            result = run_mypy(req.file_path)
+        elif lang in ("typescript", "javascript"):
+            result = run_tsc_check(req.file_path)
+        else:
+            return {"status": "ok", "tool": "none", "message": f"No type checker for {lang}"}
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/tools/pytest")
+async def pytest_endpoint(req: PytestRequest):
+    """Run pytest with optional coverage."""
+    try:
+        from agent.tool_hooks import run_pytest, run_pytest_with_coverage
+        if req.with_coverage:
+            result = run_pytest_with_coverage(req.target, cwd=req.cwd)
+        else:
+            result = run_pytest(req.target, cwd=req.cwd)
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/tools/parse_logs")
+async def parse_logs_endpoint(req: LogParseRequest):
+    """Parse a log file for errors and group repeated patterns."""
+    try:
+        from agent.tool_hooks import read_log_file
+        result = read_log_file(req.log_path, tail=req.tail)
+        return result
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/tools/git_diff")
+async def git_diff_endpoint(req: GitDiffRequest):
+    """Get git diff for code review."""
+    try:
+        from agent.tool_hooks import git_diff
+        result = git_diff(ref=req.ref, file_path=req.file_path)
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/tools/git_diff_staged")
+async def git_diff_staged_endpoint():
+    """Get staged changes diff."""
+    try:
+        from agent.tool_hooks import git_diff_staged
+        result = git_diff_staged()
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/tools/git_log")
+async def git_log_endpoint(req: GitLogRequest):
+    """Get readable changelog from recent commits."""
+    try:
+        from agent.tool_hooks import git_log_summary
+        result = git_log_summary(count=req.count)
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/tools/git_blame")
+async def git_blame_endpoint(req: GitBlameRequest):
+    """Get blame info for a specific line."""
+    try:
+        from agent.tool_hooks import git_blame_line
+        result = git_blame_line(req.file_path, req.line_number)
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/tools/pre_commit")
+async def pre_commit_endpoint():
+    """Run pre-commit style checks on staged files."""
+    try:
+        from agent.tool_hooks import pre_commit_check
+        result = pre_commit_check()
         return {"status": "ok", **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}

@@ -47,6 +47,10 @@ function App() {
   const [useMultiAgent, setUseMultiAgent] = useState(false);  // multi-agent orchestration toggle
   // ── Multi-file context ─────────────────────────────────────────────────────
   const [contextFiles, setContextFiles] = useState<string[]>([]);  // additional files for cross-file context
+  // ── Infinite scroll / pagination ───────────────────────────────────────────
+  const MESSAGES_PER_PAGE = 50;
+  const [visibleCount, setVisibleCount] = useState(MESSAGES_PER_PAGE);
+  const chatContainerRef = useRef<HTMLDivElement>(null);
   // ── Voice IO ───────────────────────────────────────────────────────────────
   const [isRecording, setIsRecording] = useState(false);
   const [voiceLoading, setVoiceLoading] = useState(false);
@@ -58,6 +62,10 @@ function App() {
   // ── OCR ────────────────────────────────────────────────────────────────────
   const [ocrLoading, setOcrLoading] = useState(false);
   const [enlargedImage, setEnlargedImage] = useState<string | null>(null);
+  const [showOcrMenu, setShowOcrMenu] = useState(false);
+
+  // Type declaration for electronAPI exposed from preload
+  const electronAPI = (window as any).electronAPI as { captureScreen: () => Promise<string | null>; openFileDialog: (opts?: { multiple?: boolean }) => Promise<string | string[] | null> } | undefined;
 
 
   // update baseSize whenever window resizes so orb scales with window size
@@ -96,6 +104,7 @@ function App() {
   const switchSession = async (sid: string) => {
     setSessionId(sid);
     setMessages([]);
+    setVisibleCount(MESSAGES_PER_PAGE);
     setLastUserQuery(null);
     setPendingAgentEdit(null);
     setDetailsContent(null);
@@ -120,6 +129,7 @@ function App() {
     const newId = crypto.randomUUID();
     setSessionId(newId);
     setMessages([]);
+    setVisibleCount(MESSAGES_PER_PAGE);
     setLastUserQuery(null);
     setPendingAgentEdit(null);
     setDetailsContent(null);
@@ -153,6 +163,8 @@ function App() {
   };
 
   useEffect(() => {
+    // Ensure visibleCount always includes the newest messages
+    setVisibleCount(prev => Math.max(prev, Math.min(messages.length, MESSAGES_PER_PAGE)));
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
@@ -267,6 +279,46 @@ function App() {
       }
     } catch (err: any) {
       setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${err.message}` }]);
+    } finally {
+      setOcrLoading(false);
+    }
+  };
+
+  const handleScreenCapture = async () => {
+    setShowOcrMenu(false);
+    setOcrLoading(true);
+    try {
+      if (!electronAPI) {
+        setMessages(prev => [...prev, { role: 'ai', text: 'Screen capture is only available in the Electron app.' }]);
+        setOcrLoading(false);
+        return;
+      }
+      const dataUrl = await electronAPI.captureScreen();
+      if (!dataUrl) {
+        setMessages(prev => [...prev, { role: 'ai', text: 'Screen capture failed — no screen sources found.' }]);
+        setOcrLoading(false);
+        return;
+      }
+      // Convert data URL to Blob
+      const resp = await fetch(dataUrl);
+      const blob = await resp.blob();
+      const form = new FormData();
+      form.append('image', blob, 'screenshot.png');
+      const res = await fetch('http://localhost:8000/ocr/extract', { method: 'POST', body: form });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        const label = data.content_type === 'code'
+          ? '```\n' + data.text + '\n```'
+          : data.text;
+        setMessages(prev => [...prev,
+          { role: 'user', text: `[Screen Capture — ${data.content_type}]`, imageData: dataUrl },
+          { role: 'ai',   text: `[OCR RESULT — ${data.content_type}]\n${label}` },
+        ]);
+      } else {
+        setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${data.error || 'unknown'}` }]);
+      }
+    } catch (err: any) {
+      setMessages(prev => [...prev, { role: 'ai', text: `Screen capture error: ${err.message}` }]);
     } finally {
       setOcrLoading(false);
     }
@@ -610,7 +662,7 @@ return (
       {/* Top spacer (for nicer vertical balance) */}
       <div style={{ flex: 1 }} />
 
-      {/* toolbar: upload + mode selector */}
+      {/* ── Top Left Toolbar: RAG / Data controls ──────────────────────── */}
       <div style={{ position: 'fixed', top: '20px', left: '20px', zIndex: 50, display: 'flex', gap: '8px' }}>
         <button
           onClick={async () => {
@@ -718,104 +770,80 @@ return (
             <option value="both">Both</option>
           </select>
         )}
+      </div>
 
-        {activeMode === 'agent' && (
-          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flex: 1 }}>
-            <input
-              id="agent-file-picker"
-              type="file"
-              style={{ display: 'none' }}
-              onChange={(e) => {
-                const f = (e.target as HTMLInputElement).files?.[0];
-                if (!f) return;
-                // In Electron with sandbox:false, .path gives the full OS path
-                const fullPath = (f as any).path || f.name;
-                setSelectedFilePath(fullPath);
-                setTestResults([]);  // clear stale test results when file changes
-                (document.getElementById('agent-file-picker') as HTMLInputElement).value = '';
-              }}
-            />
+      {/* ── Top Right Toolbar: File + Context (agent mode only) ────────── */}
+      {activeMode === 'agent' && (
+        <div style={{ position: 'fixed', top: '20px', right: '20px', zIndex: 50, display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'flex-end' }}>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
             <button
-              onClick={() => (document.getElementById('agent-file-picker') as HTMLInputElement)?.click()}
+              onClick={async () => {
+                const api = (window as any).electronAPI;
+                let handled = false;
+                if (api?.openFileDialog) {
+                  try {
+                    const p = await api.openFileDialog({ multiple: false });
+                    if (p) { setSelectedFilePath(p as string); setTestResults([]); }
+                    handled = true;
+                  } catch { /* handler not yet registered — fall through */ }
+                }
+                if (!handled) {
+                  const input = document.createElement('input');
+                  input.type = 'file';
+                  input.onchange = () => {
+                    const f = input.files?.[0];
+                    if (f) { setSelectedFilePath((f as any).path || f.name); setTestResults([]); }
+                  };
+                  input.click();
+                }
+              }}
               style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#4422aa', color: '#fff', border: 'none', cursor: 'pointer', whiteSpace: 'nowrap' }}
               disabled={mode !== 'idle'}
             >
-              📁 Select File
-            </button>
-            <input
-              type="text"
-              value={selectedFilePath || ''}
-              onChange={e => setSelectedFilePath(e.target.value)}
-              placeholder="Full path, e.g. C:\path\to\file.py"
-              disabled={mode !== 'idle'}
-              style={{ flex: 1, padding: '6px 8px', borderRadius: '6px', backgroundColor: '#111', color: '#fff', border: '1px solid #555', fontSize: '12px', minWidth: 0 }}
-            />
-            <select
-              value={agentTaskMode}
-              onChange={e => setAgentTaskMode(e.target.value as any)}
-              disabled={mode !== 'idle'}
-              title="Fix: debug existing code  |  Solve/Build: implement from scratch  |  Auto: detect from prompt"
-              style={{ padding: '6px 8px', borderRadius: '6px', backgroundColor: '#111', color: '#fff', border: '1px solid #555', fontSize: '12px', cursor: 'pointer' }}
-            >
-              <option value="auto">⚙ Auto</option>
-              <option value="fix">🔧 Fix</option>
-              <option value="solve">🏗 Solve/Build</option>
-            </select>
-            <button
-              type="button"
-              onClick={() => setShowTestPanel(p => !p)}
-              disabled={mode !== 'idle'}
-              title="Toggle test case panel"
-              style={{
-                padding: '6px 10px', borderRadius: '6px', border: '1px solid',
-                borderColor: showTestPanel ? '#22bbff' : '#555',
-                backgroundColor: showTestPanel ? 'rgba(34,187,255,0.15)' : '#111',
-                color: showTestPanel ? '#22bbff' : '#aaa',
-                fontSize: '12px', cursor: 'pointer', whiteSpace: 'nowrap'
-              }}
-            >
-              🧪 Tests{testCases.length > 0 ? ` (${testCases.length})` : ''}
+              Select File
             </button>
             <button
               type="button"
-              onClick={() => setUseMultiAgent(p => !p)}
-              disabled={mode !== 'idle'}
-              title="Multi-agent: Planner → Code Agent → Critic with retries and cross-file context"
-              style={{
-                padding: '6px 10px', borderRadius: '6px', border: '1px solid',
-                borderColor: useMultiAgent ? '#ff00ff' : '#555',
-                backgroundColor: useMultiAgent ? 'rgba(255,0,255,0.15)' : '#111',
-                color: useMultiAgent ? '#ff00ff' : '#aaa',
-                fontSize: '12px', cursor: 'pointer', whiteSpace: 'nowrap'
-              }}
-            >
-              🔗 Multi-Agent{useMultiAgent ? ' ✓' : ''}
-            </button>
-            <input
-              id="context-file-picker"
-              type="file"
-              multiple
-              style={{ display: 'none' }}
-              onChange={(e) => {
-                const files = (e.target as HTMLInputElement).files;
-                if (!files) return;
-                const paths: string[] = [];
-                for (let i = 0; i < files.length; i++) {
-                  const fullPath = (files[i] as any).path || files[i].name;
-                  if (fullPath && fullPath !== selectedFilePath) paths.push(fullPath);
+              onClick={async () => {
+                const api = (window as any).electronAPI;
+                let handled = false;
+                if (api?.openFileDialog) {
+                  try {
+                    const paths = await api.openFileDialog({ multiple: true });
+                    if (paths) {
+                      const arr: string[] = Array.isArray(paths) ? paths : [paths];
+                      setContextFiles(prev => {
+                        const existing = new Set(prev);
+                        const merged = [...prev];
+                        for (const p of arr) { if (!existing.has(p) && p !== selectedFilePath) merged.push(p); }
+                        return merged.slice(0, 10);
+                      });
+                    }
+                    handled = true;
+                  } catch { /* handler not yet registered — fall through */ }
                 }
-                setContextFiles(prev => {
-                  const existing = new Set(prev);
-                  const merged = [...prev];
-                  for (const p of paths) { if (!existing.has(p)) merged.push(p); }
-                  return merged.slice(0, 10);
-                });
-                (document.getElementById('context-file-picker') as HTMLInputElement).value = '';
+                if (!handled) {
+                  const input = document.createElement('input');
+                  input.type = 'file';
+                  input.multiple = true;
+                  input.onchange = () => {
+                    const files = input.files;
+                    if (!files) return;
+                    const arr: string[] = [];
+                    for (let i = 0; i < files.length; i++) {
+                      const p = (files[i] as any).path || files[i].name;
+                      if (p && p !== selectedFilePath) arr.push(p);
+                    }
+                    setContextFiles(prev => {
+                      const existing = new Set(prev);
+                      const merged = [...prev];
+                      for (const p of arr) { if (!existing.has(p)) merged.push(p); }
+                      return merged.slice(0, 10);
+                    });
+                  };
+                  input.click();
+                }
               }}
-            />
-            <button
-              type="button"
-              onClick={() => (document.getElementById('context-file-picker') as HTMLInputElement)?.click()}
               disabled={mode !== 'idle'}
               title="Add context files for cross-file editing (up to 10)"
               style={{
@@ -829,30 +857,46 @@ return (
               📂 Context{contextFiles.length > 0 ? ` (${contextFiles.length})` : ''}
             </button>
           </div>
-        )}
-      </div>
 
-      {/* ── Context Files Bar ─────────────────────────────────────────────── */}
-      {contextFiles.length > 0 && activeMode === 'agent' && (
-        <div style={{
-          position: 'fixed', top: '52px', left: '20px', zIndex: 55,
-          display: 'flex', gap: '4px', flexWrap: 'wrap', maxWidth: 'calc(100vw - 40px)',
-        }}>
-          {contextFiles.map((cf, i) => (
-            <span key={i} style={{
-              fontSize: '10px', padding: '3px 8px', borderRadius: '10px',
-              backgroundColor: 'rgba(34,255,136,0.12)', border: '1px solid rgba(34,255,136,0.3)',
-              color: '#22ff88', display: 'inline-flex', alignItems: 'center', gap: '4px',
+          {/* Selected file path dropdown */}
+          {selectedFilePath && (
+            <div style={{
+              padding: '5px 10px', borderRadius: '8px',
+              backgroundColor: 'rgba(68,34,170,0.2)', border: '1px solid rgba(68,34,170,0.4)',
+              fontSize: '11px', color: '#cca8ff', maxWidth: '400px',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              display: 'flex', alignItems: 'center', gap: '6px',
             }}>
-              {cf.split(/[/\\]/).pop()}
-              <button onClick={() => setContextFiles(prev => prev.filter((_, j) => j !== i))}
-                style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', fontSize: '10px', padding: '0 2px' }}>✕</button>
-            </span>
-          ))}
-          <button onClick={() => setContextFiles([])}
-            style={{ fontSize: '10px', padding: '3px 6px', borderRadius: '10px', backgroundColor: 'rgba(255,50,50,0.15)', border: '1px solid rgba(255,50,50,0.3)', color: '#ff5555', cursor: 'pointer' }}>
-            Clear All
-          </button>
+              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }} title={selectedFilePath}>
+                {selectedFilePath}
+              </span>
+              <button
+                onClick={() => { setSelectedFilePath(null); setTestResults([]); }}
+                style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', fontSize: '11px', padding: '0 2px' }}
+              >✕</button>
+            </div>
+          )}
+
+          {/* Context files tags */}
+          {contextFiles.length > 0 && (
+            <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', maxWidth: '400px', justifyContent: 'flex-end' }}>
+              {contextFiles.map((cf, i) => (
+                <span key={i} style={{
+                  fontSize: '10px', padding: '3px 8px', borderRadius: '10px',
+                  backgroundColor: 'rgba(34,255,136,0.12)', border: '1px solid rgba(34,255,136,0.3)',
+                  color: '#22ff88', display: 'inline-flex', alignItems: 'center', gap: '4px',
+                }}>
+                  {cf.split(/[/\\]/).pop()}
+                  <button onClick={() => setContextFiles(prev => prev.filter((_, j) => j !== i))}
+                    style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', fontSize: '10px', padding: '0 2px' }}>✕</button>
+                </span>
+              ))}
+              <button onClick={() => setContextFiles([])}
+                style={{ fontSize: '10px', padding: '3px 6px', borderRadius: '10px', backgroundColor: 'rgba(255,50,50,0.15)', border: '1px solid rgba(255,50,50,0.3)', color: '#ff5555', cursor: 'pointer' }}>
+                Clear
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -1017,8 +1061,16 @@ return (
         </div>
       </div>
 
-      {/* Chat history */}
+      {/* Chat history — infinite scroll */}
         <div
+        ref={chatContainerRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          // Load more when scrolled near the top
+          if (el.scrollTop < 60 && visibleCount < messages.length) {
+            setVisibleCount(prev => Math.min(prev + MESSAGES_PER_PAGE, messages.length));
+          }
+        }}
         style={{
             position: 'fixed',
             top: '50%',
@@ -1042,7 +1094,21 @@ return (
             boxShadow: '0 12px 40px rgba(0, 0, 0, 0.5)',
         }}
         >
-        {messages.map((m, i) => {
+        {/* Load more button when there are older messages */}
+        {messages.length > visibleCount && (
+          <button
+            onClick={() => setVisibleCount(prev => Math.min(prev + MESSAGES_PER_PAGE, messages.length))}
+            style={{
+              alignSelf: 'center', padding: '6px 16px', borderRadius: '12px',
+              border: '1px solid rgba(85,51,255,0.3)', backgroundColor: 'rgba(85,51,255,0.1)',
+              color: '#aaa', cursor: 'pointer', fontSize: '11px', marginBottom: '8px',
+            }}
+          >
+            Load earlier messages ({messages.length - visibleCount} more)
+          </button>
+        )}
+        {messages.slice(-visibleCount).map((m, sliceIdx) => {
+            const i = Math.max(0, messages.length - visibleCount) + sliceIdx; // real index
             const isExplanation = m.role === 'ai' && m.text.startsWith('[EXPLANATION]');
             return (
             <div
@@ -1472,12 +1538,46 @@ return (
           left: '50%',
           transform: 'translateX(-50%)',
           width: '80%',
-          maxWidth: '640px',
+          maxWidth: '740px',
           display: 'flex',
-          gap: '10px',
-          zIndex: 20,      // ensure input sits above orb
+          flexDirection: 'column',
+          gap: '6px',
+          zIndex: 20,
         }}
       >
+        {/* Agent-mode controls row: Mode + Tests above input */}
+        {activeMode === 'agent' && (
+          <div style={{ display: 'flex', gap: '6px', justifyContent: 'center', alignItems: 'center' }}>
+            <select
+              value={agentTaskMode}
+              onChange={e => setAgentTaskMode(e.target.value as any)}
+              disabled={mode !== 'idle'}
+              title="Fix: debug existing code  |  Solve/Build: implement from scratch  |  Auto: detect from prompt"
+              style={{ padding: '5px 8px', borderRadius: '8px', backgroundColor: '#111', color: '#fff', border: '1px solid #555', fontSize: '11px', cursor: 'pointer' }}
+            >
+              <option value="auto">⚙ Auto</option>
+              <option value="fix">🔧 Fix</option>
+              <option value="solve">🏗 Solve/Build</option>
+            </select>
+            <button
+              type="button"
+              onClick={() => setShowTestPanel(p => !p)}
+              disabled={mode !== 'idle'}
+              title="Toggle test case panel"
+              style={{
+                padding: '5px 10px', borderRadius: '8px', border: '1px solid',
+                borderColor: showTestPanel ? '#22bbff' : '#555',
+                backgroundColor: showTestPanel ? 'rgba(34,187,255,0.15)' : '#111',
+                color: showTestPanel ? '#22bbff' : '#aaa',
+                fontSize: '11px', cursor: 'pointer', whiteSpace: 'nowrap'
+              }}
+            >
+              🧪 Tests{testCases.length > 0 ? ` (${testCases.length})` : ''}
+            </button>
+          </div>
+        )}
+        {/* Main input row */}
+        <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
         {detailsContent && (
           <button
             type="button"
@@ -1519,15 +1619,37 @@ return (
         >
           {activeMode === 'agent' ? '🤖 Agent' : '🔍 Query'}
         </button>
+        {/* Multi-Agent toggle — right next to the Agent/Query button */}
+        {activeMode === 'agent' && (
+          <button
+            type="button"
+            onClick={() => setUseMultiAgent(p => !p)}
+            disabled={mode !== 'idle'}
+            title="Multi-agent: Planner → Code Agent → Critic with retries"
+            style={{
+              padding: '10px 10px', borderRadius: '12px', border: '2px solid',
+              borderColor: useMultiAgent ? '#ff00ff' : '#555',
+              backgroundColor: useMultiAgent ? 'rgba(255,0,255,0.15)' : '#111',
+              color: useMultiAgent ? '#ff00ff' : '#aaa',
+              fontSize: '11px', cursor: 'pointer', whiteSpace: 'nowrap',
+              transition: 'all 0.3s',
+            }}
+          >
+            🔗{useMultiAgent ? ' ✓' : ''}
+          </button>
+        )}
         {/* Voice input button */}
         <button
           type="button"
-          onMouseDown={startVoiceRecording}
-          onMouseUp={stopVoiceRecording}
-          onTouchStart={startVoiceRecording}
-          onTouchEnd={stopVoiceRecording}
+          onClick={() => {
+            if (isRecording) {
+              stopVoiceRecording();
+            } else {
+              startVoiceRecording();
+            }
+          }}
           disabled={mode !== 'idle' || voiceLoading}
-          title="Hold to record voice (Whisper transcription)"
+          title="Click to start/stop voice recording (Whisper transcription)"
           style={{
             padding: '10px 12px',
             borderRadius: '12px',
@@ -1544,37 +1666,77 @@ return (
           {voiceLoading ? '⏳' : isRecording ? '⏹' : '🎤'}
         </button>
 
-        {/* OCR capture button */}
-        <input
-          id="ocr-image-picker"
-          type="file"
-          accept="image/*"
-          style={{ display: 'none' }}
-          onChange={async (e) => {
-            const f = (e.target as HTMLInputElement).files?.[0];
-            if (f) await handleOCRCapture(f);
-            (document.getElementById('ocr-image-picker') as HTMLInputElement).value = '';
-          }}
-        />
-        <button
-          type="button"
-          onClick={() => (document.getElementById('ocr-image-picker') as HTMLInputElement)?.click()}
-          disabled={mode !== 'idle' || ocrLoading}
-          title="OCR: capture a screenshot or image → extract text"
-          style={{
-            padding: '10px 12px',
-            borderRadius: '12px',
-            border: '2px solid',
-            borderColor: ocrLoading ? '#ff9900' : '#444',
-            backgroundColor: ocrLoading ? 'rgba(255,153,0,0.15)' : '#111',
-            color: ocrLoading ? '#ff9900' : '#888',
-            cursor: mode !== 'idle' || ocrLoading ? 'not-allowed' : 'pointer',
-            fontSize: '16px',
-            transition: 'all 0.15s',
-          }}
-        >
-          {ocrLoading ? '⏳' : '📷'}
-        </button>
+        {/* OCR capture button with dropdown */}
+        <div style={{ position: 'relative' }}>
+          <input
+            id="ocr-image-picker"
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={async (e) => {
+              const f = (e.target as HTMLInputElement).files?.[0];
+              if (f) await handleOCRCapture(f);
+              (document.getElementById('ocr-image-picker') as HTMLInputElement).value = '';
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => setShowOcrMenu(p => !p)}
+            disabled={mode !== 'idle' || ocrLoading}
+            title="OCR: capture screenshot or upload image → extract text"
+            style={{
+              padding: '10px 12px',
+              borderRadius: '12px',
+              border: '2px solid',
+              borderColor: ocrLoading ? '#ff9900' : showOcrMenu ? '#22bbff' : '#444',
+              backgroundColor: ocrLoading ? 'rgba(255,153,0,0.15)' : showOcrMenu ? 'rgba(34,187,255,0.15)' : '#111',
+              color: ocrLoading ? '#ff9900' : '#888',
+              cursor: mode !== 'idle' || ocrLoading ? 'not-allowed' : 'pointer',
+              fontSize: '16px',
+              transition: 'all 0.15s',
+            }}
+          >
+            {ocrLoading ? '⏳' : '📷'}
+          </button>
+          {showOcrMenu && (
+            <div style={{
+              position: 'absolute', bottom: '48px', left: '50%', transform: 'translateX(-50%)',
+              backgroundColor: 'rgba(20,20,30,0.97)', border: '1px solid rgba(85,51,255,0.4)',
+              borderRadius: '10px', padding: '6px', display: 'flex', flexDirection: 'column', gap: '4px',
+              minWidth: '160px', boxShadow: '0 8px 24px rgba(0,0,0,0.6)', zIndex: 100,
+            }}>
+              <button
+                type="button"
+                onClick={handleScreenCapture}
+                style={{
+                  padding: '8px 12px', borderRadius: '6px', border: 'none',
+                  backgroundColor: 'transparent', color: '#fff', cursor: 'pointer',
+                  fontSize: '13px', textAlign: 'left',
+                }}
+                onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'rgba(85,51,255,0.2)')}
+                onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+              >
+                🖥 Capture Screen
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOcrMenu(false);
+                  (document.getElementById('ocr-image-picker') as HTMLInputElement)?.click();
+                }}
+                style={{
+                  padding: '8px 12px', borderRadius: '6px', border: 'none',
+                  backgroundColor: 'transparent', color: '#fff', cursor: 'pointer',
+                  fontSize: '13px', textAlign: 'left',
+                }}
+                onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'rgba(85,51,255,0.2)')}
+                onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+              >
+                📁 Upload Image
+              </button>
+            </div>
+          )}
+        </div>
 
         <input
           type="text"
@@ -1609,6 +1771,7 @@ return (
         >
           {mode !== 'idle' ? '...' : 'Send'}
         </button>
+        </div>
       </form>
     </div>
   );

@@ -13,8 +13,6 @@ Strategy for clean output:
   3. Post-process: fix common OCR errors in code (0/O, l/1, etc.)
   4. If the image looks like a diagram, use Ollama vision model to describe it
 
-Dependencies (install when ready):
-  pip install easyocr pillow numpy opencv-python-headless
 """
 
 import os
@@ -33,7 +31,7 @@ _easyocr_reader = None
 
 
 def _get_reader(languages: List[str] = None):
-    """Lazy-load EasyOCR reader. First load downloads models (~100MB)."""
+    """Lazy-load EasyOCR reader. First load downloads models"""
     global _easyocr_reader
     if _easyocr_reader is None:
         import easyocr

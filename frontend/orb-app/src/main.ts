@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, ipcMain, desktopCapturer, screen, dialog } from 'electron';
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 
@@ -58,6 +58,28 @@ function startPython() {
 }
 
 app.whenReady().then(() => {
+  // IPC handler: open a native file picker and return the full absolute path(s)
+  ipcMain.handle('open-file-dialog', async (_event, opts: { multiple?: boolean } = {}) => {
+    const result = await dialog.showOpenDialog({
+      properties: opts.multiple ? ['openFile', 'multiSelections'] : ['openFile'],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return opts.multiple ? result.filePaths : result.filePaths[0];
+  });
+
+  // IPC handler: capture the entire primary screen as a PNG data URL
+  ipcMain.handle('capture-screen', async () => {
+    const primaryDisplay = screen.getPrimaryDisplay();
+    const { width, height } = primaryDisplay.size;
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width, height },
+    });
+    if (sources.length === 0) return null;
+    // Return the first screen's thumbnail as a PNG data URL
+    return sources[0].thumbnail.toDataURL();
+  });
+
   startPython();
   createWindow();
 });
