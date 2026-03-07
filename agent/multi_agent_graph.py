@@ -52,6 +52,8 @@ class AgentState(TypedDict):
     error: Optional[str]
     # Multi-file support
     related_files: List[Dict]  # [{path, source}]
+    # Agent discussion
+    discussion_log: List[str]  # conversation between agents when stuck
 
 
 # ── Node functions ───────────────────────────────────────────────────────────
@@ -182,28 +184,115 @@ def should_retry(state: AgentState) -> str:
     if state["attempt"] >= state["max_attempts"]:
         logger.warning("[ROUTER] Max attempts reached (%d), stopping", state["max_attempts"])
         return "done"
-    logger.info("[ROUTER] Critic failed, routing back to execute (attempt %d/%d)", state["attempt"], state["max_attempts"])
-    return "retry"
+    logger.info("[ROUTER] Critic failed, routing to agent discussion (attempt %d/%d)", state["attempt"], state["max_attempts"])
+    return "discuss"
+
+
+def discuss_node(state: AgentState) -> dict:
+    """Agent discussion: Planner and Critic debate the problem when stuck.
+
+    The Planner proposes a new approach, the Critic evaluates it, and they
+    iterate to reach consensus before the next execution attempt.
+    """
+    logger.info("[DISCUSS] Agents debating the problem (attempt %d)...", state["attempt"])
+
+    llm = OllamaLLM(model=LLM_MODEL, temperature=0.3)
+    lang = LANG_FENCE.get(state["ext"], state["ext"].lstrip('.'))
+    discussion = list(state.get("discussion_log") or [])
+
+    critic_feedback = state.get("critic_feedback", "No specific feedback")
+    current_code = state.get("current_source", "")[:2000]
+    instruction = state["instruction"]
+
+    # Round 1: Planner proposes a new approach based on critic feedback
+    planner_prompt = (
+        f"You are the PLANNER agent in a multi-agent coding system.\n\n"
+        f"TASK: {instruction}\n"
+        f"LANGUAGE: {lang}\n\n"
+        f"The CRITIC agent rejected the previous attempt with this feedback:\n"
+        f"{critic_feedback}\n\n"
+        f"Current code:\n```{lang}\n{current_code}\n```\n\n"
+        f"Propose a different approach to fix the issues. Be specific about:\n"
+        f"1. What went wrong in the previous attempt\n"
+        f"2. What new strategy you recommend\n"
+        f"3. Specific code changes needed\n\n"
+        f"Keep your response concise (3-5 sentences)."
+    )
+    planner_response = llm.invoke(planner_prompt).strip()
+    discussion.append(f"[PLANNER] {planner_response}")
+    logger.info("[DISCUSS] Planner: %s", planner_response[:120])
+
+    # Round 2: Critic evaluates the planner's proposal
+    critic_prompt = (
+        f"You are the CRITIC agent in a multi-agent coding system.\n\n"
+        f"TASK: {instruction}\n"
+        f"LANGUAGE: {lang}\n\n"
+        f"The PLANNER proposed this approach:\n{planner_response}\n\n"
+        f"Previous issues: {critic_feedback}\n\n"
+        f"Evaluate this proposal:\n"
+        f"1. Will it address the issues found?\n"
+        f"2. Are there any risks or edge cases the planner missed?\n"
+        f"3. Any modifications to the plan?\n\n"
+        f"If you agree with the approach, say 'AGREED' and elaborate briefly.\n"
+        f"If not, explain what needs to change. Keep concise (3-5 sentences)."
+    )
+    critic_response = llm.invoke(critic_prompt).strip()
+    discussion.append(f"[CRITIC] {critic_response}")
+    logger.info("[DISCUSS] Critic: %s", critic_response[:120])
+
+    # Round 3: If critic disagreed, planner adjusts
+    if "AGREED" not in critic_response.upper():
+        adjust_prompt = (
+            f"You are the PLANNER agent. The CRITIC raised concerns about your proposal.\n\n"
+            f"Your proposal: {planner_response}\n"
+            f"Critic's feedback: {critic_response}\n\n"
+            f"Adjust your approach to address the critic's concerns. "
+            f"Provide a final, concrete plan. Keep concise (3-5 sentences)."
+        )
+        final_plan = llm.invoke(adjust_prompt).strip()
+        discussion.append(f"[PLANNER revised] {final_plan}")
+        logger.info("[DISCUSS] Planner revised: %s", final_plan[:120])
+        consensus = final_plan
+    else:
+        consensus = planner_response
+
+    # Synthesize the discussion into updated critic_feedback for the executor
+    enhanced_feedback = (
+        f"{critic_feedback}\n\n"
+        f"AGENT DISCUSSION CONSENSUS:\n{consensus}"
+    )
+
+    return {
+        "discussion_log": discussion,
+        "critic_feedback": enhanced_feedback,
+    }
 
 
 # ── Build the graph ──────────────────────────────────────────────────────────
 
 def build_agent_graph() -> StateGraph:
-    """Build and compile the multi-agent LangGraph."""
+    """Build and compile the multi-agent LangGraph.
+
+    Graph: plan → execute → critique ──(PASS)──→ done
+                                │
+                                └──(FAIL)──→ discuss → execute (retry)
+    """
     graph = StateGraph(AgentState)
 
     graph.add_node("plan", plan_node)
     graph.add_node("execute", execute_node)
     graph.add_node("critique", critique_node)
+    graph.add_node("discuss", discuss_node)
 
     graph.set_entry_point("plan")
     graph.add_edge("plan", "execute")
     graph.add_edge("execute", "critique")
+    graph.add_edge("discuss", "execute")  # after discussion, retry execution
 
     graph.add_conditional_edges(
         "critique",
         should_retry,
-        {"retry": "execute", "done": END},
+        {"discuss": "discuss", "done": END},
     )
 
     return graph.compile()
@@ -211,7 +300,7 @@ def build_agent_graph() -> StateGraph:
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-# Cached compiled graph (safe to reuse)
+# Cached compiled graph — reset on import to pick up graph changes
 _compiled_graph = None
 
 
@@ -294,6 +383,104 @@ def _find_related_files(file_path: str, instruction: str) -> List[Dict]:
     return related
 
 
+def _edit_context_files(
+    instruction: str,
+    main_file_path: str,
+    main_new_source: str,
+    context_file_paths: List[str],
+    plan: Dict,
+    task_mode: str,
+    session_id: str,
+) -> List[Dict]:
+    """Run CodeAgent on each context file to produce edits informed by the main change."""
+    import difflib
+    from agent.code_agent import CodeAgent
+
+    edits = []
+    agent = CodeAgent(repo_path=".")
+
+    # Build context about what changed in the main file
+    original_main = _read_file_safe(main_file_path) or ""
+    main_diff_lines = list(difflib.unified_diff(
+        original_main.splitlines(keepends=True),
+        main_new_source.splitlines(keepends=True),
+        fromfile=main_file_path,
+        tofile=main_file_path,
+    ))
+    main_diff_text = "".join(main_diff_lines)[:3000]
+
+    plan_steps = "\n".join(f"- {s}" for s in plan.get("steps", [])) if plan else ""
+
+    for cf_path in context_file_paths:
+        abs_cf = os.path.abspath(cf_path)
+        if abs_cf == os.path.abspath(main_file_path):
+            continue
+        if not os.path.isfile(abs_cf):
+            continue
+
+        original_cf = _read_file_safe(abs_cf)
+        if original_cf is None:
+            continue
+
+        # Augment instruction with main-file change context
+        augmented = (
+            f"{instruction}\n\n"
+            f"MAIN FILE CHANGES ({main_file_path}):\n"
+            f"```diff\n{main_diff_text}\n```\n\n"
+        )
+        if plan_steps:
+            augmented += f"PLAN:\n{plan_steps}\n\n"
+        augmented += (
+            "Apply any necessary corresponding changes to this file "
+            "to keep it consistent with the main file changes above. "
+            "If no changes are needed, return the file unchanged."
+        )
+
+        try:
+            result = agent.edit_code(
+                path=abs_cf,
+                instruction=augmented,
+                dry_run=True,
+                use_rag=False,
+                task_mode=task_mode,
+                session_id=session_id,
+            )
+
+            if isinstance(result, dict):
+                new_src = result.get("new_source", original_cf)
+            else:
+                new_src = result if isinstance(result, str) else original_cf
+
+            # Restore original on disk (edit_code may have written)
+            try:
+                with open(abs_cf, "w", encoding="utf-8") as f:
+                    f.write(original_cf)
+            except Exception:
+                pass
+
+            if new_src != original_cf:
+                diff_lines = list(difflib.unified_diff(
+                    original_cf.splitlines(keepends=True),
+                    new_src.splitlines(keepends=True),
+                    fromfile=abs_cf,
+                    tofile=abs_cf,
+                ))
+                edits.append({
+                    "path": abs_cf,
+                    "diff": "".join(diff_lines),
+                    "new_source": new_src,
+                    "explanation": result.get("explanation", "") if isinstance(result, dict) else "",
+                })
+                logger.info("[CONTEXT_EDIT] Produced edit for %s", abs_cf)
+            else:
+                logger.info("[CONTEXT_EDIT] No changes needed for %s", abs_cf)
+
+        except Exception as e:
+            logger.warning("[CONTEXT_EDIT] Failed for %s: %s", abs_cf, e)
+
+    return edits
+
+
 def run_multi_agent(
     instruction: str,
     file_path: str,
@@ -365,6 +552,7 @@ def run_multi_agent(
         "verdict": "",
         "error": None,
         "related_files": related_files,
+        "discussion_log": [],
     }
 
     graph = get_agent_graph()
@@ -383,6 +571,21 @@ def run_multi_agent(
     new_source = final_state.get("current_source", source)
     has_changes = new_source != source
 
+    # ── Edit context files if the instruction targets them ──────────────
+    # When the user provides context_files, check if the planner/instruction
+    # implies changes to those files too. Run the code agent on each one.
+    context_file_edits = []
+    if extra_context_files and has_changes:
+        context_file_edits = _edit_context_files(
+            instruction=instruction,
+            main_file_path=file_path,
+            main_new_source=new_source,
+            context_file_paths=extra_context_files,
+            plan=final_state.get("plan", {}),
+            task_mode=task_mode,
+            session_id=session_id,
+        )
+
     return {
         "status": "pending_review" if has_changes else "ok",
         "diff": final_state.get("diff", ""),
@@ -396,4 +599,6 @@ def run_multi_agent(
         "new_source": new_source,
         "file_path": file_path,
         "critic_feedback": final_state.get("critic_feedback", ""),
+        "discussion_log": final_state.get("discussion_log", []),
+        "context_file_edits": context_file_edits,
     }

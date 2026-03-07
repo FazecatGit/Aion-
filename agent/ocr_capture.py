@@ -353,3 +353,100 @@ def extract_text_from_file(image_path: str, mode: str = "auto") -> dict:
     """Extract text from an image file on disk."""
     with open(image_path, "rb") as f:
         return extract_text_from_image(f.read(), mode)
+
+
+# ── Image-as-context for LLM reasoning ──────────────────────────────────────
+
+def analyze_image_with_context(
+    image_bytes: bytes,
+    user_question: str = "",
+    mode: str = "auto",
+) -> dict:
+    """Use the image as supporting visual evidence for the LLM.
+
+    Instead of just extracting text, this sends both the OCR-extracted text
+    AND the image description to the LLM so it can reason about the visual
+    content alongside the user's question.
+
+    Returns:
+        {
+            "analysis": str,       # LLM's response using the image as context
+            "ocr_text": str,       # raw OCR text for reference
+            "content_type": str,   # detected content type
+            "confidence": float,
+        }
+    """
+    import base64
+    from langchain_ollama import OllamaLLM
+    from brain.config import LLM_MODEL
+
+    # Step 1: Extract OCR text for supplementary context
+    ocr_result = extract_text_from_image(image_bytes, mode=mode)
+    ocr_text = ocr_result.get("text", "")
+    content_type = ocr_result.get("content_type", "unknown")
+    confidence = ocr_result.get("confidence", 0.0)
+
+    # Step 2: Try vision model (llava) to describe what's in the image
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    visual_description = ""
+    try:
+        import requests
+        resp = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llava",
+                "prompt": (
+                    "Describe this image in detail. If it contains code, transcribe it exactly. "
+                    "If it contains a diagram, describe the structure. If it contains a problem "
+                    "statement, reproduce the full text. Be precise and thorough."
+                ),
+                "images": [b64],
+                "stream": False,
+            },
+            timeout=60,
+        )
+        if resp.status_code == 200:
+            visual_description = resp.json().get("response", "")
+    except Exception as e:
+        logger.warning("[OCR] Vision model (llava) unavailable: %s", e)
+
+    # Step 3: Build a combined context and send to the LLM with the user's question
+    context_parts = []
+    if visual_description:
+        context_parts.append(f"[VISUAL DESCRIPTION OF IMAGE]\n{visual_description}")
+    if ocr_text:
+        context_parts.append(f"[TEXT EXTRACTED FROM IMAGE (OCR)]\n{ocr_text}")
+
+    image_context = "\n\n".join(context_parts) if context_parts else "(No readable content detected in the image)"
+
+    if user_question.strip():
+        prompt = (
+            f"The user has shared a screenshot/image as supporting evidence for their question.\n\n"
+            f"{image_context}\n\n"
+            f"USER'S QUESTION: {user_question}\n\n"
+            f"Using the image content as context, provide a thorough and helpful answer. "
+            f"Reference specific parts of the image content in your response."
+        )
+    else:
+        prompt = (
+            f"The user has shared a screenshot/image. Analyze it and explain what you see.\n\n"
+            f"{image_context}\n\n"
+            f"Provide a clear explanation of what this image shows. If it's code, explain "
+            f"what the code does and any issues you notice. If it's a diagram, describe the "
+            f"workflow. If it's a problem statement, summarize the requirements."
+        )
+
+    try:
+        llm = OllamaLLM(model=LLM_MODEL, temperature=0.2)
+        analysis = llm.invoke(prompt).strip()
+    except Exception as e:
+        logger.error("[OCR] LLM analysis failed: %s", e)
+        analysis = f"Could not analyze the image: {e}\n\nExtracted text:\n{ocr_text}"
+
+    return {
+        "analysis": analysis,
+        "ocr_text": ocr_text,
+        "content_type": content_type,
+        "confidence": confidence,
+        "image_context": image_context,
+    }

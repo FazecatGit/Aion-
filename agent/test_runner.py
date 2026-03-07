@@ -275,13 +275,155 @@ def run_tests(
         ]
 
 
-def build_test_failure_note(test_results: List[Dict], instruction: str, source: str = "", llm: Optional[OllamaLLM] = None, attempt: int = 0, failed_approaches: Optional[List[str]] = None) -> str:
+def _generate_debug_harness(
+    source: str,
+    ext: str,
+    failing_input: str,
+    expected_output: str,
+    llm: OllamaLLM,
+) -> str:
+    """Generate a test harness that prints intermediate variable values.
+
+    Instead of just printing the final return value, this harness instruments
+    the function so that key variables (loop counters, accumulators, conditions)
+    are printed at each iteration.  The runtime output lets the LLM see the
+    actual execution flow rather than having to guess.
+    """
+    lang = LANG_FENCE.get(ext, ext.lstrip("."))
+    prompt = (
+        f"Given this {lang} source code:\n"
+        f"```{lang}\n{source}\n```\n\n"
+        f"I need to debug why it returns the WRONG answer for input: {failing_input}\n"
+        f"Expected output: {expected_output}\n\n"
+        f"Write a complete, self-contained, runnable {lang} DEBUG program that:\n"
+        f"1. Contains a MODIFIED version of the function(s) above with print/fmt.Println/cout "
+        f"statements added INSIDE loops and at key decision points\n"
+        f"2. Prints the values of ALL important variables at each loop iteration "
+        f"(loop index, accumulators, counters, conditions being checked)\n"
+        f"3. Format each debug line as: STEP <iteration>: <var1>=<val1>, <var2>=<val2>, ...\n"
+        f"4. At the end, prints RESULT: <final_return_value>\n"
+        f"5. Has a main entry point that calls the function with input: {failing_input}\n\n"
+        f"Language-specific rules:\n"
+        f"- Go: use 'package main' and 'import \"fmt\"'. Use fmt.Printf for debug output.\n"
+        f"- Python: use print() for debug output.\n"
+        f"- C++: use std::cerr for debug output (so it doesn't mix with stdout), "
+        f"then std::cout for RESULT line.\n\n"
+        f"The goal is to see the ACTUAL runtime values at each step so we can find "
+        f"where the logic diverges from what's expected.\n\n"
+        f"Output ONLY the complete program — no explanation, no markdown fences."
+    )
+    harness = llm.invoke(prompt).strip()
+    if "```" in harness:
+        harness = strip_markdown(harness)
+    return harness
+
+
+def run_debug_trace(
+    source: str,
+    path: str,
+    failing_input: str,
+    expected_output: str,
+    llm: Optional[OllamaLLM] = None,
+) -> Optional[str]:
+    """Run a debug-instrumented version of the code and capture intermediate values.
+
+    Returns the debug output as a string, or None on failure.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if llm is None:
+        llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+
+    try:
+        harness = _generate_debug_harness(source, ext, failing_input, expected_output, llm)
+    except Exception as e:
+        logger.warning("[DEBUG_TRACE] Harness generation failed: %s", e)
+        return None
+
+    logger.debug("[DEBUG_TRACE] Generated debug harness:\n%s", harness[:1000])
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            if ext == ".go":
+                harness_path = os.path.join(tmpdir, "main.go")
+                cmd = ["go", "run", harness_path]
+            elif ext == ".py":
+                harness_path = os.path.join(tmpdir, "debug_harness.py")
+                cmd = [sys.executable, harness_path]
+            elif ext == ".cpp":
+                harness_path = os.path.join(tmpdir, "debug.cpp")
+                exe_path = os.path.join(tmpdir, "debug.exe" if os.name == "nt" else "debug")
+                compiler, _ = _find_cpp_compiler()
+                if not compiler:
+                    return None
+                compile_cmd = [compiler, "-std=c++17", "-O0", "-o", exe_path, harness_path]
+                cmd = None
+            elif ext == ".c":
+                harness_path = os.path.join(tmpdir, "debug.c")
+                exe_path = os.path.join(tmpdir, "debug.exe" if os.name == "nt" else "debug")
+                compiler, _ = _find_c_compiler()
+                if not compiler:
+                    return None
+                compile_cmd = [compiler, "-std=c11", "-O0", "-o", exe_path, harness_path]
+                cmd = None
+            else:
+                return None
+
+            with open(harness_path, "w", encoding="utf-8") as f:
+                f.write(harness)
+
+            if ext in (".cpp", ".c"):
+                compile_result = subprocess.run(
+                    compile_cmd, capture_output=True, text=True, timeout=30, cwd=tmpdir
+                )
+                if compile_result.returncode != 0:
+                    logger.warning("[DEBUG_TRACE] Compilation failed: %s", compile_result.stderr[:400])
+                    return None
+                cmd = [exe_path]
+
+            run_result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10, cwd=tmpdir
+            )
+            # Combine stdout and stderr (C++ debug may use cerr)
+            output = (run_result.stdout or "") + (run_result.stderr or "")
+            output = output.strip()
+            if output:
+                # Truncate very long traces to keep prompt reasonable
+                lines = output.split("\n")
+                if len(lines) > 60:
+                    output = "\n".join(lines[:30] + ["... (truncated) ..."] + lines[-10:])
+                logger.info("[DEBUG_TRACE] Captured %d lines of debug output", len(lines))
+                return output
+            return None
+
+    except subprocess.TimeoutExpired:
+        logger.warning("[DEBUG_TRACE] Execution timed out")
+        return None
+    except Exception as e:
+        logger.warning("[DEBUG_TRACE] Failed: %s", e)
+        return None
+
+
+def build_test_failure_note(
+    test_results: List[Dict],
+    instruction: str,
+    source: str = "",
+    llm: Optional[OllamaLLM] = None,
+    attempt: int = 0,
+    failed_approaches: Optional[List[str]] = None,
+    debug_trace: Optional[str] = None,
+    previous_diff: Optional[str] = None,
+) -> str:
     """
     Build a structured prompt note from failing test cases.
-    
-    Includes a self-reasoning step: the LLM reads the problem, traces through
-    the test case, and identifies the root cause before being asked to fix.
-    
+
+    Includes:
+      - Debug trace: actual runtime variable values from executing the code
+        (when available), so the LLM sees real execution data instead of guessing
+      - Self-reasoning: LLM reads problem + debug trace to identify root cause
+      - Previous attempt diff: what changed last time (so LLM doesn't repeat it)
+      - Graduated escalation: early attempts target specific bugs, later attempts
+        suggest broader rethinking
+
     On later attempts (attempt >= 2), the prompt explicitly requests a different
     algorithmic approach to break out of circular reasoning.
     """
@@ -303,8 +445,9 @@ def build_test_failure_note(test_results: List[Dict], instruction: str, source: 
             if attempt >= 2:
                 pivot_hint = (
                     "\nIMPORTANT: Previous fix attempts using the same logic have FAILED REPEATEDLY. "
-                    "The current approach is fundamentally flawed.\n"
-                    "You MUST identify a DIFFERENT algorithm or strategy — do NOT keep tweaking the same logic.\n"
+                    "The current approach may be fundamentally flawed.\n"
+                    "Consider whether a DIFFERENT algorithm or strategy is needed — "
+                    "do NOT keep making small tweaks if the core logic is wrong.\n"
                 )
                 if failed_approaches:
                     pivot_hint += "APPROACHES ALREADY TRIED AND FAILED:\n"
@@ -312,27 +455,55 @@ def build_test_failure_note(test_results: List[Dict], instruction: str, source: 
                         pivot_hint += f"  - {fa}\n"
                     pivot_hint += "Do NOT use any of the above approaches again.\n"
 
+            # Include debug trace data in the reasoning prompt
+            debug_section = ""
+            if debug_trace:
+                debug_section = (
+                    "\nACTUAL RUNTIME EXECUTION TRACE (from running the code):\n"
+                    "```\n"
+                    f"{debug_trace}\n"
+                    "```\n"
+                    "The above shows the REAL variable values at each step when the code runs.\n"
+                    "Use this trace to find EXACTLY where the logic produces the wrong value.\n\n"
+                )
+
+            prev_diff_section = ""
+            if previous_diff:
+                prev_diff_section = (
+                    "\nPREVIOUS FIX ATTEMPT (this change did NOT solve the problem):\n"
+                    f"```diff\n{previous_diff}\n```\n"
+                    "Do NOT repeat this same change. Try a different fix.\n\n"
+                )
+
             trace_prompt = (
-                f"You are debugging incorrect code. Read the problem and trace through the test.\n\n"
+                f"You are debugging incorrect code. Read the problem, study the execution trace, "
+                f"and identify the root cause.\n\n"
                 f"PROBLEM: {instruction}\n\n"
                 f"CODE:\n```\n{source}\n```\n\n"
                 f"FAILED TEST:\n{failure_lines}\n\n"
+                f"{debug_section}"
+                f"{prev_diff_section}"
                 f"{pivot_hint}"
                 "Step by step:\n"
-                "1. Read the problem statement — what does it actually require?\n"
-                "2. Trace through your code with the failing test input\n"
-                "3. At which specific line does the logic diverge from what the problem requires?\n"
-                "4. What is the exact root cause (wrong condition, wrong variable, wrong loop, etc.)?\n"
+                "1. What does the problem actually require? State it precisely.\n"
+                "2. Look at the execution trace — at which specific step do the variable values "
+                "diverge from what the correct algorithm would produce?\n"
+                "3. What SPECIFIC line or expression in the code causes this wrong value?\n"
+                "4. What is the exact fix needed (be precise: wrong operator, wrong index, "
+                "wrong condition, missing case, etc.)?\n"
             )
             if attempt >= 2:
                 trace_prompt += (
-                    "5. What COMPLETELY DIFFERENT algorithm or approach would solve this correctly?\n\n"
-                    "Output your analysis concisely — max 8 lines. Be precise about which line is wrong, "
-                    "why the current APPROACH is fundamentally flawed, and what different strategy to use."
+                    "5. If the same type of error keeps recurring, what DIFFERENT algorithmic "
+                    "approach would avoid this class of bugs entirely?\n\n"
+                    "Output your analysis concisely — max 10 lines. Be precise about which "
+                    "line is wrong, what the variable values should be vs what they are, "
+                    "and what specific change fixes it."
                 )
             else:
                 trace_prompt += (
-                    "\nOutput your analysis concisely — max 5 lines. Be precise about which line is wrong and why."
+                    "\nOutput your analysis concisely — max 8 lines. Reference the execution "
+                    "trace values to pinpoint the exact line and expression that's wrong."
                 )
             reasoning = llm.invoke(trace_prompt).strip()
             logger.info("[TEST_RUNNER] Self-reasoning result: %s", reasoning[:300])
@@ -346,22 +517,36 @@ def build_test_failure_note(test_results: List[Dict], instruction: str, source: 
         f"{failure_lines}\n"
     )
 
+    if debug_trace:
+        note += (
+            "RUNTIME EXECUTION TRACE (actual variable values when code runs):\n"
+            f"```\n{debug_trace}\n```\n\n"
+        )
+
+    if previous_diff:
+        note += (
+            "PREVIOUS FIX THAT DID NOT WORK (do NOT repeat this):\n"
+            f"```diff\n{previous_diff}\n```\n\n"
+        )
+
     if reasoning:
         note += (
-            "ROOT CAUSE ANALYSIS (trace-through):\n"
+            "ROOT CAUSE ANALYSIS (based on execution trace):\n"
             f"{reasoning}\n\n"
         )
 
     if attempt >= 2:
         note += (
-            "CRITICAL: Previous attempts to fix this with small tweaks have FAILED. "
-            "You MUST use a COMPLETELY DIFFERENT algorithm or approach. "
-            "Rewrite the function logic from scratch using a new strategy. "
+            "Previous fix attempts have not resolved the issue. "
+            "If the root cause analysis points to a specific bug, fix that precisely. "
+            "If the same kind of error keeps repeating, consider restructuring the "
+            "core logic of the function. "
             "Output a SEARCH/REPLACE block."
         )
     else:
         note += (
             "Fix the specific root cause identified above. "
+            "Use the execution trace values to verify your fix is correct. "
             "Do NOT restructure the entire function — target ONLY the incorrect logic. "
             "Output a SEARCH/REPLACE block."
         )

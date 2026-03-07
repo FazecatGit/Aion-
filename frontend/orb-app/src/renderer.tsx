@@ -20,7 +20,7 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [lastUserQuery, setLastUserQuery] = useState<string | null>(null);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
-  const [pendingAgentEdit, setPendingAgentEdit] = useState<{ instruction: string; output: string; filePath: string; newSource?: string } | null>(null);
+  const [pendingAgentEdit, setPendingAgentEdit] = useState<{ instruction: string; output: string; filePath: string; newSource?: string; contextEdits?: { path: string; diff: string; new_source: string; explanation?: string }[] } | null>(null);
   const computeSize = () => {
     const maxDim = Math.max(window.innerWidth, window.innerHeight);
     const raw = 2000 / maxDim;           // 2000 is arbitrary scale factor
@@ -63,12 +63,18 @@ function App() {
   const [ocrLoading, setOcrLoading] = useState(false);
   const [enlargedImage, setEnlargedImage] = useState<string | null>(null);
   const [showOcrMenu, setShowOcrMenu] = useState(false);
+  const [pendingImageBlob, setPendingImageBlob] = useState<Blob | null>(null);
+  const [pendingImageDataUrl, setPendingImageDataUrl] = useState<string | null>(null);
 
   // ── Tutor mode state ───────────────────────────────────────────────────────
+  type TutorLesson = {
+    title: string; explanation: string; rules: string[]; example_code: string;
+    example_explanation: string; key_terms: string[];
+  };
   type TutorProblem = {
     session_id: string; style: string; question: string; language: string;
     options?: string[]; test_cases?: { input: string; expected: string }[];
-    function_name?: string;
+    function_name?: string; code_snippet?: string; lesson?: TutorLesson;
   };
   type TutorFeedback = { correct: boolean; feedback: string; solved: boolean; attempts: number; score?: number; missing_points?: string[] };
   const [tutorTopic, setTutorTopic] = useState('arrays');
@@ -82,6 +88,7 @@ function App() {
   const [tutorAnswer, setTutorAnswer] = useState('');
   const [tutorCodeResults, setTutorCodeResults] = useState<{ input: string; expected: string; actual: string | null; passed: boolean }[] | null>(null);
   const [tutorLoading, setTutorLoading] = useState(false);
+  const [showLesson, setShowLesson] = useState(true);
 
   // ── Tools panel state ──────────────────────────────────────────────────────
   const [showToolsPanel, setShowToolsPanel] = useState(false);
@@ -297,17 +304,18 @@ function App() {
         reader.onload = () => resolve(reader.result as string);
         reader.readAsDataURL(file);
       });
+      // Store the image as pending context so user can ask questions about it
+      setPendingImageBlob(file);
+      setPendingImageDataUrl(imageData);
+      // Send to analyze endpoint (LLM reasons about the image, not just OCR text)
       const form = new FormData();
       form.append('image', file, file.name);
-      const res = await fetch('http://localhost:8000/ocr/extract', { method: 'POST', body: form });
+      const res = await fetch('http://localhost:8000/ocr/analyze', { method: 'POST', body: form });
       const data = await res.json();
       if (data.status === 'ok') {
-        const label = data.content_type === 'code'
-          ? '```\n' + data.text + '\n```'
-          : data.text;
         setMessages(prev => [...prev,
-          { role: 'user', text: `[Screenshot — ${data.content_type}]`, imageData },
-          { role: 'ai',   text: `[OCR RESULT — ${data.content_type}]\n${label}` },
+          { role: 'user', text: `[Screenshot uploaded — ask me anything about it]`, imageData },
+          { role: 'ai',   text: data.analysis || `[OCR RESULT]\n${data.ocr_text}` },
         ]);
       } else {
         setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${data.error || 'unknown'}` }]);
@@ -330,23 +338,23 @@ function App() {
       }
       const dataUrl = await electronAPI.captureScreen();
       if (!dataUrl) {
-        setMessages(prev => [...prev, { role: 'ai', text: 'Screen capture failed — no screen sources found.' }]);
+        setMessages(prev => [...prev, { role: 'ai', text: 'Screen capture cancelled.' }]);
         setOcrLoading(false);
         return;
       }
-      // Convert data URL to Blob without fetch (avoids "Failed to fetch" on large data URLs)
+      // Convert data URL to Blob and store as pending context
       const blob = dataUrlToBlob(dataUrl);
+      setPendingImageBlob(blob);
+      setPendingImageDataUrl(dataUrl);
+      // Send to analyze endpoint (LLM reasons about the image, not just OCR text)
       const form = new FormData();
       form.append('image', blob, 'screenshot.png');
-      const res = await fetch('http://localhost:8000/ocr/extract', { method: 'POST', body: form });
+      const res = await fetch('http://localhost:8000/ocr/analyze', { method: 'POST', body: form });
       const data = await res.json();
       if (data.status === 'ok') {
-        const label = data.content_type === 'code'
-          ? '```\n' + data.text + '\n```'
-          : data.text;
         setMessages(prev => [...prev,
-          { role: 'user', text: `[Screen Capture — ${data.content_type}]`, imageData: dataUrl },
-          { role: 'ai',   text: `[OCR RESULT — ${data.content_type}]\n${label}` },
+          { role: 'user', text: `[Screen Capture — select area captured]`, imageData: dataUrl },
+          { role: 'ai',   text: data.analysis || `[OCR RESULT]\n${data.ocr_text}` },
         ]);
       } else {
         setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${data.error || 'unknown'}` }]);
@@ -446,7 +454,34 @@ const handleSubmit = async (e: React.FormEvent) => {
 
   const userMsg = input.trim();
   setInput('');
-  setMessages(prev => [...prev, { role: 'user', text: userMsg }]);
+  setMessages(prev => [...prev, { role: 'user', text: userMsg, imageData: pendingImageDataUrl || undefined }]);
+
+  // If there's a pending image, send the question + image to the analyze endpoint
+  if (pendingImageBlob) {
+    const imageBlob = pendingImageBlob;
+    const imageDataUrl = pendingImageDataUrl;
+    setPendingImageBlob(null);
+    setPendingImageDataUrl(null);
+
+    setMode('querying');
+    try {
+      const form = new FormData();
+      form.append('image', imageBlob, 'screenshot.png');
+      form.append('question', userMsg);
+      const res = await fetch('http://localhost:8000/ocr/analyze', { method: 'POST', body: form });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        setMessages(prev => [...prev, { role: 'ai', text: data.analysis }]);
+      } else {
+        setMessages(prev => [...prev, { role: 'ai', text: `Analysis error: ${data.error || 'unknown'}` }]);
+      }
+    } catch (err: any) {
+      setMessages(prev => [...prev, { role: 'ai', text: `Error: ${err.message}` }]);
+    } finally {
+      setMode('idle');
+    }
+    return;
+  }
 
   // Auto-create persistent session on first message
   let sid = sessionId;
@@ -482,11 +517,16 @@ const handleSubmit = async (e: React.FormEvent) => {
       const data = await res.json();
 
       if (useMultiAgent && (data.status === 'ok' || data.status === 'pending_review')) {
-        // Multi-agent returns {diff, explanation, citations, plan, verdict, attempts, related_files, new_source, critic_feedback}
+        // Multi-agent returns {diff, explanation, citations, plan, verdict, attempts, related_files, new_source, critic_feedback, discussion_log}
         const planSteps = data.plan?.steps?.map((s: string, i: number) => `  ${i + 1}. ${s}`).join('\n') || '';
         const relatedNote = data.related_files?.length > 0 ? `\n📎 Related files read: ${data.related_files.join(', ')}` : '';
         const orchestrateMsgs: Message[] = [];
         if (planSteps) orchestrateMsgs.push({ role: 'ai', text: `[PLAN]\n${planSteps}` });
+        // Show agent discussion if agents debated the problem
+        if (data.discussion_log?.length > 0) {
+          const discussionText = data.discussion_log.join('\n\n');
+          orchestrateMsgs.push({ role: 'ai', text: `[AGENT DISCUSSION]\n${discussionText}` });
+        }
         if (data.diff) orchestrateMsgs.push({ role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.diff}`, isDiff: true });
         if (data.explanation) {
           const citationBlock = data.citations?.length > 0
@@ -502,7 +542,7 @@ const handleSubmit = async (e: React.FormEvent) => {
         orchestrateMsgs.push({ role: 'ai', text: verdictText });
         setMessages(prev => [...prev, ...orchestrateMsgs]);
         if (data.diff && data.file_path) {
-          setPendingAgentEdit({ instruction: userMsg, output: data.diff, filePath: data.file_path, newSource: data.new_source });
+          setPendingAgentEdit({ instruction: userMsg, output: data.diff, filePath: data.file_path, newSource: data.new_source, contextEdits: data.context_file_edits || [] });
           setSelectedFilePath(data.file_path);
         }
       } else if (data.status === 'pending_review') {
@@ -1318,11 +1358,63 @@ return (
               style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
               <option value="mcq">Multiple Choice</option><option value="free_text">Short Answer</option><option value="code">Coding</option>
             </select>
-            <button onClick={handleTutorGenerate} disabled={tutorLoading || !tutorTopic.trim()}
+            <button onClick={() => { handleTutorGenerate(); setShowLesson(true); }} disabled={tutorLoading || !tutorTopic.trim()}
               style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
               {tutorLoading ? '...' : 'Generate Problem'}
             </button>
           </div>
+
+          {/* Lesson display */}
+          {tutorProblem?.lesson && showLesson && (
+            <div style={{ marginBottom: '16px', padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(85,51,255,0.08)', border: '1px solid rgba(85,51,255,0.25)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div style={{ fontSize: '16px', fontWeight: 'bold', color: '#b388ff' }}>
+                  📖 {tutorProblem.lesson.title || `${tutorTopic} Lesson`}
+                </div>
+                <button onClick={() => setShowLesson(false)} style={{ background: 'none', border: '1px solid #5533ff44', borderRadius: '6px', color: '#888', cursor: 'pointer', padding: '4px 10px', fontSize: '11px' }}>
+                  Hide Lesson
+                </button>
+              </div>
+              <div style={{ fontSize: '13px', lineHeight: '1.7', color: '#ddd', whiteSpace: 'pre-wrap', marginBottom: '12px' }}>
+                {tutorProblem.lesson.explanation}
+              </div>
+              {tutorProblem.lesson.rules && tutorProblem.lesson.rules.length > 0 && (
+                <div style={{ marginBottom: '12px' }}>
+                  <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#00cc88', marginBottom: '6px' }}>Rules:</div>
+                  {tutorProblem.lesson.rules.map((rule, i) => (
+                    <div key={i} style={{ fontSize: '12px', color: '#ccc', padding: '4px 0 4px 12px', borderLeft: '2px solid #00cc8844' }}>
+                      {rule}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {tutorProblem.lesson.example_code && (
+                <div style={{ marginBottom: '10px' }}>
+                  <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#7df9ff', marginBottom: '6px' }}>Example:</div>
+                  <pre style={{ padding: '12px', borderRadius: '8px', backgroundColor: '#0a0a0a', color: '#0f0', fontFamily: 'monospace', fontSize: '12px', overflowX: 'auto', border: '1px solid #333', whiteSpace: 'pre-wrap' }}>
+                    {tutorProblem.lesson.example_code}
+                  </pre>
+                  {tutorProblem.lesson.example_explanation && (
+                    <div style={{ fontSize: '12px', color: '#aaa', marginTop: '6px', lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>
+                      {tutorProblem.lesson.example_explanation}
+                    </div>
+                  )}
+                </div>
+              )}
+              {tutorProblem.lesson.key_terms && tutorProblem.lesson.key_terms.length > 0 && (
+                <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                  {tutorProblem.lesson.key_terms.map((term, i) => (
+                    <span key={i} style={{ padding: '2px 8px', borderRadius: '4px', backgroundColor: 'rgba(0,204,136,0.15)', color: '#00cc88', fontSize: '11px' }}>{term}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {tutorProblem?.lesson && !showLesson && (
+            <button onClick={() => setShowLesson(true)} style={{ marginBottom: '12px', background: 'none', border: '1px solid #5533ff44', borderRadius: '6px', color: '#b388ff', cursor: 'pointer', padding: '4px 12px', fontSize: '11px' }}>
+              📖 Show Lesson
+            </button>
+          )}
 
           {/* Problem display */}
           {tutorProblem && (
@@ -1330,6 +1422,20 @@ return (
               <div style={{ padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(255,255,255,0.06)', border: '1px solid rgba(0,204,136,0.2)', marginBottom: '12px' }}>
                 <div style={{ fontSize: '14px', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>{tutorProblem.question}</div>
               </div>
+
+              {/* MCQ code snippet — shown above the options */}
+              {tutorProblem.style === 'mcq' && tutorProblem.code_snippet && (
+                <div style={{ marginBottom: '12px' }}>
+                  <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#7df9ff', marginBottom: '6px' }}>Code:</div>
+                  <pre style={{
+                    padding: '12px', borderRadius: '8px', backgroundColor: '#0a0a0a', color: '#0f0',
+                    fontFamily: 'monospace', fontSize: '12px', overflowX: 'auto', border: '1px solid #333',
+                    whiteSpace: 'pre-wrap', lineHeight: '1.5',
+                  }}>
+                    {tutorProblem.code_snippet}
+                  </pre>
+                </div>
+              )}
 
               {/* MCQ options */}
               {tutorProblem.style === 'mcq' && tutorProblem.options && (
@@ -1362,7 +1468,7 @@ return (
                 </div>
               )}
 
-              {/* Code editor */}
+              {/* Code editor with syntax support */}
               {tutorProblem.style === 'code' && (
                 <div style={{ marginBottom: '12px' }}>
                   {tutorProblem.test_cases && tutorProblem.test_cases.length > 0 && (
@@ -1375,9 +1481,69 @@ return (
                       ))}
                     </div>
                   )}
-                  <textarea value={tutorCode} onChange={e => setTutorCode(e.target.value)}
+                  <textarea value={tutorCode}
+                    onChange={e => setTutorCode(e.target.value)}
+                    onKeyDown={e => {
+                      const ta = e.target as HTMLTextAreaElement;
+                      // Tab key: insert 4 spaces (or 1 tab) at cursor
+                      if (e.key === 'Tab') {
+                        e.preventDefault();
+                        const start = ta.selectionStart;
+                        const end = ta.selectionEnd;
+                        const indent = '    ';
+                        const newVal = tutorCode.substring(0, start) + indent + tutorCode.substring(end);
+                        setTutorCode(newVal);
+                        // Restore cursor after React re-render
+                        requestAnimationFrame(() => { ta.selectionStart = ta.selectionEnd = start + indent.length; });
+                      }
+                      // Auto-close brackets
+                      const pairs: Record<string, string> = { '{': '}', '[': ']', '(': ')' };
+                      if (pairs[e.key]) {
+                        e.preventDefault();
+                        const start = ta.selectionStart;
+                        const end = ta.selectionEnd;
+                        const selected = tutorCode.substring(start, end);
+                        const newVal = tutorCode.substring(0, start) + e.key + selected + pairs[e.key] + tutorCode.substring(end);
+                        setTutorCode(newVal);
+                        requestAnimationFrame(() => { ta.selectionStart = ta.selectionEnd = start + 1; });
+                      }
+                      // Auto-close quotes
+                      if (e.key === '"' || e.key === "'") {
+                        const start = ta.selectionStart;
+                        const charBefore = start > 0 ? tutorCode[start - 1] : '';
+                        // Don't auto-close if it's an escape or already in a pair
+                        if (charBefore !== '\\') {
+                          e.preventDefault();
+                          const end = ta.selectionEnd;
+                          const selected = tutorCode.substring(start, end);
+                          const newVal = tutorCode.substring(0, start) + e.key + selected + e.key + tutorCode.substring(end);
+                          setTutorCode(newVal);
+                          requestAnimationFrame(() => { ta.selectionStart = ta.selectionEnd = start + 1; });
+                        }
+                      }
+                      // Enter: maintain indentation
+                      if (e.key === 'Enter') {
+                        const start = ta.selectionStart;
+                        const lineStart = tutorCode.lastIndexOf('\n', start - 1) + 1;
+                        const currentLine = tutorCode.substring(lineStart, start);
+                        const indentMatch = currentLine.match(/^(\s*)/);
+                        let indent = indentMatch ? indentMatch[1] : '';
+                        // Add extra indent after { or :
+                        const trimmed = currentLine.trimEnd();
+                        if (trimmed.endsWith('{') || trimmed.endsWith(':') || trimmed.endsWith('(')) {
+                          indent += '    ';
+                        }
+                        if (indent) {
+                          e.preventDefault();
+                          const newVal = tutorCode.substring(0, start) + '\n' + indent + tutorCode.substring(ta.selectionEnd);
+                          setTutorCode(newVal);
+                          requestAnimationFrame(() => { ta.selectionStart = ta.selectionEnd = start + 1 + indent.length; });
+                        }
+                      }
+                    }}
                     placeholder={`Write your ${tutorProblem.language} solution here...`} rows={12}
-                    style={{ width: '100%', padding: '12px', borderRadius: '10px', border: '1px solid #333', backgroundColor: '#0a0a0a', color: '#0f0', fontSize: '13px', fontFamily: 'monospace', resize: 'vertical', tabSize: 4, boxSizing: 'border-box' }} />
+                    spellCheck={false}
+                    style={{ width: '100%', padding: '12px', borderRadius: '10px', border: '1px solid #333', backgroundColor: '#0a0a0a', color: '#0f0', fontSize: '13px', fontFamily: "'Fira Code', 'JetBrains Mono', 'Cascadia Code', Consolas, monospace", resize: 'vertical', tabSize: 4, boxSizing: 'border-box', lineHeight: '1.5', letterSpacing: '0.02em' }} />
                   <button onClick={handleTutorRunCode}
                     disabled={tutorLoading || !tutorCode.trim()}
                     style={{ marginTop: '8px', padding: '8px 20px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px' }}>
@@ -1601,7 +1767,22 @@ return (
               </div>
             )}
             {pendingAgentEdit && i === messages.length - 1 && activeMode === 'agent' && (
-              <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
+              <div style={{ marginTop: 12 }}>
+                {/* Show context file diffs if any */}
+                {pendingAgentEdit.contextEdits && pendingAgentEdit.contextEdits.length > 0 && (
+                  <div style={{ marginBottom: 10 }}>
+                    <div style={{ fontSize: '12px', color: '#aaa', marginBottom: 4 }}>Context file changes:</div>
+                    {pendingAgentEdit.contextEdits.map((ce, idx) => (
+                      <details key={idx} style={{ marginBottom: 4 }}>
+                        <summary style={{ fontSize: '12px', color: '#7ec8e3', cursor: 'pointer' }}>
+                          {ce.path.split(/[/\\]/).pop()} — {ce.explanation || 'modified'}
+                        </summary>
+                        <pre style={{ fontSize: '11px', background: '#1a1a2e', padding: 6, borderRadius: 4, overflowX: 'auto', maxHeight: 200 }}>{ce.diff}</pre>
+                      </details>
+                    ))}
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: 8 }}>
                 <button
                   onClick={async () => {
                     if (!pendingAgentEdit) return;
@@ -1617,10 +1798,14 @@ return (
                           task_mode: agentTaskMode,
                           session_id: sessionId,
                           new_source: pendingAgentEdit.newSource || undefined,
+                          context_file_edits: pendingAgentEdit.contextEdits || undefined,
                         })
                       });
                       const result = await res.json();
-                      setMessages(prev => [...prev, { role: 'ai', text: result.message || 'Changes applied successfully!' }]);
+                      const ctxNote = result.applied_context_files?.length
+                        ? ` + ${result.applied_context_files.length} context file(s)`
+                        : '';
+                      setMessages(prev => [...prev, { role: 'ai', text: (result.message || 'Changes applied successfully!') + ctxNote }]);
                       setPendingAgentEdit(null);
                     } catch (e) {
                       setMessages(prev => [...prev, { role: 'ai', text: 'Error applying changes.' }]);
@@ -1678,6 +1863,7 @@ return (
                 >
                   🔄 Try with More Context
                 </button>
+                </div>
               </div>
             )}
             </div>
@@ -2134,11 +2320,24 @@ return (
           )}
         </div>
 
+        {/* Pending image indicator */}
+        {pendingImageBlob && (
+          <div style={{
+            padding: '4px 10px', borderRadius: '12px', backgroundColor: 'rgba(85,51,255,0.2)',
+            border: '1px solid rgba(85,51,255,0.4)', fontSize: '11px', color: '#b388ff',
+            display: 'flex', alignItems: 'center', gap: '6px', marginRight: '4px',
+          }}>
+            📷 Image attached
+            <button onClick={() => { setPendingImageBlob(null); setPendingImageDataUrl(null); }}
+              style={{ background: 'none', border: 'none', color: '#ff6666', cursor: 'pointer', fontSize: '11px', padding: '0 2px' }}>✕</button>
+          </div>
+        )}
+
         <input
           type="text"
           value={input}
           onChange={e => setInput(e.target.value)}
-          placeholder={activeMode === 'agent' ? 'Describe code changes...' : 'Ask Aion...'}
+          placeholder={pendingImageBlob ? 'Ask about the captured image...' : activeMode === 'agent' ? 'Describe code changes...' : 'Ask Aion...'}
           disabled={mode !== 'idle'}
           style={{
             flex: 1,

@@ -932,17 +932,18 @@ class CodeAgent:
             failed_block += "\n"
 
         prompt = (
-            f"The current implementation of the function is FUNDAMENTALLY WRONG. "
-            f"Small fixes have been attempted multiple times and all failed with the same errors.\n\n"
+            f"Multiple fix attempts have failed with the same test errors, suggesting the "
+            f"current approach has a structural issue that small edits cannot resolve.\n\n"
             f"PROBLEM: {instruction}\n\n"
-            f"CURRENT BROKEN CODE:\n```{lang_fence}\n{current_source}\n```\n\n"
+            f"CURRENT CODE:\n```{lang_fence}\n{current_source}\n```\n\n"
             f"FAILING TESTS:\n{failures_block}\n"
             f"{failed_block}"
-            f"You MUST solve this using a COMPLETELY DIFFERENT algorithm or approach.\n"
             f"Think step by step:\n"
             f"1. Re-read the problem statement carefully — what is actually being asked?\n"
-            f"2. Why does the current approach fundamentally fail?\n"
-            f"3. What alternative algorithm solves this correctly?\n\n"
+            f"2. What specific logical error in the current approach causes these test failures?\n"
+            f"3. What is the correct algorithm? (It may be a corrected version of the same approach, "
+            f"or a different approach entirely — choose whatever produces correct results.)\n"
+            f"4. Trace through your solution with the first failing test input to verify it works.\n\n"
             f"Write the COMPLETE rewritten function in {lang_name}.\n"
             f"Output ONLY the function code — no explanation, no markdown fences.\n"
         )
@@ -978,15 +979,18 @@ class CodeAgent:
         """Iteratively fix code until all test cases pass or max_retries is exhausted.
 
         Features:
-          - Self-reasoning: LLM traces through failing tests to identify root cause
+          - Debug tracing: runs failing tests with instrumented code to capture
+            actual runtime variable values, giving the LLM concrete execution data
+          - Self-reasoning: LLM reads execution trace to identify root cause
+          - Diff context: shows LLM what changed in previous attempt (so it doesn't repeat)
+          - Graduated escalation: targeted fix → debug-informed fix → strategy pivot
           - Degradation detector: stops if pass count drops between iterations
           - Temperature escalation: bumps temperature when stuck at same pass count
-          - Explanation + citations: returns what the agent did and which RAG docs it used
 
         Returns dict with final_source, test_results, all_passed, attempts, diff,
                explanation, citations.
         """
-        from .test_runner import run_tests, build_test_failure_note
+        from .test_runner import run_tests, build_test_failure_note, run_debug_trace
 
         llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
         original_source = read_file(path)
@@ -1002,6 +1006,7 @@ class CodeAgent:
         prev_error_signature = None  # Track repeated errors to break loops
         failed_approaches: list[str] = []  # Track failed strategies so pivots avoid them
         stagnant_count = 0  # How many consecutive attempts with no improvement
+        previous_source = None  # Track previous source for diff context
 
         for attempt in range(max_retries + 1):
             logger.info("[FIX_WITH_TESTS] Attempt %d — running %d test case(s)...", attempt, len(test_cases))
@@ -1017,7 +1022,7 @@ class CodeAgent:
                 logger.warning("[FIX_WITH_TESTS] Structural issues: %s",
                                [i['msg'] for i in structural_issues])
 
-            # --- Identical-error loop detector + strategy pivot ---
+            # --- Identical-error loop detector + graduated escalation ---
             error_sig = frozenset(
                 tuple((r['input'], str(r.get('actual', r.get('error', '')))))
                 for r in results if not r['passed']
@@ -1036,38 +1041,53 @@ class CodeAgent:
                 except Exception:
                     pass
 
-                if stagnant_count >= 2:
+                if stagnant_count >= 3:
                     logger.warning(
-                        "[FIX_WITH_TESTS] Identical errors repeating after pivot — stopping"
+                        "[FIX_WITH_TESTS] Identical errors repeating after debug + pivot — stopping"
                     )
                     explanation_parts.append(
-                        "Same errors repeating after strategy pivot. Stopped to avoid infinite loop."
+                        "Same errors repeating after debug trace and strategy pivot. Stopped to avoid infinite loop."
                     )
                     source = best_source
                     all_results = run_tests(source, path, test_cases, llm)
                     break
 
-                # --- Strategy Pivot: rewrite from scratch with a different approach ---
-                logger.info(
-                    "[FIX_WITH_TESTS] Identical errors — triggering strategy pivot (attempt %d)",
-                    attempt
-                )
-                explanation_parts.append(
-                    f"Attempt {attempt}: Same errors detected — pivoting to a different algorithm."
-                )
-                pivot_source = self._strategy_pivot(
-                    llm, instruction, source, ext, test_cases, results, failed_approaches
-                )
-                if pivot_source and pivot_source != source:
-                    source = pivot_source
-                    write_file(path, source)
-                    logger.info("[FIX_WITH_TESTS] Strategy pivot applied — re-running tests")
-                    continue
-                else:
-                    logger.warning("[FIX_WITH_TESTS] Strategy pivot produced no change — stopping")
-                    source = best_source
-                    all_results = run_tests(source, path, test_cases, llm)
-                    break
+                # --- Stagnant count 1: Debug-trace-informed fix (before pivot) ---
+                if stagnant_count == 1:
+                    logger.info(
+                        "[FIX_WITH_TESTS] Identical errors — running debug trace for deeper insight (attempt %d)",
+                        attempt
+                    )
+                    explanation_parts.append(
+                        f"Attempt {attempt}: Same errors detected — running debug trace to capture "
+                        "actual runtime values for more targeted fix."
+                    )
+                    # Don't pivot yet — let debug trace inform the next fix attempt
+                    # The debug trace will be picked up below in the failure_note builder
+
+                # --- Stagnant count 2: Strategy Pivot ---
+                elif stagnant_count >= 2:
+                    logger.info(
+                        "[FIX_WITH_TESTS] Identical errors persisting after debug fix — triggering strategy pivot (attempt %d)",
+                        attempt
+                    )
+                    explanation_parts.append(
+                        f"Attempt {attempt}: Debug-informed fix didn't resolve — pivoting to a different algorithm."
+                    )
+                    pivot_source = self._strategy_pivot(
+                        llm, instruction, source, ext, test_cases, results, failed_approaches
+                    )
+                    if pivot_source and pivot_source != source:
+                        previous_source = source
+                        source = pivot_source
+                        write_file(path, source)
+                        logger.info("[FIX_WITH_TESTS] Strategy pivot applied — re-running tests")
+                        continue
+                    else:
+                        logger.warning("[FIX_WITH_TESTS] Strategy pivot produced no change — stopping")
+                        source = best_source
+                        all_results = run_tests(source, path, test_cases, llm)
+                        break
             else:
                 stagnant_count = 0
             prev_error_signature = error_sig
@@ -1122,10 +1142,38 @@ class CodeAgent:
                     f"Escalated temperature to {current_temperature:.2f} for creative problem-solving."
                 )
 
-            # --- Self-reasoning: trace through test to find root cause ---
+            # --- Self-reasoning with debug trace: actual runtime values ---
+            # Run debug trace on the first failing test to get real execution data
+            debug_trace = None
+            if failures:
+                first_fail = failures[0]
+                if first_fail.get("actual") is not None:
+                    # Only run debug trace if we got an actual (wrong) output, not a crash
+                    try:
+                        logger.info("[FIX_WITH_TESTS] Running debug trace for failing test input=%s...",
+                                    first_fail["input"][:60])
+                        debug_trace = run_debug_trace(
+                            source, path, first_fail["input"], first_fail["expected"], llm
+                        )
+                        if debug_trace:
+                            logger.info("[FIX_WITH_TESTS] Debug trace captured (%d chars)", len(debug_trace))
+                            explanation_parts.append(
+                                f"Attempt {attempt}: Ran debug trace — captured runtime variable values."
+                            )
+                    except Exception as e:
+                        logger.debug("[FIX_WITH_TESTS] Debug trace failed: %s", e)
+
+            # Build diff from previous attempt to show LLM what already didn't work
+            previous_diff = None
+            if previous_source and previous_source != source:
+                previous_diff = show_diff(previous_source, source)
+                if previous_diff and len(previous_diff) > 2000:
+                    previous_diff = previous_diff[:2000] + "\n... (truncated)"
+
             failure_note = build_test_failure_note(
                 results, instruction, source=source, llm=llm,
-                attempt=attempt, failed_approaches=failed_approaches
+                attempt=attempt, failed_approaches=failed_approaches,
+                debug_trace=debug_trace, previous_diff=previous_diff,
             )
             augmented_instruction = f"{instruction}\n\n{failure_note}"
 
@@ -1135,6 +1183,9 @@ class CodeAgent:
                 augmented_instruction += f"\n\n{structural_note}"
 
             attempts += 1
+
+            # Track current source before edit for next iteration's diff
+            previous_source = source
 
             # Write current source so edit_code reads the right state
             write_file(path, source)

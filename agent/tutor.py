@@ -22,11 +22,142 @@ def _llm(temperature: float = 0.3) -> OllamaLLM:
 
 
 def _parse_json_from_llm(text: str) -> dict:
-    """Best-effort extraction of a JSON object from LLM output."""
+    """Best-effort extraction of a JSON object from LLM output.
+
+    Handles common LLM quirks: markdown fences, literal newlines inside string
+    values, triple-quoted strings, and multiple JSON blocks.
+    """
     # Strip markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```$", "", text.strip())
-    return json.loads(text)
+
+    # Try direct parse first (fast path)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 1: Find the outermost {...} and try parsing just that
+    brace_start = text.find('{')
+    brace_end = text.rfind('}')
+    if brace_start != -1 and brace_end > brace_start:
+        candidate = text[brace_start:brace_end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: Escape literal newlines inside JSON string values.
+        # Walk character by character to find unescaped newlines within "..."
+        fixed = _fix_json_newlines(candidate)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3: Replace triple-quoted strings (""" ... """) with single-quoted
+    triple_fixed = re.sub(
+        r'"""(.*?)"""',
+        lambda m: '"' + m.group(1).replace('\n', '\\n').replace('\r', '').replace('"', '\\"') + '"',
+        text,
+        flags=re.DOTALL,
+    )
+    try:
+        return json.loads(triple_fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 4: Aggressive line-by-line newline escaping inside the JSON block
+    if brace_start != -1 and brace_end > brace_start:
+        aggressive = text[brace_start:brace_end + 1]
+        aggressive = _fix_json_newlines(aggressive)
+        # Also handle trailing commas before } or ]
+        aggressive = re.sub(r',\s*([}\]])', r'\1', aggressive)
+        try:
+            return json.loads(aggressive)
+        except json.JSONDecodeError:
+            pass
+
+    raise json.JSONDecodeError("Could not parse JSON from LLM output", text, 0)
+
+
+def _fix_json_newlines(text: str) -> str:
+    """Escape literal newlines that appear inside JSON string values."""
+    result = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+            continue
+        if ch == '\\':
+            result.append(ch)
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            continue
+        if in_string and ch == '\n':
+            result.append('\\n')
+            continue
+        if in_string and ch == '\r':
+            continue
+        if in_string and ch == '\t':
+            result.append('\\t')
+            continue
+        result.append(ch)
+    return ''.join(result)
+
+
+# ── Lesson Generation ──────────────────────────────────────────────────────────
+
+def generate_lesson(
+    topic: str,
+    difficulty: str = "medium",
+    language: str = "python",
+) -> dict:
+    """Generate a lesson covering the fundamentals of a topic.
+
+    Returns dict with keys:
+      title, explanation, rules, example_code, example_explanation
+    """
+    llm = _llm(temperature=0.4)
+
+    prompt = f"""You are an expert programming tutor. Generate a concise lesson about "{topic}" in {language} at {difficulty} difficulty level.
+
+The lesson should cover the key fundamentals that a student needs to understand before solving problems on this topic.
+
+Return ONLY a JSON object with this EXACT structure:
+{{
+  "title": "Topic Title (e.g. Arrays in C++)",
+  "explanation": "A clear 2-4 paragraph explanation of the core concept, how it works, and why it matters. Be specific to {language}.",
+  "rules": [
+    "Rule 1: specific rule or behavior the student must understand",
+    "Rule 2: another important rule",
+    "Rule 3: edge case or common pitfall"
+  ],
+  "example_code": "A complete, runnable code example demonstrating the concept. Include comments.",
+  "example_explanation": "Line-by-line or section-by-section walkthrough of what the example code does",
+  "key_terms": ["term1", "term2", "term3"]
+}}
+
+Make the lesson practical and concrete. Use {language}-specific syntax and idioms. The example code should be realistic and demonstrate the concept clearly."""
+
+    raw = llm.invoke(prompt)
+    try:
+        lesson = _parse_json_from_llm(raw)
+    except (json.JSONDecodeError, ValueError):
+        lesson = {
+            "title": f"{topic} in {language}",
+            "explanation": raw.strip(),
+            "rules": [],
+            "example_code": "",
+            "example_explanation": "",
+            "key_terms": [],
+        }
+    return lesson
 
 
 # ── Problem Generation ─────────────────────────────────────────────────────────
@@ -37,26 +168,36 @@ def generate_problem(
     language: str = "python",
     style: str = "mcq",  # "mcq" | "free_text" | "code"
 ) -> dict:
-    """Generate a single practice problem.
+    """Generate a practice problem with an accompanying lesson.
 
     Returns dict with keys:
       session_id, style, question, options (if mcq), correct_answer,
-      test_cases (if code), hints[]
+      test_cases (if code), hints[], lesson, code_snippet (if mcq)
     """
+    # Step 1: Generate the lesson first
+    lesson = generate_lesson(topic, difficulty, language)
+
+    # Step 2: Generate the problem
     llm = _llm(temperature=0.5)
 
     if style == "mcq":
-        prompt = f"""Generate a multiple-choice question about {topic} ({difficulty} difficulty).
-The question should test understanding of {language} programming concepts.
+        prompt = f"""Generate a multiple-choice question about {topic} ({difficulty} difficulty) in {language}.
+
+IMPORTANT: The question MUST include a code snippet that the student needs to analyze.
+The code snippet should be actual {language} code that demonstrates a concept, bug, or behavior related to {topic}.
+The question should ask what happens when the code runs, what's wrong with it, or what output it produces.
 
 Return ONLY a JSON object with this EXACT structure:
 {{
-  "question": "The question text",
+  "code_snippet": "The actual {language} code snippet that the student must read and analyze. Multiple lines, properly formatted.",
+  "question": "Based on the code above, what happens when... / what is the output of... / which statement is correct about...",
   "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
   "correct_answer": "A",
-  "explanation": "Why the correct answer is correct",
-  "hints": ["First hint", "Second stronger hint"]
-}}"""
+  "explanation": "Detailed explanation of why the correct answer is correct, referencing specific lines of the code",
+  "hints": ["First hint about what to look for in the code", "Second stronger hint referencing a specific line"]
+}}
+
+The code_snippet MUST be non-trivial, compilable/runnable {language} code. Do NOT reference a code snippet without providing one."""
     elif style == "free_text":
         prompt = f"""Generate a short-answer conceptual question about {topic} ({difficulty} difficulty) for {language}.
 The student should explain a concept in their own words.
@@ -72,9 +213,16 @@ Return ONLY a JSON object with this EXACT structure:
         prompt = f"""Generate a coding problem about {topic} ({difficulty} difficulty) in {language}.
 The problem should require the student to write a function.
 
+Provide a clear problem description with:
+- What the function should do
+- The function signature
+- Rules and constraints
+- An example with input/output
+- Implementation hints
+
 Return ONLY a JSON object with this EXACT structure:
 {{
-  "question": "Problem description including function signature",
+  "question": "Detailed problem description including function signature, rules, example usage, and implementation hints. Use newlines for formatting.",
   "function_name": "the_function_name",
   "test_cases": [
     {{"input": "input_value_1", "expected": "expected_output_1"}},
@@ -104,6 +252,7 @@ Return ONLY a JSON object with this EXACT structure:
         "difficulty": difficulty,
         "language": language,
         "problem": problem,
+        "lesson": lesson,
         "hints_given": 0,
         "attempts": 0,
         "solved": False,
@@ -116,9 +265,11 @@ Return ONLY a JSON object with this EXACT structure:
         "style": style,
         "question": problem.get("question", ""),
         "language": language,
+        "lesson": lesson,
     }
     if style == "mcq":
         resp["options"] = problem.get("options", [])
+        resp["code_snippet"] = problem.get("code_snippet", "")
     if style == "code":
         resp["test_cases"] = problem.get("test_cases", [])
         resp["function_name"] = problem.get("function_name", "")
@@ -297,8 +448,10 @@ def get_tutor_state(session_id: str) -> Optional[dict]:
         "language": state["language"],
         "question": state["problem"].get("question", ""),
         "options": state["problem"].get("options"),
+        "code_snippet": state["problem"].get("code_snippet"),
         "test_cases": state["problem"].get("test_cases"),
         "function_name": state["problem"].get("function_name"),
+        "lesson": state.get("lesson"),
         "hints_given": state["hints_given"],
         "attempts": state["attempts"],
         "solved": state["solved"],

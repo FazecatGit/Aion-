@@ -1,6 +1,6 @@
 import asyncio
 import warnings
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -306,6 +306,7 @@ class AgentApplyRequest(BaseModel):
     task_mode: str = "auto"  # "fix", "solve", or "auto"
     session_id: Optional[str] = None
     new_source: Optional[str] = None  # pre-computed source to write directly
+    context_file_edits: Optional[list] = None  # [{path, new_source}] for multi-file
 
 
 @app.post("/agent/apply")
@@ -346,9 +347,28 @@ async def agent_apply(req: AgentApplyRequest):
                     subprocess.run(["gofmt", "-w", resolved_path], timeout=5, check=True)
                 except Exception:
                     pass
+
+            # Also apply context file edits if provided
+            applied_context = []
+            if req.context_file_edits:
+                for cf_edit in req.context_file_edits:
+                    cf_path = cf_edit.get("path", "")
+                    cf_source = cf_edit.get("new_source", "")
+                    if cf_path and cf_source and os.path.isfile(cf_path):
+                        with open(cf_path, "w", encoding="utf-8") as cf:
+                            cf.write(cf_source)
+                        cf_ext = os.path.splitext(cf_path)[1].lower()
+                        if cf_ext == ".go":
+                            try:
+                                subprocess.run(["gofmt", "-w", cf_path], timeout=5, check=True)
+                            except Exception:
+                                pass
+                        applied_context.append(cf_path)
+
             return {
                 "status": "success",
                 "message": f"Changes applied to {resolved_path}",
+                "applied_context_files": applied_context,
             }
 
         agent = CodeAgent(repo_path=".")
@@ -745,6 +765,26 @@ async def ocr_extract(
         from agent.ocr_capture import extract_text_from_image
         image_bytes = await image.read()
         result = extract_text_from_image(image_bytes, mode=mode)
+        return {"status": "ok", **result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/ocr/analyze")
+async def ocr_analyze(
+    image: UploadFile = File(...),
+    question: str = Form(""),
+    mode: str = Form("auto"),
+):
+    """Analyze a screenshot image using it as visual evidence for the LLM.
+
+    Instead of just extracting text, the image is used as supporting context
+    so the LLM can reason about what it shows alongside the user's question.
+    """
+    try:
+        from agent.ocr_capture import analyze_image_with_context
+        image_bytes = await image.read()
+        result = analyze_image_with_context(image_bytes, user_question=question, mode=mode)
         return {"status": "ok", **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
