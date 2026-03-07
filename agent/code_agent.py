@@ -899,6 +899,73 @@ class CodeAgent:
         logger.info("Wrote file %s", path)
         return new_source
 
+    def _strategy_pivot(
+        self,
+        llm,
+        instruction: str,
+        current_source: str,
+        ext: str,
+        test_cases: list,
+        test_results: list,
+        failed_approaches: list,
+    ) -> Optional[str]:
+        """Rewrite the function from scratch using a fundamentally different algorithm.
+
+        Called when the identical-error loop detector fires, meaning small tweaks
+        to the current approach cannot fix the problem. Instead of retrying the
+        same logic, this asks the LLM to pick a completely new strategy.
+        """
+        lang_fence = LANG_FENCE.get(ext, ext.lstrip('.') if ext else 'text')
+        lang_name = LANG_NAMES.get(ext, ext.lstrip('.').upper() if ext else 'code')
+
+        failures_block = ""
+        for r in test_results:
+            if not r["passed"]:
+                got = r["actual"] if r["actual"] is not None else f"ERROR: {r.get('error', 'unknown')}"
+                failures_block += f"  input={r['input']}  →  expected={r['expected']},  got={got}\n"
+
+        failed_block = ""
+        if failed_approaches:
+            failed_block = "APPROACHES ALREADY TRIED AND FAILED (do NOT reuse):\n"
+            for fa in failed_approaches:
+                failed_block += f"  - {fa}\n"
+            failed_block += "\n"
+
+        prompt = (
+            f"The current implementation of the function is FUNDAMENTALLY WRONG. "
+            f"Small fixes have been attempted multiple times and all failed with the same errors.\n\n"
+            f"PROBLEM: {instruction}\n\n"
+            f"CURRENT BROKEN CODE:\n```{lang_fence}\n{current_source}\n```\n\n"
+            f"FAILING TESTS:\n{failures_block}\n"
+            f"{failed_block}"
+            f"You MUST solve this using a COMPLETELY DIFFERENT algorithm or approach.\n"
+            f"Think step by step:\n"
+            f"1. Re-read the problem statement carefully — what is actually being asked?\n"
+            f"2. Why does the current approach fundamentally fail?\n"
+            f"3. What alternative algorithm solves this correctly?\n\n"
+            f"Write the COMPLETE rewritten function in {lang_name}.\n"
+            f"Output ONLY the function code — no explanation, no markdown fences.\n"
+        )
+
+        try:
+            # Use slightly higher temperature to encourage creative divergence
+            pivot_llm = OllamaLLM(model=LLM_MODEL, temperature=0.3)
+            rewritten = pivot_llm.invoke(prompt).strip()
+            rewritten = strip_markdown(rewritten) if "```" in rewritten else rewritten
+
+            if not rewritten.strip():
+                logger.warning("[STRATEGY_PIVOT] LLM returned empty output")
+                return None
+
+            # Apply via whole-function replace
+            _, func_start, func_end = extract_function(current_source, instruction)
+            new_source = whole_function_replace(current_source, rewritten, func_start, func_end)
+            logger.info("[STRATEGY_PIVOT] New approach applied")
+            return new_source
+        except Exception as e:
+            logger.error("[STRATEGY_PIVOT] Failed: %s", e)
+            return None
+
     def fix_with_tests(
         self,
         path: str,
@@ -933,6 +1000,8 @@ class CodeAgent:
         citations: list[str] = []
         current_temperature = 0.0
         prev_error_signature = None  # Track repeated errors to break loops
+        failed_approaches: list[str] = []  # Track failed strategies so pivots avoid them
+        stagnant_count = 0  # How many consecutive attempts with no improvement
 
         for attempt in range(max_retries + 1):
             logger.info("[FIX_WITH_TESTS] Attempt %d — running %d test case(s)...", attempt, len(test_cases))
@@ -948,21 +1017,59 @@ class CodeAgent:
                 logger.warning("[FIX_WITH_TESTS] Structural issues: %s",
                                [i['msg'] for i in structural_issues])
 
-            # --- Identical-error loop detector ---
+            # --- Identical-error loop detector + strategy pivot ---
             error_sig = frozenset(
                 tuple((r['input'], str(r.get('actual', r.get('error', '')))))
                 for r in results if not r['passed']
             ) | frozenset(i['msg'] for i in structural_issues)
             if error_sig and error_sig == prev_error_signature:
-                logger.warning(
-                    "[FIX_WITH_TESTS] Identical errors repeating — stopping to avoid infinite loop"
+                stagnant_count += 1
+                # Capture current approach description for the failed_approaches list
+                try:
+                    approach_desc = llm.invoke(
+                        f"Describe in ONE sentence the algorithm/strategy used in this code:\n"
+                        f"```\n{source[:2000]}\n```\n"
+                        f"Output ONLY one sentence — no extra text."
+                    ).strip()
+                    if approach_desc and approach_desc not in failed_approaches:
+                        failed_approaches.append(approach_desc)
+                except Exception:
+                    pass
+
+                if stagnant_count >= 2:
+                    logger.warning(
+                        "[FIX_WITH_TESTS] Identical errors repeating after pivot — stopping"
+                    )
+                    explanation_parts.append(
+                        "Same errors repeating after strategy pivot. Stopped to avoid infinite loop."
+                    )
+                    source = best_source
+                    all_results = run_tests(source, path, test_cases, llm)
+                    break
+
+                # --- Strategy Pivot: rewrite from scratch with a different approach ---
+                logger.info(
+                    "[FIX_WITH_TESTS] Identical errors — triggering strategy pivot (attempt %d)",
+                    attempt
                 )
                 explanation_parts.append(
-                    "Same errors repeating across attempts. Stopped to avoid infinite loop."
+                    f"Attempt {attempt}: Same errors detected — pivoting to a different algorithm."
                 )
-                source = best_source
-                all_results = run_tests(source, path, test_cases, llm)
-                break
+                pivot_source = self._strategy_pivot(
+                    llm, instruction, source, ext, test_cases, results, failed_approaches
+                )
+                if pivot_source and pivot_source != source:
+                    source = pivot_source
+                    write_file(path, source)
+                    logger.info("[FIX_WITH_TESTS] Strategy pivot applied — re-running tests")
+                    continue
+                else:
+                    logger.warning("[FIX_WITH_TESTS] Strategy pivot produced no change — stopping")
+                    source = best_source
+                    all_results = run_tests(source, path, test_cases, llm)
+                    break
+            else:
+                stagnant_count = 0
             prev_error_signature = error_sig
 
             if not failures:
@@ -1016,7 +1123,10 @@ class CodeAgent:
                 )
 
             # --- Self-reasoning: trace through test to find root cause ---
-            failure_note = build_test_failure_note(results, instruction, source=source, llm=llm)
+            failure_note = build_test_failure_note(
+                results, instruction, source=source, llm=llm,
+                attempt=attempt, failed_approaches=failed_approaches
+            )
             augmented_instruction = f"{instruction}\n\n{failure_note}"
 
             # Include structural issues in the instruction so LLM can fix them

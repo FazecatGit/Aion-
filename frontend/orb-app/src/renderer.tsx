@@ -5,7 +5,7 @@ import './index.css';
 
 type Message    = { role: 'user' | 'ai'; text: string; isDiff?: boolean; imageData?: string };
 type OrbMode    = 'idle' | 'querying' | 'agent-processing';
-type ActiveMode = 'query' | 'agent';
+type ActiveMode = 'query' | 'agent' | 'tutor';
 type TestCase   = { id: number; input: string; expected: string };
 type TestResult = { input: string; expected: string; actual: string | null; passed: boolean; error: string | null };
 type ChatSession = { session_id: string; title: string; created_at?: string; turn_count?: number };
@@ -64,8 +64,43 @@ function App() {
   const [enlargedImage, setEnlargedImage] = useState<string | null>(null);
   const [showOcrMenu, setShowOcrMenu] = useState(false);
 
+  // ── Tutor mode state ───────────────────────────────────────────────────────
+  type TutorProblem = {
+    session_id: string; style: string; question: string; language: string;
+    options?: string[]; test_cases?: { input: string; expected: string }[];
+    function_name?: string;
+  };
+  type TutorFeedback = { correct: boolean; feedback: string; solved: boolean; attempts: number; score?: number; missing_points?: string[] };
+  const [tutorTopic, setTutorTopic] = useState('arrays');
+  const [tutorDifficulty, setTutorDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium');
+  const [tutorLanguage, setTutorLanguage] = useState('python');
+  const [tutorStyle, setTutorStyle] = useState<'mcq' | 'free_text' | 'code'>('mcq');
+  const [tutorProblem, setTutorProblem] = useState<TutorProblem | null>(null);
+  const [tutorFeedback, setTutorFeedback] = useState<TutorFeedback | null>(null);
+  const [tutorHint, setTutorHint] = useState<string | null>(null);
+  const [tutorCode, setTutorCode] = useState('');
+  const [tutorAnswer, setTutorAnswer] = useState('');
+  const [tutorCodeResults, setTutorCodeResults] = useState<{ input: string; expected: string; actual: string | null; passed: boolean }[] | null>(null);
+  const [tutorLoading, setTutorLoading] = useState(false);
+
+  // ── Tools panel state ──────────────────────────────────────────────────────
+  const [showToolsPanel, setShowToolsPanel] = useState(false);
+  const [toolsOutput, setToolsOutput] = useState<string | null>(null);
+  const [toolsLoading, setToolsLoading] = useState(false);
+
   // Type declaration for electronAPI exposed from preload
-  const electronAPI = (window as any).electronAPI as { captureScreen: () => Promise<string | null>; openFileDialog: (opts?: { multiple?: boolean }) => Promise<string | string[] | null> } | undefined;
+  const electronAPI = (window as any).electronAPI as { captureScreen: () => Promise<string | null>; sendCropResult: (rect: any) => void; openFileDialog: (opts?: { multiple?: boolean }) => Promise<string | string[] | null> } | undefined;
+
+
+  // Helper: convert data URL to Blob without fetch (avoids "Failed to fetch" on large data URLs)
+  const dataUrlToBlob = (dataUrl: string): Blob => {
+    const [header, b64] = dataUrl.split(',');
+    const mime = header.match(/:(.*?);/)?.[1] || 'image/png';
+    const bytes = atob(b64);
+    const arr = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+    return new Blob([arr], { type: mime });
+  };
 
 
   // update baseSize whenever window resizes so orb scales with window size
@@ -299,9 +334,8 @@ function App() {
         setOcrLoading(false);
         return;
       }
-      // Convert data URL to Blob
-      const resp = await fetch(dataUrl);
-      const blob = await resp.blob();
+      // Convert data URL to Blob without fetch (avoids "Failed to fetch" on large data URLs)
+      const blob = dataUrlToBlob(dataUrl);
       const form = new FormData();
       form.append('image', blob, 'screenshot.png');
       const res = await fetch('http://localhost:8000/ocr/extract', { method: 'POST', body: form });
@@ -322,6 +356,88 @@ function App() {
     } finally {
       setOcrLoading(false);
     }
+  };
+
+  // ── Tutor handlers ─────────────────────────────────────────────────────────
+  const handleTutorGenerate = async () => {
+    setTutorLoading(true);
+    setTutorProblem(null); setTutorFeedback(null); setTutorHint(null);
+    setTutorCode(''); setTutorAnswer(''); setTutorCodeResults(null);
+    try {
+      const res = await fetch('http://localhost:8000/tutor/start', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ topic: tutorTopic, difficulty: tutorDifficulty, language: tutorLanguage, style: tutorStyle }),
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        setTutorProblem(data as TutorProblem);
+      } else {
+        setMessages(prev => [...prev, { role: 'ai', text: `[TUTOR] Error: ${data.error || 'unknown'}` }]);
+      }
+    } catch { setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Failed to connect to server.' }]); }
+    setTutorLoading(false);
+  };
+
+  const handleTutorCheckAnswer = async (answer: string) => {
+    if (!tutorProblem) return;
+    setTutorLoading(true);
+    try {
+      const res = await fetch('http://localhost:8000/tutor/check', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: tutorProblem.session_id, answer }),
+      });
+      const data = await res.json();
+      if (data.status === 'ok') setTutorFeedback(data as TutorFeedback);
+    } catch { /* ignore */ }
+    setTutorLoading(false);
+  };
+
+  const handleTutorRunCode = async () => {
+    if (!tutorProblem) return;
+    setTutorLoading(true);
+    try {
+      const res = await fetch('http://localhost:8000/tutor/run', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: tutorProblem.session_id, code: tutorCode }),
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        setTutorCodeResults(data.results || []);
+        if (data.solved) setTutorFeedback({ correct: true, feedback: 'All tests passed! Well done!', solved: true, attempts: data.attempts });
+      }
+    } catch { /* ignore */ }
+    setTutorLoading(false);
+  };
+
+  const handleTutorHint = async () => {
+    if (!tutorProblem) return;
+    setTutorLoading(true);
+    try {
+      const res = await fetch('http://localhost:8000/tutor/hint', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: tutorProblem.session_id }),
+      });
+      const data = await res.json();
+      if (data.status === 'ok') setTutorHint(`Hint ${data.hint_number}/${data.total_hints}: ${data.hint}`);
+    } catch { /* ignore */ }
+    setTutorLoading(false);
+  };
+
+  // ── Tools panel helper ─────────────────────────────────────────────────────
+  const runTool = async (endpoint: string, body: Record<string, any> = {}) => {
+    setToolsLoading(true);
+    setToolsOutput(null);
+    try {
+      const res = await fetch(`http://localhost:8000${endpoint}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      setToolsOutput(JSON.stringify(data, null, 2));
+    } catch (err: any) {
+      setToolsOutput(`Error: ${err.message}`);
+    }
+    setToolsLoading(false);
   };
 
 const handleSubmit = async (e: React.FormEvent) => {
@@ -772,6 +888,120 @@ return (
         )}
       </div>
 
+      {/* ── Tools Panel (slide-out) ────────────────────────────────────── */}
+      <button
+        onClick={() => setShowToolsPanel(p => !p)}
+        style={{
+          position: 'fixed', top: '20px', right: activeMode === 'agent' ? '320px' : '20px', zIndex: 51,
+          padding: '6px 12px', borderRadius: '6px', border: '1px solid #555',
+          backgroundColor: showToolsPanel ? 'rgba(85,51,255,0.3)' : '#222', color: '#fff',
+          cursor: 'pointer', fontSize: '12px', transition: 'right 0.25s ease',
+        }}
+      >
+        🔧 Tools
+      </button>
+
+      {showToolsPanel && (
+        <div style={{
+          position: 'fixed', top: '60px', right: '20px', zIndex: 50, width: '340px', maxHeight: '80vh',
+          overflowY: 'auto', padding: '16px', borderRadius: '14px',
+          backgroundColor: 'rgba(10,10,20,0.95)', border: '1px solid rgba(85,51,255,0.3)',
+          backdropFilter: 'blur(20px)', boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
+        }}>
+          <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#5533ff', marginBottom: '12px', letterSpacing: '0.08em' }}>DEV TOOLS</div>
+
+          {/* Lint */}
+          <div style={{ marginBottom: '10px' }}>
+            <button onClick={() => { if (selectedFilePath) runTool('/tools/lint', { file_path: selectedFilePath }); }}
+              disabled={toolsLoading || !selectedFilePath}
+              style={{ width: '100%', padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', cursor: 'pointer', fontSize: '12px', textAlign: 'left' }}>
+              🔍 Lint Current File
+            </button>
+          </div>
+
+          {/* Lint + Fix */}
+          <div style={{ marginBottom: '10px' }}>
+            <button onClick={() => { if (selectedFilePath) runTool('/tools/lint', { file_path: selectedFilePath, fix: true }); }}
+              disabled={toolsLoading || !selectedFilePath}
+              style={{ width: '100%', padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', cursor: 'pointer', fontSize: '12px', textAlign: 'left' }}>
+              🔧 Lint + Auto-fix
+            </button>
+          </div>
+
+          {/* Type Check */}
+          <div style={{ marginBottom: '10px' }}>
+            <button onClick={() => { if (selectedFilePath) runTool('/tools/type_check', { file_path: selectedFilePath }); }}
+              disabled={toolsLoading || !selectedFilePath}
+              style={{ width: '100%', padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', cursor: 'pointer', fontSize: '12px', textAlign: 'left' }}>
+              🏷 Type Check
+            </button>
+          </div>
+
+          {/* Pytest */}
+          <div style={{ marginBottom: '10px' }}>
+            <button onClick={() => runTool('/tools/pytest', { target: '.', with_coverage: false })}
+              disabled={toolsLoading}
+              style={{ width: '100%', padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', cursor: 'pointer', fontSize: '12px', textAlign: 'left' }}>
+              🧪 Run Pytest
+            </button>
+          </div>
+
+          {/* Git Diff */}
+          <div style={{ marginBottom: '10px' }}>
+            <button onClick={() => runTool('/tools/git_diff', { ref: 'HEAD' })}
+              disabled={toolsLoading}
+              style={{ width: '100%', padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', cursor: 'pointer', fontSize: '12px', textAlign: 'left' }}>
+              📝 Git Diff (unstaged)
+            </button>
+          </div>
+
+          {/* Git Diff Staged */}
+          <div style={{ marginBottom: '10px' }}>
+            <button onClick={() => runTool('/tools/git_diff_staged', {})}
+              disabled={toolsLoading}
+              style={{ width: '100%', padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', cursor: 'pointer', fontSize: '12px', textAlign: 'left' }}>
+              📋 Git Diff (staged)
+            </button>
+          </div>
+
+          {/* Git Log */}
+          <div style={{ marginBottom: '10px' }}>
+            <button onClick={() => runTool('/tools/git_log', { count: 15 })}
+              disabled={toolsLoading}
+              style={{ width: '100%', padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', cursor: 'pointer', fontSize: '12px', textAlign: 'left' }}>
+              📜 Git Log (recent)
+            </button>
+          </div>
+
+          {/* Pre-commit */}
+          <div style={{ marginBottom: '10px' }}>
+            <button onClick={() => runTool('/tools/pre_commit', {})}
+              disabled={toolsLoading}
+              style={{ width: '100%', padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', cursor: 'pointer', fontSize: '12px', textAlign: 'left' }}>
+              ✅ Pre-commit Check
+            </button>
+          </div>
+
+          {!selectedFilePath && (
+            <div style={{ fontSize: '11px', color: '#666', marginBottom: '8px' }}>
+              Select a file in agent mode to enable file-specific tools.
+            </div>
+          )}
+
+          {/* Output */}
+          {toolsLoading && <div style={{ color: '#5533ff', fontSize: '12px', marginTop: '8px' }}>Running...</div>}
+          {toolsOutput && (
+            <pre style={{
+              marginTop: '10px', padding: '10px', borderRadius: '8px', backgroundColor: '#0a0a0a',
+              border: '1px solid #333', color: '#ccc', fontSize: '11px', fontFamily: 'monospace',
+              whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: '300px', overflowY: 'auto',
+            }}>
+              {toolsOutput}
+            </pre>
+          )}
+        </div>
+      )}
+
       {/* ── Top Right Toolbar: File + Context (agent mode only) ────────── */}
       {activeMode === 'agent' && (
         <div style={{ position: 'fixed', top: '20px', right: '20px', zIndex: 50, display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'flex-end' }}>
@@ -1061,7 +1291,170 @@ return (
         </div>
       </div>
 
+      {/* ── Tutor Mode Panel ─────────────────────────────────────────────── */}
+      {activeMode === 'tutor' && (
+        <div style={{
+          position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+          zIndex: 35, width: '85%', maxWidth: '1000px', maxHeight: '80vh', overflowY: 'auto',
+          padding: '24px', borderRadius: '20px',
+          backgroundColor: 'rgba(0, 20, 15, 0.92)', backdropFilter: 'blur(25px)',
+          border: '1px solid rgba(0,204,136,0.3)', boxShadow: '0 12px 40px rgba(0,0,0,0.6)',
+        }}>
+          {/* Setup bar */}
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '16px', alignItems: 'center' }}>
+            <input value={tutorTopic} onChange={e => setTutorTopic(e.target.value)} placeholder="Topic (e.g. arrays, recursion)"
+              style={{ padding: '8px 12px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', flex: '1', minWidth: '120px' }} />
+            <select value={tutorDifficulty} onChange={e => setTutorDifficulty(e.target.value as any)}
+              style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
+              <option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option>
+            </select>
+            <select value={tutorLanguage} onChange={e => setTutorLanguage(e.target.value)}
+              style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
+              {['python', 'go', 'cpp', 'c', 'javascript', 'typescript', 'java', 'rust'].map(l =>
+                <option key={l} value={l}>{l}</option>
+              )}
+            </select>
+            <select value={tutorStyle} onChange={e => setTutorStyle(e.target.value as any)}
+              style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
+              <option value="mcq">Multiple Choice</option><option value="free_text">Short Answer</option><option value="code">Coding</option>
+            </select>
+            <button onClick={handleTutorGenerate} disabled={tutorLoading || !tutorTopic.trim()}
+              style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
+              {tutorLoading ? '...' : 'Generate Problem'}
+            </button>
+          </div>
+
+          {/* Problem display */}
+          {tutorProblem && (
+            <div style={{ marginBottom: '16px' }}>
+              <div style={{ padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(255,255,255,0.06)', border: '1px solid rgba(0,204,136,0.2)', marginBottom: '12px' }}>
+                <div style={{ fontSize: '14px', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>{tutorProblem.question}</div>
+              </div>
+
+              {/* MCQ options */}
+              {tutorProblem.style === 'mcq' && tutorProblem.options && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '12px' }}>
+                  {tutorProblem.options.map((opt, i) => (
+                    <button key={i} onClick={() => handleTutorCheckAnswer(opt.charAt(0))}
+                      disabled={tutorLoading || (tutorFeedback?.solved ?? false)}
+                      style={{
+                        padding: '10px 16px', borderRadius: '10px', border: '1px solid rgba(0,204,136,0.3)',
+                        backgroundColor: tutorFeedback?.solved && opt.charAt(0) === tutorFeedback?.feedback?.charAt(0) ? 'rgba(0,204,136,0.2)' : 'rgba(255,255,255,0.04)',
+                        color: '#fff', cursor: 'pointer', fontSize: '13px', textAlign: 'left', transition: 'background 0.2s',
+                      }}>
+                      {opt}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Free text input */}
+              {tutorProblem.style === 'free_text' && (
+                <div style={{ marginBottom: '12px' }}>
+                  <textarea value={tutorAnswer} onChange={e => setTutorAnswer(e.target.value)}
+                    placeholder="Type your answer here..." rows={4}
+                    style={{ width: '100%', padding: '12px', borderRadius: '10px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', resize: 'vertical', boxSizing: 'border-box' }} />
+                  <button onClick={() => handleTutorCheckAnswer(tutorAnswer)}
+                    disabled={tutorLoading || !tutorAnswer.trim() || (tutorFeedback?.solved ?? false)}
+                    style={{ marginTop: '8px', padding: '8px 20px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px' }}>
+                    Submit Answer
+                  </button>
+                </div>
+              )}
+
+              {/* Code editor */}
+              {tutorProblem.style === 'code' && (
+                <div style={{ marginBottom: '12px' }}>
+                  {tutorProblem.test_cases && tutorProblem.test_cases.length > 0 && (
+                    <div style={{ marginBottom: '10px', fontSize: '12px', color: '#aaa' }}>
+                      <strong style={{ color: '#00cc88' }}>Test Cases:</strong>
+                      {tutorProblem.test_cases.map((tc, i) => (
+                        <div key={i} style={{ padding: '4px 0', borderBottom: '1px solid #222' }}>
+                          Input: <code style={{ color: '#7df9ff' }}>{tc.input}</code> → Expected: <code style={{ color: '#7df9ff' }}>{tc.expected}</code>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <textarea value={tutorCode} onChange={e => setTutorCode(e.target.value)}
+                    placeholder={`Write your ${tutorProblem.language} solution here...`} rows={12}
+                    style={{ width: '100%', padding: '12px', borderRadius: '10px', border: '1px solid #333', backgroundColor: '#0a0a0a', color: '#0f0', fontSize: '13px', fontFamily: 'monospace', resize: 'vertical', tabSize: 4, boxSizing: 'border-box' }} />
+                  <button onClick={handleTutorRunCode}
+                    disabled={tutorLoading || !tutorCode.trim()}
+                    style={{ marginTop: '8px', padding: '8px 20px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px' }}>
+                    ▶ Run Code
+                  </button>
+                  {/* Code test results */}
+                  {tutorCodeResults && (
+                    <div style={{ marginTop: '10px' }}>
+                      {tutorCodeResults.map((r, i) => (
+                        <div key={i} style={{ padding: '6px 10px', marginBottom: '4px', borderRadius: '6px', fontSize: '12px', fontFamily: 'monospace', backgroundColor: r.passed ? 'rgba(0,204,136,0.15)' : 'rgba(255,50,50,0.15)', border: `1px solid ${r.passed ? '#00cc8844' : '#ff333344'}` }}>
+                          {r.passed ? '✓' : '✗'} Input: {r.input} | Expected: {r.expected} | Got: {r.actual ?? 'error'}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Feedback */}
+              {tutorFeedback && (
+                <div style={{
+                  padding: '12px 16px', borderRadius: '10px', marginBottom: '12px',
+                  backgroundColor: tutorFeedback.correct ? 'rgba(0,204,136,0.15)' : 'rgba(255,170,50,0.15)',
+                  border: `1px solid ${tutorFeedback.correct ? '#00cc8844' : '#ffaa3344'}`,
+                }}>
+                  <div style={{ fontSize: '14px', fontWeight: 'bold', marginBottom: '6px', color: tutorFeedback.correct ? '#00cc88' : '#ffaa33' }}>
+                    {tutorFeedback.correct ? '✓ Correct!' : '✗ Not quite right'}
+                  </div>
+                  <div style={{ fontSize: '13px', lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>{tutorFeedback.feedback}</div>
+                  {tutorFeedback.missing_points && tutorFeedback.missing_points.length > 0 && (
+                    <div style={{ marginTop: '8px', fontSize: '12px', color: '#ffaa33' }}>
+                      Missing: {tutorFeedback.missing_points.join(', ')}
+                    </div>
+                  )}
+                  <div style={{ marginTop: '6px', fontSize: '11px', color: '#888' }}>Attempts: {tutorFeedback.attempts}</div>
+                </div>
+              )}
+
+              {/* Hint */}
+              {tutorHint && (
+                <div style={{ padding: '10px 14px', borderRadius: '8px', backgroundColor: 'rgba(85,51,255,0.15)', border: '1px solid rgba(85,51,255,0.3)', marginBottom: '12px', fontSize: '13px' }}>
+                  💡 {tutorHint}
+                </div>
+              )}
+
+              {/* Hint / Next buttons */}
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button onClick={handleTutorHint} disabled={tutorLoading || (tutorFeedback?.solved ?? false)}
+                  style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#5533ff', cursor: 'pointer', fontSize: '12px' }}>
+                  💡 Hint
+                </button>
+                {tutorFeedback?.solved && (
+                  <button onClick={handleTutorGenerate}
+                    style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '12px' }}>
+                    Next Problem →
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Empty state */}
+          {!tutorProblem && !tutorLoading && (
+            <div style={{ textAlign: 'center', padding: '40px 0', color: '#666', fontSize: '14px' }}>
+              Choose a topic and click "Generate Problem" to start learning.
+            </div>
+          )}
+          {tutorLoading && !tutorProblem && (
+            <div style={{ textAlign: 'center', padding: '40px 0', color: '#00cc88', fontSize: '14px' }}>
+              Generating problem...
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Chat history — infinite scroll */}
+      {activeMode !== 'tutor' && (
         <div
         ref={chatContainerRef}
         onScroll={(e) => {
@@ -1292,6 +1685,7 @@ return (
         })}
         <div ref={messagesEndRef} />
       </div>
+      )}
 
       {/* RAG Chunk Selection Modal */}
       {ragChunkPrompt && (
@@ -1529,7 +1923,29 @@ return (
         </div>
       )}
 
+      {/* Mode toggle — always visible */}
+      <button
+        onClick={() => {
+          const modes: ActiveMode[] = ['query', 'agent', 'tutor'];
+          const idx = modes.indexOf(activeMode);
+          setActiveMode(modes[(idx + 1) % modes.length]);
+        }}
+        disabled={mode !== 'idle'}
+        style={{
+          position: 'fixed', bottom: '28px', right: '40px', zIndex: 50,
+          padding: '10px 14px', borderRadius: '12px', border: '2px solid',
+          borderColor: activeMode === 'agent' ? '#ff00ff' : activeMode === 'tutor' ? '#00cc88' : '#5533ff',
+          backgroundColor: activeMode === 'agent' ? 'rgba(255,0,255,0.1)' : activeMode === 'tutor' ? 'rgba(0,204,136,0.1)' : 'rgba(85,51,255,0.1)',
+          color: activeMode === 'agent' ? '#ff00ff' : activeMode === 'tutor' ? '#00cc88' : '#5533ff',
+          cursor: 'pointer', fontSize: '12px', fontWeight: 'bold', textTransform: 'uppercase', transition: 'all 0.3s',
+          backdropFilter: 'blur(10px)',
+        }}
+      >
+        {activeMode === 'agent' ? '🤖 Agent' : activeMode === 'tutor' ? '📚 Tutor' : '🔍 Query'}
+      </button>
+
       {/* Input bar fixed at bottom center */}
+      {activeMode !== 'tutor' && (
       <form
         onSubmit={handleSubmit}
         style={{
@@ -1599,26 +2015,6 @@ return (
             Show Details
           </button>
         )}
-        <button
-          type="button"
-          onClick={() => setActiveMode(activeMode === 'query' ? 'agent' : 'query')}
-          disabled={mode !== 'idle'}
-          style={{
-            padding: '10px 14px',
-            borderRadius: '12px',
-            border: '2px solid',
-            borderColor: activeMode === 'agent' ? '#ff00ff' : '#5533ff',
-            backgroundColor: activeMode === 'agent' ? 'rgba(255,0,255,0.1)' : 'rgba(85,51,255,0.1)',
-            color: activeMode === 'agent' ? '#ff00ff' : '#5533ff',
-            cursor: 'pointer',
-            fontSize: '12px',
-            fontWeight: 'bold',
-            textTransform: 'uppercase',
-            transition: 'all 0.3s'
-          }}
-        >
-          {activeMode === 'agent' ? '🤖 Agent' : '🔍 Query'}
-        </button>
         {/* Multi-Agent toggle — right next to the Agent/Query button */}
         {activeMode === 'agent' && (
           <button
@@ -1773,6 +2169,7 @@ return (
         </button>
         </div>
       </form>
+      )}
     </div>
   );
 }

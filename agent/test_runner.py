@@ -275,12 +275,15 @@ def run_tests(
         ]
 
 
-def build_test_failure_note(test_results: List[Dict], instruction: str, source: str = "", llm: Optional[OllamaLLM] = None) -> str:
+def build_test_failure_note(test_results: List[Dict], instruction: str, source: str = "", llm: Optional[OllamaLLM] = None, attempt: int = 0, failed_approaches: Optional[List[str]] = None) -> str:
     """
     Build a structured prompt note from failing test cases.
     
     Includes a self-reasoning step: the LLM reads the problem, traces through
     the test case, and identifies the root cause before being asked to fix.
+    
+    On later attempts (attempt >= 2), the prompt explicitly requests a different
+    algorithmic approach to break out of circular reasoning.
     """
     failures = [r for r in test_results if not r["passed"]]
     if not failures:
@@ -296,18 +299,41 @@ def build_test_failure_note(test_results: List[Dict], instruction: str, source: 
     reasoning = ""
     if source and llm:
         try:
+            pivot_hint = ""
+            if attempt >= 2:
+                pivot_hint = (
+                    "\nIMPORTANT: Previous fix attempts using the same logic have FAILED REPEATEDLY. "
+                    "The current approach is fundamentally flawed.\n"
+                    "You MUST identify a DIFFERENT algorithm or strategy — do NOT keep tweaking the same logic.\n"
+                )
+                if failed_approaches:
+                    pivot_hint += "APPROACHES ALREADY TRIED AND FAILED:\n"
+                    for fa in failed_approaches:
+                        pivot_hint += f"  - {fa}\n"
+                    pivot_hint += "Do NOT use any of the above approaches again.\n"
+
             trace_prompt = (
                 f"You are debugging incorrect code. Read the problem and trace through the test.\n\n"
                 f"PROBLEM: {instruction}\n\n"
                 f"CODE:\n```\n{source}\n```\n\n"
                 f"FAILED TEST:\n{failure_lines}\n\n"
+                f"{pivot_hint}"
                 "Step by step:\n"
                 "1. Read the problem statement — what does it actually require?\n"
                 "2. Trace through your code with the failing test input\n"
                 "3. At which specific line does the logic diverge from what the problem requires?\n"
-                "4. What is the exact root cause (wrong condition, wrong variable, wrong loop, etc.)?\n\n"
-                "Output your analysis concisely — max 5 lines. Be precise about which line is wrong and why."
+                "4. What is the exact root cause (wrong condition, wrong variable, wrong loop, etc.)?\n"
             )
+            if attempt >= 2:
+                trace_prompt += (
+                    "5. What COMPLETELY DIFFERENT algorithm or approach would solve this correctly?\n\n"
+                    "Output your analysis concisely — max 8 lines. Be precise about which line is wrong, "
+                    "why the current APPROACH is fundamentally flawed, and what different strategy to use."
+                )
+            else:
+                trace_prompt += (
+                    "\nOutput your analysis concisely — max 5 lines. Be precise about which line is wrong and why."
+                )
             reasoning = llm.invoke(trace_prompt).strip()
             logger.info("[TEST_RUNNER] Self-reasoning result: %s", reasoning[:300])
         except Exception as e:
@@ -326,9 +352,17 @@ def build_test_failure_note(test_results: List[Dict], instruction: str, source: 
             f"{reasoning}\n\n"
         )
 
-    note += (
-        "Fix the specific root cause identified above. "
-        "Do NOT restructure the entire function — target ONLY the incorrect logic. "
-        "Output a SEARCH/REPLACE block."
-    )
+    if attempt >= 2:
+        note += (
+            "CRITICAL: Previous attempts to fix this with small tweaks have FAILED. "
+            "You MUST use a COMPLETELY DIFFERENT algorithm or approach. "
+            "Rewrite the function logic from scratch using a new strategy. "
+            "Output a SEARCH/REPLACE block."
+        )
+    else:
+        note += (
+            "Fix the specific root cause identified above. "
+            "Do NOT restructure the entire function — target ONLY the incorrect logic. "
+            "Output a SEARCH/REPLACE block."
+        )
     return note

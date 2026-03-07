@@ -2,6 +2,7 @@ data/
 faiss_index/
 .venv/
 __pycache__/
+node_modules/
 
 /plans
 rag-search-engine/

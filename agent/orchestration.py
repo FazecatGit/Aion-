@@ -23,9 +23,14 @@ def plan_task(
     ext: str,
     rag_context: str = "",
     llm: Optional[OllamaLLM] = None,
+    failed_approaches: Optional[list] = None,
 ) -> Dict:
     """
     Decompose a complex instruction into ordered sub-steps.
+
+    Args:
+        failed_approaches: List of approach descriptions that already failed.
+                           The planner will avoid these strategies.
 
     Returns:
         {
@@ -45,6 +50,12 @@ def plan_task(
         f"LANGUAGE: {lang}\n\n"
         f"CURRENT CODE:\n```{lang}\n{source[:3000]}\n```\n\n"
     )
+
+    if failed_approaches:
+        prompt += "APPROACHES THAT HAVE ALREADY BEEN TRIED AND FAILED (do NOT reuse):\n"
+        for fa in failed_approaches:
+            prompt += f"  - {fa}\n"
+        prompt += "\nYou MUST choose a DIFFERENT algorithm or strategy from the ones listed above.\n\n"
 
     if rag_context:
         prompt += f"REFERENCE DOCUMENTATION:\n{rag_context[:2000]}\n\n"

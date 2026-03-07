@@ -883,3 +883,60 @@ async def pre_commit_endpoint():
         return {"status": "ok", **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+# ── Tutor Mode endpoints ────────────────────────────────────────────────────
+
+class TutorStartRequest(BaseModel):
+    topic: str
+    difficulty: str = "medium"  # "easy", "medium", "hard"
+    language: str = "python"
+    style: str = "mcq"  # "mcq", "free_text", "code"
+
+class TutorAnswerRequest(BaseModel):
+    session_id: str
+    answer: str
+
+class TutorCodeRequest(BaseModel):
+    session_id: str
+    code: str
+
+class TutorHintRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/tutor/start")
+async def tutor_start(req: TutorStartRequest):
+    """Generate a new tutor problem."""
+    from agent.tutor import generate_problem
+    result = generate_problem(
+        topic=req.topic,
+        difficulty=req.difficulty,
+        language=req.language,
+        style=req.style,
+    )
+    return {"status": "ok", **result}
+
+
+@app.post("/tutor/check")
+async def tutor_check(req: TutorAnswerRequest):
+    """Check the user's answer (MCQ letter or free text)."""
+    from agent.tutor import check_answer
+    result = check_answer(req.session_id, req.answer)
+    return {"status": "ok", **result}
+
+
+@app.post("/tutor/run")
+async def tutor_run(req: TutorCodeRequest):
+    """Run user code against the problem's test cases."""
+    from agent.tutor import run_tutor_code
+    result = run_tutor_code(req.session_id, req.code)
+    return {"status": "ok", **result}
+
+
+@app.post("/tutor/hint")
+async def tutor_hint(req: TutorHintRequest):
+    """Get the next progressive hint."""
+    from agent.tutor import get_hint
+    result = get_hint(req.session_id)
+    return {"status": "ok", **result}
