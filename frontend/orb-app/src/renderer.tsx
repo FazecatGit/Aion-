@@ -65,6 +65,9 @@ function App() {
   const [showOcrMenu, setShowOcrMenu] = useState(false);
   const [pendingImageBlob, setPendingImageBlob] = useState<Blob | null>(null);
   const [pendingImageDataUrl, setPendingImageDataUrl] = useState<string | null>(null);
+  // Persistent OCR context: keeps the extracted text/analysis available for follow-up queries
+  // until the user explicitly clears it (e.g., by capturing a new image or dismissing)
+  const [ocrContext, setOcrContext] = useState<{ text: string; imageDataUrl: string } | null>(null);
 
   // ── Tutor mode state ───────────────────────────────────────────────────────
   type TutorLesson = {
@@ -89,6 +92,8 @@ function App() {
   const [tutorCodeResults, setTutorCodeResults] = useState<{ input: string; expected: string; actual: string | null; passed: boolean }[] | null>(null);
   const [tutorLoading, setTutorLoading] = useState(false);
   const [showLesson, setShowLesson] = useState(true);
+  const [agentLearnings, setAgentLearnings] = useState<{ topic: string; explanation: string; timestamp: string }[] | null>(null);
+  const [showLearnings, setShowLearnings] = useState(false);
 
   // ── Tools panel state ──────────────────────────────────────────────────────
   const [showToolsPanel, setShowToolsPanel] = useState(false);
@@ -313,9 +318,12 @@ function App() {
       const res = await fetch('http://localhost:8000/ocr/analyze', { method: 'POST', body: form });
       const data = await res.json();
       if (data.status === 'ok') {
+        const analysisText = data.analysis || `[OCR RESULT]\n${data.ocr_text}`;
+        // Store persistent OCR context so follow-up queries include image+text together
+        setOcrContext({ text: data.image_context || data.ocr_text || analysisText, imageDataUrl: imageData });
         setMessages(prev => [...prev,
           { role: 'user', text: `[Screenshot uploaded — ask me anything about it]`, imageData },
-          { role: 'ai',   text: data.analysis || `[OCR RESULT]\n${data.ocr_text}` },
+          { role: 'ai',   text: analysisText },
         ]);
       } else {
         setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${data.error || 'unknown'}` }]);
@@ -352,9 +360,12 @@ function App() {
       const res = await fetch('http://localhost:8000/ocr/analyze', { method: 'POST', body: form });
       const data = await res.json();
       if (data.status === 'ok') {
+        const analysisText = data.analysis || `[OCR RESULT]\n${data.ocr_text}`;
+        // Store persistent OCR context for follow-up queries
+        setOcrContext({ text: data.image_context || data.ocr_text || analysisText, imageDataUrl: dataUrl });
         setMessages(prev => [...prev,
           { role: 'user', text: `[Screen Capture — select area captured]`, imageData: dataUrl },
-          { role: 'ai',   text: data.analysis || `[OCR RESULT]\n${data.ocr_text}` },
+          { role: 'ai',   text: analysisText },
         ]);
       } else {
         setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${data.error || 'unknown'}` }]);
@@ -367,6 +378,23 @@ function App() {
   };
 
   // ── Tutor handlers ─────────────────────────────────────────────────────────
+  const handleFetchLearnings = async () => {
+    try {
+      const params = new URLSearchParams();
+      if (tutorTopic.trim()) params.set('topic', tutorTopic.trim());
+      if (tutorLanguage) params.set('language', tutorLanguage);
+      params.set('limit', '20');
+      const res = await fetch(`http://localhost:8000/tutor/learnings?${params}`);
+      const data = await res.json();
+      setAgentLearnings(data.learnings || []);
+      setShowLearnings(true);
+    } catch (e) {
+      console.error('Failed to fetch learnings:', e);
+      setAgentLearnings([]);
+      setShowLearnings(true);
+    }
+  };
+
   const handleTutorGenerate = async () => {
     setTutorLoading(true);
     setTutorProblem(null); setTutorFeedback(null); setTutorHint(null);
@@ -378,7 +406,46 @@ function App() {
       });
       const data = await res.json();
       if (data.status === 'ok') {
-        setTutorProblem(data as TutorProblem);
+        // Extract only expected TutorProblem fields to avoid leaking raw JSON/extra fields
+        const problem: TutorProblem = {
+          session_id: data.session_id || '',
+          style: data.style || tutorStyle,
+          question: data.question || '',
+          language: data.language || tutorLanguage,
+          options: data.options,
+          test_cases: data.test_cases,
+          function_name: data.function_name,
+          code_snippet: data.code_snippet,
+          lesson: data.lesson,
+        };
+        // Guard: if question looks like raw JSON (LLM parse failure), show error
+        const q = problem.question.trim();
+        if (q.startsWith('{') && q.endsWith('}')) {
+          setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Problem generation returned malformed data. Retrying...' }]);
+          // Auto-retry once
+          const retry = await fetch('http://localhost:8000/tutor/start', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ topic: tutorTopic, difficulty: tutorDifficulty, language: tutorLanguage, style: tutorStyle }),
+          });
+          const retryData = await retry.json();
+          if (retryData.status === 'ok' && retryData.question && !retryData.question.trim().startsWith('{')) {
+            setTutorProblem({
+              session_id: retryData.session_id || '',
+              style: retryData.style || tutorStyle,
+              question: retryData.question || '',
+              language: retryData.language || tutorLanguage,
+              options: retryData.options,
+              test_cases: retryData.test_cases,
+              function_name: retryData.function_name,
+              code_snippet: retryData.code_snippet,
+              lesson: retryData.lesson,
+            });
+          } else {
+            setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Could not generate a valid problem. Please try again.' }]);
+          }
+        } else {
+          setTutorProblem(problem);
+        }
       } else {
         setMessages(prev => [...prev, { role: 'ai', text: `[TUTOR] Error: ${data.error || 'unknown'}` }]);
       }
@@ -454,7 +521,7 @@ const handleSubmit = async (e: React.FormEvent) => {
 
   const userMsg = input.trim();
   setInput('');
-  setMessages(prev => [...prev, { role: 'user', text: userMsg, imageData: pendingImageDataUrl || undefined }]);
+  setMessages(prev => [...prev, { role: 'user', text: userMsg, imageData: pendingImageDataUrl || ocrContext?.imageDataUrl || undefined }]);
 
   // If there's a pending image, send the question + image to the analyze endpoint
   if (pendingImageBlob) {
@@ -471,6 +538,8 @@ const handleSubmit = async (e: React.FormEvent) => {
       const res = await fetch('http://localhost:8000/ocr/analyze', { method: 'POST', body: form });
       const data = await res.json();
       if (data.status === 'ok') {
+        // Update persistent OCR context so follow-up queries also have it
+        setOcrContext({ text: data.image_context || data.ocr_text || data.analysis, imageDataUrl: imageDataUrl || '' });
         setMessages(prev => [...prev, { role: 'ai', text: data.analysis }]);
       } else {
         setMessages(prev => [...prev, { role: 'ai', text: `Analysis error: ${data.error || 'unknown'}` }]);
@@ -566,10 +635,14 @@ const handleSubmit = async (e: React.FormEvent) => {
       }
     } else {
       // Query mode: send to query endpoint
+      // If there's persistent OCR context, prepend it to the question so the LLM has the image content
+      const queryQuestion = ocrContext
+        ? `[IMAGE CONTEXT]\n${ocrContext.text}\n\n[QUESTION]\n${userMsg}`
+        : userMsg;
       const res = await fetch('http://localhost:8000/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: userMsg, mode: queryMode, session_id: sid }),
+        body: JSON.stringify({ question: queryQuestion, mode: queryMode, session_id: sid }),
       });
       const data = await res.json();
 
@@ -1362,7 +1435,37 @@ return (
               style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
               {tutorLoading ? '...' : 'Generate Problem'}
             </button>
+            <button onClick={handleFetchLearnings}
+              style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#b388ff', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px' }}>
+              📚 Learnings
+            </button>
           </div>
+
+          {/* Agent learnings display */}
+          {showLearnings && (
+            <div style={{ marginBottom: '16px', padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(85,51,255,0.06)', border: '1px solid rgba(85,51,255,0.2)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <div style={{ fontSize: '15px', fontWeight: 'bold', color: '#b388ff' }}>📚 Agent Learnings</div>
+                <button onClick={() => setShowLearnings(false)} style={{ background: 'none', border: '1px solid #5533ff44', borderRadius: '6px', color: '#888', cursor: 'pointer', padding: '4px 10px', fontSize: '11px' }}>
+                  Hide
+                </button>
+              </div>
+              {agentLearnings === null ? (
+                <div style={{ color: '#888', fontSize: '13px' }}>Loading...</div>
+              ) : agentLearnings.length === 0 ? (
+                <div style={{ color: '#888', fontSize: '13px' }}>No learnings yet. Use the code agent to build up learnings from debugging sessions.</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '300px', overflowY: 'auto' }}>
+                  {agentLearnings.map((l, i) => (
+                    <div key={i} style={{ padding: '10px', borderRadius: '8px', backgroundColor: 'rgba(0,0,0,0.3)', border: '1px solid #333' }}>
+                      <div style={{ fontSize: '12px', color: '#888', marginBottom: '4px' }}>{l.topic} · {new Date(l.timestamp).toLocaleDateString()}</div>
+                      <div style={{ fontSize: '13px', color: '#ddd', lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>{l.explanation}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Lesson display */}
           {tutorProblem?.lesson && showLesson && (
@@ -2329,6 +2432,19 @@ return (
           }}>
             📷 Image attached
             <button onClick={() => { setPendingImageBlob(null); setPendingImageDataUrl(null); }}
+              style={{ background: 'none', border: 'none', color: '#ff6666', cursor: 'pointer', fontSize: '11px', padding: '0 2px' }}>✕</button>
+          </div>
+        )}
+
+        {/* Persistent OCR context indicator — shows when image context is active for follow-up questions */}
+        {!pendingImageBlob && ocrContext && (
+          <div style={{
+            padding: '4px 10px', borderRadius: '12px', backgroundColor: 'rgba(0,204,136,0.15)',
+            border: '1px solid rgba(0,204,136,0.3)', fontSize: '11px', color: '#00cc88',
+            display: 'flex', alignItems: 'center', gap: '6px', marginRight: '4px',
+          }}>
+            🖼️ Image context active
+            <button onClick={() => setOcrContext(null)}
               style={{ background: 'none', border: 'none', color: '#ff6666', cursor: 'pointer', fontSize: '11px', padding: '0 2px' }}>✕</button>
           </div>
         )}

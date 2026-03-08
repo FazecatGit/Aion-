@@ -21,6 +21,7 @@ from .code_editing_helpers import (
     strip_markdown, parse_multiple_blocks, build_syntax_error_note,
     build_runtime_error_note, build_post_error_note,
     validate_code_structure, build_structural_issue_note,
+    count_top_level_functions, extract_error_lines_from_text,
     FUNC_PATTERN, _C_FUNC_PATTERN
 )
 from .code_context_builders import build_all_contexts
@@ -316,6 +317,32 @@ class CodeAgent:
             except Exception as e:
                 logger.debug("[AGENT] Planner failed, continuing without plan: %s", e)
 
+        # --- Detect crash-type errors for targeted analysis ---
+        _crash_keywords = {
+            'stack overflow', 'stack-overflow', 'buffer overflow', 'buffer-overflow',
+            'out of bounds', 'out-of-bounds', 'segfault', 'segmentation fault',
+            'heap-buffer-overflow', 'stack-buffer-overflow', 'addresssanitizer',
+            'asan', 'runtime error', 'access violation', 'index out of range',
+            'array index', 'undefined behavior', 'undefined behaviour',
+        }
+        instruction_lower_crash = instruction.lower()
+        is_crash_bug = any(kw in instruction_lower_crash for kw in _crash_keywords)
+        crash_analysis_hint = ""
+        if is_crash_bug:
+            crash_analysis_hint = (
+                "\n\nCRASH BUG ANALYSIS CHECKLIST — the error is a runtime crash, NOT a logic error:\n"
+                "1. Check EVERY array/vector/string index expression. For each one:\n"
+                "   - What is the maximum value the index can reach?\n"
+                "   - What is the array's actual length?\n"
+                "   - Does the index ALWAYS stay in [0, length-1] for ALL loop iterations?\n"
+                "2. Check for off-by-one errors in loop bounds.\n"
+                "3. If patterns/arrays are length N, any index like `N + i` is OUT OF BOUNDS.\n"
+                "   Use `(N + i) % N` or `(N + i - 1) % N` to wrap around.\n"
+                "4. Check for integer overflow in index arithmetic.\n"
+                "5. 'Stack overflow' on LeetCode usually means MEMORY ACCESS violation, not recursion.\n"
+            )
+            logger.info("[AGENT] Crash-type bug detected — injecting bounds-checking analysis hints")
+
         # --- Two-stage: analysis then edit ---
         logger.info("Waiting for LLM to analyze the issue...")
         try:
@@ -336,6 +363,7 @@ class CodeAgent:
                     f"Look at this code and describe what needs to change to fix: {instruction}\n\n"
                     f"{lang_directive}"
                     f"{original_header}```{lang_fence}\n{original_snippet}\n```\n\n"
+                    f"{crash_analysis_hint}"
                     f"{context_block}"
                 )
             analysis = llm.invoke(analysis_prompt).strip()
@@ -635,7 +663,7 @@ class CodeAgent:
                     # Guard: if the span covers the entire file and has multiple functions,
                     # the rewrite would destroy unrelated code — refuse and keep original.
                     is_full_file = func_start == 0 and func_end >= len(file_lines)
-                    func_count = sum(1 for l in file_lines if FUNC_PATTERN.match(l) or _C_FUNC_PATTERN.match(l))
+                    func_count = count_top_level_functions(file_lines, ext)
                     if is_full_file and func_count > 1:
                         logger.warning(
                             "Whole-function rewrite rejected — span covers the entire file "
@@ -656,6 +684,59 @@ class CodeAgent:
             except Exception as e:
                 logger.error("Whole-function rewrite LLM call failed: %s", e)
                 logger.debug(traceback.format_exc())
+
+        # --- Targeted line-edit fallback ---
+        # When all SEARCH/REPLACE attempts fail, try to extract error line numbers
+        # from the instruction (e.g., AddressSanitizer, compiler errors, user mentions)
+        # and ask the LLM to fix just those specific lines.
+        if new_source == file_source:
+            error_lines = extract_error_lines_from_text(instruction)
+            if error_lines:
+                logger.info("[AGENT] Targeted line-edit fallback: error lines %s extracted from instruction", error_lines)
+                # Build focused context around each error line
+                focus_snippets = []
+                for err_line in error_lines[:3]:  # limit to 3 error sites
+                    if 1 <= err_line <= len(file_lines):
+                        start = max(0, err_line - 5)
+                        end = min(len(file_lines), err_line + 5)
+                        snippet = '\n'.join(file_lines[start:end])
+                        focus_snippets.append(
+                            f"Around line {err_line}:\n```{lang_fence}\n{snippet}\n```"
+                        )
+
+                if focus_snippets:
+                    focused_context = '\n\n'.join(focus_snippets)
+                    targeted_prompt = (
+                        f"The user reported an error in this {lang_name} code.\n\n"
+                        f"{lang_directive}"
+                        f"ERROR DESCRIPTION: {instruction}\n\n"
+                        f"FULL FILE:\n```{lang_fence}\n{file_source}\n```\n\n"
+                        f"ERROR LOCATIONS:\n{focused_context}\n\n"
+                        f"Fix ONLY the lines causing the error. Output a SEARCH/REPLACE block.\n"
+                        f"The SEARCH block must match the EXACT current lines character-for-character.\n"
+                        f"FORMAT:\n{FORMAT_BLOCK}\n"
+                    )
+                    try:
+                        raw_output = llm.invoke(targeted_prompt).strip()
+                        targeted_blocks = parse_multiple_blocks(raw_output)
+                        if not targeted_blocks:
+                            targeted_blocks = parse_multiple_blocks(strip_markdown(raw_output))
+                        if targeted_blocks:
+                            source_lines = file_lines[:]
+                            for idx, (search_text, replace_text) in enumerate(targeted_blocks):
+                                match_start_idx, replace_lines, matched_len = apply_block_to_lines(
+                                    source_lines, search_text, replace_text
+                                )
+                                if match_start_idx != -1:
+                                    source_lines = (
+                                        source_lines[:match_start_idx]
+                                        + replace_lines
+                                        + source_lines[match_start_idx + matched_len:]
+                                    )
+                                    logger.info("[AGENT] Targeted line-edit block applied at line %s", match_start_idx)
+                            new_source = "\n".join(source_lines)
+                    except Exception as e:
+                        logger.warning("[AGENT] Targeted line-edit fallback failed: %s", e)
 
         # --- Self-correction ---
         new_source = self._self_correct_output(
@@ -845,6 +926,20 @@ class CodeAgent:
                 )
                 explanation = llm.invoke(explain_prompt).strip()
                 logger.info("[AGENT] Teaching explanation: %s", explanation[:200])
+
+                # Store explanation as a learning for tutor mode
+                try:
+                    from .tutor import store_agent_learning
+                    lang_name_for_learning = LANG_NAMES.get(ext, ext.lstrip('.').upper() if ext else '')
+                    store_agent_learning(
+                        explanation=explanation,
+                        topic=instruction[:100],
+                        language=lang_name_for_learning,
+                        file_path=path,
+                    )
+                except Exception:
+                    pass  # don't let tutor bridge failure affect the agent
+
             except Exception as e:
                 logger.debug("Explanation generation failed: %s", e)
 
@@ -1147,8 +1242,11 @@ class CodeAgent:
             debug_trace = None
             if failures:
                 first_fail = failures[0]
-                if first_fail.get("actual") is not None:
-                    # Only run debug trace if we got an actual (wrong) output, not a crash
+                has_output = first_fail.get("actual") is not None
+                has_crash = not has_output and first_fail.get("error")
+
+                if has_output:
+                    # Got a wrong output — run debug trace to capture runtime values
                     try:
                         logger.info("[FIX_WITH_TESTS] Running debug trace for failing test input=%s...",
                                     first_fail["input"][:60])
@@ -1162,6 +1260,25 @@ class CodeAgent:
                             )
                     except Exception as e:
                         logger.debug("[FIX_WITH_TESTS] Debug trace failed: %s", e)
+
+                elif has_crash:
+                    # Code crashed (segfault, OOB, stack overflow) — use the error message
+                    # as the debug trace. ASan reports from test_runner will be included.
+                    crash_error = first_fail["error"]
+                    logger.info("[FIX_WITH_TESTS] Crash detected — using error as debug context (%d chars)",
+                                len(crash_error))
+                    debug_trace = (
+                        "CRASH REPORT (code did not produce output — it crashed at runtime):\n"
+                        f"{crash_error}\n\n"
+                        "This is NOT a wrong-answer bug. The code CRASHES before producing any output.\n"
+                        "Common causes: array/buffer out-of-bounds access, stack overflow from "
+                        "unbounded recursion, null pointer dereference, integer overflow.\n"
+                        "Look carefully at ALL array index expressions — check that every index "
+                        "stays within [0, array_length-1] for ALL possible loop iterations."
+                    )
+                    explanation_parts.append(
+                        f"Attempt {attempt}: Runtime crash detected — analyzing crash report."
+                    )
 
             # Build diff from previous attempt to show LLM what already didn't work
             previous_diff = None

@@ -980,3 +980,11 @@ async def tutor_hint(req: TutorHintRequest):
     from agent.tutor import get_hint
     result = get_hint(req.session_id)
     return {"status": "ok", **result}
+
+
+@app.get("/tutor/learnings")
+async def tutor_learnings(topic: str = "", language: str = "", limit: int = 5):
+    """Get recent code agent learnings for use in tutor mode."""
+    from agent.tutor import get_agent_learnings
+    learnings = get_agent_learnings(topic=topic, language=language, limit=limit)
+    return {"status": "ok", "learnings": learnings}

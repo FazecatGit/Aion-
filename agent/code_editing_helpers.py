@@ -425,6 +425,67 @@ def parse_multiple_blocks(text: str) -> list:
     return [(m.group(1), m.group(2)) for m in pattern.finditer(text)]
 
 
+def count_top_level_functions(file_lines: list, ext: str = "") -> int:
+    """Count top-level function definitions, excluding class declarations in C-family languages.
+
+    For C/C++/Java/Go files, 'class' keyword should not count as a function.
+    Only counts actual function definitions (def/func for Python/Go, type+name( for C-family).
+    Also skips methods that are indented inside a class body — only counts truly top-level.
+    """
+    c_family_exts = {'.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.java', '.cs', '.js', '.ts'}
+    is_c_family = ext.lower() in c_family_exts
+
+    count = 0
+    for line in file_lines:
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+
+        # Skip blank lines
+        if not stripped:
+            continue
+
+        # For C-family: only count top-level functions (indent <= 4 to allow some namespace indentation)
+        # and skip 'class' keyword
+        if is_c_family:
+            if stripped.startswith('class '):
+                continue  # class declarations are not functions
+            if _C_FUNC_PATTERN.match(line) and indent <= 4:
+                count += 1
+        else:
+            # Python/Go/Ruby: use FUNC_PATTERN but only at top-level (indent 0)
+            if FUNC_PATTERN.match(line) and indent == 0:
+                count += 1
+
+    return count
+
+
+def extract_error_lines_from_text(text: str) -> list:
+    """Extract line numbers from error messages in user instructions.
+
+    Handles common error report formats:
+      - AddressSanitizer: 'solution.cpp:33:43'
+      - GCC/Clang: 'file.cpp:10:5: error:'
+      - Python traceback: 'File "foo.py", line 42'
+      - Generic: 'line 33', 'Line 33:', 'at line 33'
+      - User shorthand: 'Line 33:'
+    """
+    lines = set()
+
+    # Standard compiler format: file:line:col
+    for m in re.finditer(r'[\w./\\]+\.\w+:(\d+):\d+', text):
+        lines.add(int(m.group(1)))
+
+    # Python traceback: File "...", line N
+    for m in re.finditer(r'[Ff]ile\s+"[^"]+",\s*line\s+(\d+)', text):
+        lines.add(int(m.group(1)))
+
+    # Generic "line N" patterns
+    for m in re.finditer(r'\b[Ll]ine\s+(\d+)\b', text):
+        lines.add(int(m.group(1)))
+
+    return sorted(lines)
+
+
 def build_syntax_error_note(syntax_errors: list, file_lines: list) -> str:
     """Build a formatted note describing syntax errors."""
     if not syntax_errors:

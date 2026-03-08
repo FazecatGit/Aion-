@@ -230,13 +230,38 @@ def run_tests(
             if run_result.returncode != 0:
                 err_msg = (run_result.stderr or "Unknown error").strip()[:800]
                 logger.error("[TEST_RUNNER] Harness execution failed:\n%s", err_msg)
+
+                # --- ASan rerun for C/C++ crashes ---
+                # When a C/C++ program crashes at runtime (segfault, OOB, stack overflow),
+                # recompile with AddressSanitizer to get the exact crash location and access pattern.
+                asan_detail = ""
+                if ext in (".cpp", ".c") and shutil.which(compiler):
+                    asan_flags = [compiler, "-std=c++17" if ext == ".cpp" else "-std=c11",
+                                  "-O0", "-g", "-fsanitize=address", "-fno-omit-frame-pointer",
+                                  "-o", exe_path + "_asan", harness_path]
+                    try:
+                        asan_compile = subprocess.run(
+                            asan_flags, capture_output=True, text=True, timeout=30, cwd=tmpdir
+                        )
+                        if asan_compile.returncode == 0:
+                            asan_run = subprocess.run(
+                                [exe_path + "_asan"], capture_output=True, text=True,
+                                timeout=10, cwd=tmpdir
+                            )
+                            asan_output = ((asan_run.stderr or "") + (asan_run.stdout or "")).strip()
+                            if asan_output:
+                                asan_detail = f"\n\nAddressSanitizer report:\n{asan_output[:2000]}"
+                                logger.info("[TEST_RUNNER] ASan report captured (%d chars)", len(asan_output))
+                    except Exception as e:
+                        logger.debug("[TEST_RUNNER] ASan rerun failed: %s", e)
+
                 return [
                     {
                         "input": tc["input"],
                         "expected": tc["expected"],
                         "actual": None,
                         "passed": False,
-                        "error": f"Compilation/runtime error:\n{err_msg}",
+                        "error": f"Compilation/runtime error:\n{err_msg}{asan_detail}",
                     }
                     for tc in test_cases
                 ]
@@ -437,6 +462,20 @@ def build_test_failure_note(
         got = r["actual"] if r["actual"] is not None else f"ERROR: {r.get('error', 'unknown')}"
         failure_lines += f"  Test {i + 1}: input={r['input']}  →  expected={r['expected']},  got={got}\n"
 
+    # Detect if all failures are crashes (no actual output) — different debugging approach needed
+    all_crashes = all(r.get("actual") is None for r in failures)
+    has_asan = any("AddressSanitizer" in str(r.get("error", "")) or "sanitizer" in str(r.get("error", "")).lower() for r in failures)
+    crash_hint = ""
+    if all_crashes:
+        crash_hint = (
+            "\nCRITICAL: The code CRASHES at runtime — it does not produce any output.\n"
+            "This is a MEMORY ACCESS bug, not a logic error. Focus on:\n"
+            "- Array/vector/string index expressions that go OUT OF BOUNDS\n"
+            "- If an array has length N, index N+i is INVALID — use (N+i) % N or (N+i-1) % N\n"
+            "- 'Stack overflow' on LeetCode = out-of-bounds memory access, NOT infinite recursion\n"
+            "- Check the MAXIMUM value each index expression can reach across ALL loop iterations\n"
+        )
+
     # Self-reasoning: LLM traces through the test to identify root cause
     reasoning = ""
     if source and llm:
@@ -481,17 +520,28 @@ def build_test_failure_note(
                 f"PROBLEM: {instruction}\n\n"
                 f"CODE:\n```\n{source}\n```\n\n"
                 f"FAILED TEST:\n{failure_lines}\n\n"
+                f"{crash_hint}"
                 f"{debug_section}"
                 f"{prev_diff_section}"
                 f"{pivot_hint}"
                 "Step by step:\n"
                 "1. What does the problem actually require? State it precisely.\n"
-                "2. Look at the execution trace — at which specific step do the variable values "
-                "diverge from what the correct algorithm would produce?\n"
-                "3. What SPECIFIC line or expression in the code causes this wrong value?\n"
-                "4. What is the exact fix needed (be precise: wrong operator, wrong index, "
-                "wrong condition, missing case, etc.)?\n"
             )
+            if all_crashes:
+                trace_prompt += (
+                    "2. List EVERY array/vector/string index expression in the code.\n"
+                    "3. For each index expression, compute its MAXIMUM possible value across all loop iterations.\n"
+                    "4. Compare each maximum index to the array's length — which one exceeds the bounds?\n"
+                    "5. What is the exact fix (e.g., wrap with % N, change loop bound, resize array)?\n"
+                )
+            else:
+                trace_prompt += (
+                    "2. Look at the execution trace — at which specific step do the variable values "
+                    "diverge from what the correct algorithm would produce?\n"
+                    "3. What SPECIFIC line or expression in the code causes this wrong value?\n"
+                    "4. What is the exact fix needed (be precise: wrong operator, wrong index, "
+                    "wrong condition, missing case, etc.)?\n"
+                )
             if attempt >= 2:
                 trace_prompt += (
                     "5. If the same type of error keeps recurring, what DIFFERENT algorithmic "
@@ -513,6 +563,17 @@ def build_test_failure_note(
     note = (
         "TEST FAILURES — the current code does not produce correct output.\n"
         f"Original requirement: {instruction}\n\n"
+    )
+
+    if all_crashes:
+        note += (
+            "⚠️ RUNTIME CRASH — the code crashes before producing any output.\n"
+            "This is a memory access bug (out-of-bounds array index), NOT a logic error.\n"
+            "Do NOT rewrite the algorithm — find and fix the specific index expression "
+            "that goes out of bounds.\n\n"
+        )
+
+    note += (
         "FAILED TESTS:\n"
         f"{failure_lines}\n"
     )
