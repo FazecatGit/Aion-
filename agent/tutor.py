@@ -130,10 +130,23 @@ def generate_lesson(
     """
     llm = _llm(temperature=0.4)
 
+    # Pull relevant agent learnings so the lesson incorporates real debugging insights
+    learnings = get_agent_learnings(topic=topic, language=language, limit=3)
+    learnings_block = ""
+    if learnings:
+        snippets = []
+        for l in learnings:
+            snippets.append(f"- {l.get('explanation', '')[:500]}")
+        learnings_block = (
+            "\n\nThe student's code agent previously generated these explanations on related topics. "
+            "Incorporate relevant insights, patterns, or edge cases from them into the lesson:\n"
+            + "\n".join(snippets) + "\n"
+        )
+
     prompt = f"""You are an expert programming tutor. Generate a concise lesson about "{topic}" in {language} at {difficulty} difficulty level.
 
 The lesson should cover the key fundamentals that a student needs to understand before solving problems on this topic.
-
+{learnings_block}
 Return ONLY a JSON object with this EXACT structure:
 {{
   "title": "Topic Title (e.g. Arrays in C++)",
@@ -154,12 +167,34 @@ Make the lesson practical and concrete. Use {language}-specific syntax and idiom
     try:
         lesson = _parse_json_from_llm(raw)
     except (json.JSONDecodeError, ValueError):
-        lesson = {
-            "title": f"{topic} in {language}",
-            "explanation": raw.strip(),
-            "rules": [],
-            "example_code": "",
-            "example_explanation": "",
+        # Aggressive retry: strip everything outside outermost braces, fix common issues
+        fallback_parsed = None
+        try:
+            text = raw.strip()
+            # Remove markdown fences anywhere
+            text = re.sub(r'```(?:json)?\s*', '', text)
+            text = re.sub(r'\s*```', '', text)
+            brace_start = text.find('{')
+            brace_end = text.rfind('}')
+            if brace_start != -1 and brace_end > brace_start:
+                candidate = text[brace_start:brace_end + 1]
+                # Escape all literal newlines inside string values
+                fixed = _fix_json_newlines(candidate)
+                # Remove trailing commas
+                fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+                fallback_parsed = json.loads(fixed)
+        except Exception:
+            pass
+
+        if fallback_parsed and isinstance(fallback_parsed, dict) and fallback_parsed.get("explanation"):
+            lesson = fallback_parsed
+        else:
+            lesson = {
+                "title": f"{topic} in {language}",
+                "explanation": raw.strip(),
+                "rules": [],
+                "example_code": "",
+                "example_explanation": "",
             "key_terms": [],
         }
     return lesson
@@ -533,8 +568,16 @@ def get_agent_learnings(topic: str = "", language: str = "", limit: int = 5) -> 
     """Retrieve recent agent learnings, optionally filtered by topic/language."""
     results = _agent_learnings[:]
     if topic:
-        topic_lower = topic.lower()
-        results = [l for l in results if topic_lower in l.get("topic", "").lower() or topic_lower in l.get("explanation", "").lower()]
+        # Keyword-based matching: split topic into words, match if >=2 keywords hit
+        topic_clean = topic.replace('…', '').replace('...', '').strip().lower()
+        keywords = [w for w in re.split(r'\W+', topic_clean) if len(w) >= 3]
+        if keywords:
+            def _matches(learning: dict) -> bool:
+                haystack = (learning.get("topic", "") + " " + learning.get("explanation", "")).lower()
+                hits = sum(1 for kw in keywords if kw in haystack)
+                # Match if at least 2 keywords hit, or 1 if there's only 1 keyword
+                return hits >= min(2, len(keywords))
+            results = [l for l in results if _matches(l)]
     if language:
         lang_lower = language.lower()
         results = [l for l in results if lang_lower in l.get("language", "").lower()]

@@ -413,25 +413,45 @@ def analyze_image_with_context(
     # Step 3: Build a combined context and send to the LLM with the user's question
     context_parts = []
     if visual_description:
-        context_parts.append(f"[VISUAL DESCRIPTION OF IMAGE]\n{visual_description}")
+        context_parts.append(f"[VISUAL DESCRIPTION]\n{visual_description}")
     if ocr_text:
-        context_parts.append(f"[TEXT EXTRACTED FROM IMAGE (OCR)]\n{ocr_text}")
+        context_parts.append(f"[EXTRACTED CONTENT]\n{ocr_text}")
 
-    image_context = "\n\n".join(context_parts) if context_parts else "(No readable content detected in the image)"
+    image_context = "\n\n".join(context_parts) if context_parts else ""
 
+    # If we have no content at all, return an error directly — don't confuse the LLM
+    if not image_context.strip():
+        return {
+            "analysis": (
+                "I could not extract any readable content from the screenshot. "
+                "This can happen if the image is too small, blurry, or contains "
+                "non-text content.\n\n"
+                "Tips:\n"
+                "- Try capturing a larger area\n"
+                "- Ensure the text/code is clearly visible\n"
+                "- Use a higher resolution screenshot"
+            ),
+            "ocr_text": ocr_text,
+            "content_type": content_type,
+            "confidence": confidence,
+            "image_context": "",
+        }
+
+    # Build LLM prompt — present extracted content as plain context so the text
+    # model doesn't think it needs vision capabilities
     if user_question.strip():
         prompt = (
-            f"The user has shared a screenshot/image as supporting evidence for their question.\n\n"
+            f"Below is some content that was provided as context for the user's question.\n\n"
             f"{image_context}\n\n"
             f"USER'S QUESTION: {user_question}\n\n"
-            f"Using the image content as context, provide a thorough and helpful answer. "
-            f"Reference specific parts of the image content in your response."
+            f"Answer the question using the content above as context. "
+            f"Reference specific parts of the content in your response."
         )
     else:
         prompt = (
-            f"The user has shared a screenshot/image. Analyze it and explain what you see.\n\n"
+            f"Below is some content to analyze.\n\n"
             f"{image_context}\n\n"
-            f"Provide a clear explanation of what this image shows. If it's code, explain "
+            f"Provide a clear explanation of what this content shows. If it's code, explain "
             f"what the code does and any issues you notice. If it's a diagram, describe the "
             f"workflow. If it's a problem statement, summarize the requirements."
         )
@@ -441,7 +461,7 @@ def analyze_image_with_context(
         analysis = llm.invoke(prompt).strip()
     except Exception as e:
         logger.error("[OCR] LLM analysis failed: %s", e)
-        analysis = f"Could not analyze the image: {e}\n\nExtracted text:\n{ocr_text}"
+        analysis = f"Could not analyze the content: {e}\n\nExtracted text:\n{ocr_text}"
 
     return {
         "analysis": analysis,

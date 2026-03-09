@@ -312,24 +312,9 @@ function App() {
       // Store the image as pending context so user can ask questions about it
       setPendingImageBlob(file);
       setPendingImageDataUrl(imageData);
-      // Send to analyze endpoint (LLM reasons about the image, not just OCR text)
-      const form = new FormData();
-      form.append('image', file, file.name);
-      const res = await fetch('http://localhost:8000/ocr/analyze', { method: 'POST', body: form });
-      const data = await res.json();
-      if (data.status === 'ok') {
-        const analysisText = data.analysis || `[OCR RESULT]\n${data.ocr_text}`;
-        // Store persistent OCR context so follow-up queries include image+text together
-        setOcrContext({ text: data.image_context || data.ocr_text || analysisText, imageDataUrl: imageData });
-        setMessages(prev => [...prev,
-          { role: 'user', text: `[Screenshot uploaded — ask me anything about it]`, imageData },
-          { role: 'ai',   text: analysisText },
-        ]);
-      } else {
-        setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${data.error || 'unknown'}` }]);
-      }
+      // Image will be shown on the user's question message when they submit
     } catch (err: any) {
-      setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${err.message}` }]);
+      setMessages(prev => [...prev, { role: 'ai', text: `Image attach error: ${err.message}` }]);
     } finally {
       setOcrLoading(false);
     }
@@ -354,22 +339,7 @@ function App() {
       const blob = dataUrlToBlob(dataUrl);
       setPendingImageBlob(blob);
       setPendingImageDataUrl(dataUrl);
-      // Send to analyze endpoint (LLM reasons about the image, not just OCR text)
-      const form = new FormData();
-      form.append('image', blob, 'screenshot.png');
-      const res = await fetch('http://localhost:8000/ocr/analyze', { method: 'POST', body: form });
-      const data = await res.json();
-      if (data.status === 'ok') {
-        const analysisText = data.analysis || `[OCR RESULT]\n${data.ocr_text}`;
-        // Store persistent OCR context for follow-up queries
-        setOcrContext({ text: data.image_context || data.ocr_text || analysisText, imageDataUrl: dataUrl });
-        setMessages(prev => [...prev,
-          { role: 'user', text: `[Screen Capture — select area captured]`, imageData: dataUrl },
-          { role: 'ai',   text: analysisText },
-        ]);
-      } else {
-        setMessages(prev => [...prev, { role: 'ai', text: `OCR error: ${data.error || 'unknown'}` }]);
-      }
+      // Image will be shown on the user's question message when they submit
     } catch (err: any) {
       setMessages(prev => [...prev, { role: 'ai', text: `Screen capture error: ${err.message}` }]);
     } finally {
@@ -378,11 +348,13 @@ function App() {
   };
 
   // ── Tutor handlers ─────────────────────────────────────────────────────────
-  const handleFetchLearnings = async () => {
+  const handleFetchLearnings = async (overrideTopic?: string, overrideLanguage?: string) => {
     try {
       const params = new URLSearchParams();
-      if (tutorTopic.trim()) params.set('topic', tutorTopic.trim());
-      if (tutorLanguage) params.set('language', tutorLanguage);
+      const topic = overrideTopic ?? tutorTopic;
+      const language = overrideLanguage ?? tutorLanguage;
+      if (topic.trim()) params.set('topic', topic.trim());
+      if (language) params.set('language', language);
       params.set('limit', '20');
       const res = await fetch(`http://localhost:8000/tutor/learnings?${params}`);
       const data = await res.json();
@@ -418,6 +390,16 @@ function App() {
           code_snippet: data.code_snippet,
           lesson: data.lesson,
         };
+        // Safeguard: if lesson.explanation is raw JSON, try to parse it
+        if (problem.lesson && typeof problem.lesson.explanation === 'string') {
+          const exp = problem.lesson.explanation.trim();
+          if (exp.startsWith('{') && exp.endsWith('}')) {
+            try {
+              const parsed = JSON.parse(exp);
+              if (parsed.explanation) problem.lesson = parsed;
+            } catch { /* keep original */ }
+          }
+        }
         // Guard: if question looks like raw JSON (LLM parse failure), show error
         const q = problem.question.trim();
         if (q.startsWith('{') && q.endsWith('}')) {
@@ -429,7 +411,7 @@ function App() {
           });
           const retryData = await retry.json();
           if (retryData.status === 'ok' && retryData.question && !retryData.question.trim().startsWith('{')) {
-            setTutorProblem({
+            const retryProblem = {
               session_id: retryData.session_id || '',
               style: retryData.style || tutorStyle,
               question: retryData.question || '',
@@ -439,7 +421,18 @@ function App() {
               function_name: retryData.function_name,
               code_snippet: retryData.code_snippet,
               lesson: retryData.lesson,
-            });
+            };
+            // Safeguard: if lesson.explanation is raw JSON, try to parse it
+            if (retryProblem.lesson && typeof retryProblem.lesson.explanation === 'string') {
+              const exp = retryProblem.lesson.explanation.trim();
+              if (exp.startsWith('{') && exp.endsWith('}')) {
+                try {
+                  const parsed = JSON.parse(exp);
+                  if (parsed.explanation) retryProblem.lesson = parsed;
+                } catch { /* keep original */ }
+              }
+            }
+            setTutorProblem(retryProblem);
           } else {
             setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Could not generate a valid problem. Please try again.' }]);
           }
@@ -521,7 +514,9 @@ const handleSubmit = async (e: React.FormEvent) => {
 
   const userMsg = input.trim();
   setInput('');
-  setMessages(prev => [...prev, { role: 'user', text: userMsg, imageData: pendingImageDataUrl || ocrContext?.imageDataUrl || undefined }]);
+  // Attach imageData to the question message so the user sees the image is part of their query
+  const questionImageData = pendingImageDataUrl || ocrContext?.imageDataUrl || undefined;
+  setMessages(prev => [...prev, { role: 'user', text: userMsg, imageData: questionImageData }]);
 
   // If there's a pending image, send the question + image to the analyze endpoint
   if (pendingImageBlob) {
@@ -1435,7 +1430,7 @@ return (
               style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
               {tutorLoading ? '...' : 'Generate Problem'}
             </button>
-            <button onClick={handleFetchLearnings}
+            <button onClick={() => handleFetchLearnings()}
               style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#b388ff', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px' }}>
               📚 Learnings
             </button>
@@ -1869,6 +1864,38 @@ return (
                 </button>
               </div>
             )}
+            {/* Practice in Tutor button on agent explanation messages */}
+            {isExplanation && activeMode === 'agent' && (
+              <div style={{ marginTop: 8 }}>
+                <button
+                  onClick={() => {
+                    // Extract topic from the last agent instruction
+                    const rawTopic = lastAgentInstruction.current || 'general';
+                    const displayTopic = rawTopic.length > 60 ? rawTopic.slice(0, 60) + '…' : rawTopic;
+                    setTutorTopic(displayTopic);
+                    // Detect language from selected file extension
+                    let detectedLang = tutorLanguage;
+                    if (selectedFilePath) {
+                      const ext = selectedFilePath.split('.').pop()?.toLowerCase() || '';
+                      const langMap: Record<string, string> = { py: 'python', go: 'go', cpp: 'cpp', c: 'c', js: 'javascript', ts: 'typescript', java: 'java', rs: 'rust' };
+                      if (langMap[ext]) { detectedLang = langMap[ext]; setTutorLanguage(detectedLang); }
+                    }
+                    // Switch to tutor mode and auto-fetch learnings with raw topic (no ellipsis) for better matching
+                    setActiveMode('tutor');
+                    setShowLearnings(true);
+                    handleFetchLearnings(rawTopic, detectedLang);
+                  }}
+                  style={{
+                    padding: '6px 12px', borderRadius: '8px',
+                    border: '1px solid rgba(0,204,136,0.4)',
+                    backgroundColor: 'rgba(0,204,136,0.1)',
+                    color: '#00cc88', cursor: 'pointer', fontSize: '12px',
+                  }}
+                >
+                  📚 Practice in Tutor
+                </button>
+              </div>
+            )}
             {pendingAgentEdit && i === messages.length - 1 && activeMode === 'agent' && (
               <div style={{ marginTop: 12 }}>
                 {/* Show context file diffs if any */}
@@ -2247,7 +2274,7 @@ return (
           display: 'flex',
           flexDirection: 'column',
           gap: '6px',
-          zIndex: 20,
+          zIndex: 40,
         }}
       >
         {/* Agent-mode controls row: Mode + Tests above input */}
