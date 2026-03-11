@@ -359,7 +359,9 @@ class CodeAgent:
             try:
                 plan = plan_task(instruction, file_source, ext, rag_context=rag_context, llm=llm)
                 plan_context = format_plan_for_prompt(plan)
-                logger.info("[AGENT] Planner produced %d steps, approach: %s", len(plan.get('steps', [])), plan.get('approach', '')[:100])
+                logger.info("[AGENT] Planner produced %d steps, approach: %s", len(plan.get('steps', [])), plan.get('approach', '')[:200])
+                for i, step in enumerate(plan.get('steps', []), 1):
+                    logger.info("[AGENT]   Step %d: %s", i, step[:300])
             except Exception as e:
                 logger.debug("[AGENT] Planner failed, continuing without plan: %s", e)
 
@@ -1295,8 +1297,8 @@ class CodeAgent:
             previous_diff = None
             if previous_source and previous_source != source:
                 previous_diff = show_diff(previous_source, source)
-                if previous_diff and len(previous_diff) > 2000:
-                    previous_diff = previous_diff[:2000] + "\n... (truncated)"
+                if previous_diff and len(previous_diff) > 4000:
+                    previous_diff = previous_diff[:4000] + "\n... (truncated)"
 
             failure_note = build_test_failure_note(
                 results, instruction, source=source, llm=llm,
@@ -1317,10 +1319,16 @@ class CodeAgent:
                     # Build a targeted query from the error + instruction
                     rag_error_query = f"{instruction[:200]} {error_context[:100]} {actual[:50]}".strip()
                     from brain.fast_search import fast_topic_search
+                    from brain.config import EXT_TO_TOPIC
+                    _topics = ["algorithms", "clean-code"]
+                    _lang_topic = EXT_TO_TOPIC.get(ext)
+                    if _lang_topic:
+                        _topics.append(_lang_topic)
                     rag_error_results = fast_topic_search(
                         rag_error_query,
-                        top_n=3,
+                        top_k=3,
                         rerank_method="keyword",
+                        topic_filter=_topics,
                     )
                     if rag_error_results:
                         rag_error_text = "\n\n".join(

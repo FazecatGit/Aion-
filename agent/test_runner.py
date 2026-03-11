@@ -556,7 +556,7 @@ def build_test_failure_note(
 
     if all_crashes:
         note += (
-            "⚠️ RUNTIME CRASH — the code crashes before producing any output.\n"
+            "RUNTIME CRASH — the code crashes before producing any output.\n"
             "This is a memory access bug (out-of-bounds array index), NOT a logic error.\n"
             "Do NOT rewrite the algorithm — find and fix the specific index expression "
             "that goes out of bounds.\n\n"

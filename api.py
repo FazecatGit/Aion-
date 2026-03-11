@@ -1,6 +1,6 @@
 import asyncio
 import warnings
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -10,6 +10,7 @@ from pathlib import Path
 from brain.fast_search import initialize_bm25
 from brain.ingest import ingest_docs
 from brain.ingest import ingest_file
+from brain.ingest import _reingest_log
 from brain.augmented_generation_query import query_brain_comprehensive, session_chat_history
 from brain.chat_session_store import ChatSessionStore
 from brain.pdf_utils import load_pdfs
@@ -79,9 +80,57 @@ async def query(req: QueryRequest):
 async def ingest():
     print("[API] ingest called")
     global raw_docs
-    docs, topic_synonyms = await ingest_docs()
+    docs, topic_synonyms = await asyncio.to_thread(ingest_docs)
     raw_docs = load_pdfs(DATA_DIR)
     return {"topics": list(topic_synonyms.keys())}
+
+
+# ── Reingest: background task with status polling ────────────────────────────
+_reingest_state: dict = {"status": "idle", "topics": [], "error": "", "log": [], "log_cursor": 0}
+
+async def _run_reingest():
+    global raw_docs, _reingest_state
+    _reingest_state = {"status": "running", "topics": [], "error": "", "log": [], "log_cursor": 0}
+    try:
+        print("[API] reingest background task started")
+        docs, topic_synonyms = await asyncio.to_thread(ingest_docs, force=True)
+        raw_docs = load_pdfs(DATA_DIR)
+        initialize_bm25(raw_docs)
+        _reingest_state["status"] = "done"
+        _reingest_state["topics"] = list(topic_synonyms.keys())
+        _reingest_state["log"] = list(_reingest_log)
+        print(f"[API] reingest complete: {len(_reingest_state['topics'])} topics")
+    except Exception as e:
+        import traceback
+        _reingest_state["status"] = "error"
+        _reingest_state["error"] = str(e)
+        _reingest_state["log"] = list(_reingest_log)
+        print(f"[API] reingest failed: {e}\n{traceback.format_exc()}")
+
+
+@app.post("/reingest")
+async def reingest():
+    """Start a full re-ingestion in the background. Poll /reingest/status for progress."""
+    global _reingest_state
+    if _reingest_state["status"] == "running":
+        return {"status": "already_running"}
+    _reingest_state = {"status": "running", "topics": [], "error": "", "log": [], "log_cursor": 0}
+    asyncio.create_task(_run_reingest())
+    return {"status": "started"}
+
+
+@app.get("/reingest/status")
+async def reingest_status(log_cursor: int = 0):
+    """Poll this for progress. Pass log_cursor=N to get only new log lines since N."""
+    full_log = list(_reingest_log) if _reingest_state["status"] == "running" else _reingest_state.get("log", [])
+    new_lines = full_log[log_cursor:]
+    return {
+        "status": _reingest_state["status"],
+        "topics": _reingest_state.get("topics", []),
+        "error": _reingest_state.get("error", ""),
+        "log": new_lines,
+        "log_cursor": len(full_log),
+    }
 
 
 @app.post("/open_data_folder")
@@ -130,7 +179,7 @@ async def upload_and_ingest(file: UploadFile = File(...)):
         with dest.open('wb') as f:
             f.write(contents)
 
-        result = await ingest_file(str(dest))
+        result = await asyncio.to_thread(ingest_file, str(dest))
         if result is None:
             return {"status": "exists", "filename": filename}
         docs, topics = result
@@ -144,7 +193,7 @@ async def ingest_file_endpoint(filename: str):
     print("[API] ingest_file called; filename=", filename)
     # filename relative to DATA_DIR
     try:
-        result = await ingest_file(filename)
+        result = await asyncio.to_thread(ingest_file, filename)
         if result is None:
             return {"status": "exists"}
         docs, topics = result

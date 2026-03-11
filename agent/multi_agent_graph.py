@@ -86,7 +86,10 @@ def plan_node(state: AgentState) -> dict:
             llm=llm,
         )
         plan_text = format_plan_for_prompt(plan)
-        logger.info("[PLAN] %d steps, approach: %s", len(plan.get("steps", [])), plan.get("approach", "")[:80])
+        steps = plan.get("steps", [])
+        logger.info("[PLAN] %d steps, approach: %s", len(steps), plan.get("approach", "")[:200])
+        for i, step in enumerate(steps, 1):
+            logger.info("[PLAN]   Step %d: %s", i, step[:300])
         return {"plan": plan, "plan_text": plan_text}
     except Exception as e:
         logger.warning("[PLAN] Failed: %s", e)
@@ -126,10 +129,16 @@ def strategist_node(state: AgentState) -> dict:
         from brain.fast_search import fast_topic_search
         # Build a query targeting algorithm patterns, not just the language
         rag_query = f"algorithm {approach} dynamic programming combinatorics {instruction[:150]}"
+        from brain.config import EXT_TO_TOPIC
+        _topics = ["algorithms", "clean-code"]
+        _lang_topic = EXT_TO_TOPIC.get(ext)
+        if _lang_topic:
+            _topics.append(_lang_topic)
         rag_results = fast_topic_search(
             rag_query,
             top_k=5,
             rerank_method="cross_encoder",
+            topic_filter=_topics,
         )
         if rag_results:
             rag_chunks = []
@@ -167,7 +176,7 @@ def strategist_node(state: AgentState) -> dict:
         f"Your job is to figure out the CORRECT algorithm before any code is written.\n\n"
         f"PROBLEM:\n{instruction}\n\n"
         f"LANGUAGE: {lang_name} ({ext})\n\n"
-        f"CURRENT CODE (stub or broken attempt):\n```{lang}\n{source[:2000]}\n```\n"
+        f"CURRENT CODE (stub or broken attempt):\n```{lang}\n{source[:4000]}\n```\n"
         f"{test_section}"
         f"{edge_section}"
         f"{rag_section}\n\n"
@@ -395,7 +404,7 @@ def discuss_node(state: AgentState) -> dict:
     discussion = list(state.get("discussion_log") or [])
 
     critic_feedback = state.get("critic_feedback", "No specific feedback")
-    current_code = state.get("current_source", "")[:2000]
+    current_code = state.get("current_source", "")[:4000]
     instruction = state["instruction"]
     strategy = state.get("strategy", "")
 
@@ -434,7 +443,7 @@ def discuss_node(state: AgentState) -> dict:
     )
     planner_response = llm.invoke(planner_prompt).strip()
     discussion.append(f"[PLANNER] {planner_response}")
-    logger.info("[DISCUSS] Planner: %s", planner_response[:120])
+    logger.info("[DISCUSS] Planner: %s", planner_response[:300])
 
     # Round 2: Critic evaluates the planner's proposal
     critic_prompt = (
@@ -454,7 +463,7 @@ def discuss_node(state: AgentState) -> dict:
     )
     critic_response = llm.invoke(critic_prompt).strip()
     discussion.append(f"[CRITIC] {critic_response}")
-    logger.info("[DISCUSS] Critic: %s", critic_response[:120])
+    logger.info("[DISCUSS] Critic: %s", critic_response[:300])
 
     # Round 3: If critic disagreed, planner adjusts
     if "AGREED" not in critic_response.upper():
@@ -467,7 +476,7 @@ def discuss_node(state: AgentState) -> dict:
         )
         final_plan = llm.invoke(adjust_prompt).strip()
         discussion.append(f"[PLANNER revised] {final_plan}")
-        logger.info("[DISCUSS] Planner revised: %s", final_plan[:120])
+        logger.info("[DISCUSS] Planner revised: %s", final_plan[:300])
         consensus = final_plan
     else:
         consensus = planner_response
@@ -477,6 +486,63 @@ def discuss_node(state: AgentState) -> dict:
         f"{critic_feedback}\n\n"
         f"AGENT DISCUSSION CONSENSUS:\n{consensus}"
     )
+
+    # ── Strategist escalation on repeated failures ──────────────────
+    # If we've failed 2+ times, the algorithm itself may be wrong.
+    # Re-invoke the strategist with the full failure context so it can
+    # propose a fundamentally different approach rather than patching.
+    if state["attempt"] >= 2:
+        logger.info("[DISCUSS] Escalating to strategist (attempt %d)", state["attempt"])
+        try:
+            llm_strat = OllamaLLM(model=LLM_MODEL, temperature=0.2)
+            lang_name = LANG_NAMES.get(state["ext"], state["ext"])
+            lang = LANG_FENCE.get(state["ext"], state["ext"].lstrip('.'))
+
+            failed_summary = "\n".join(discussion[-3:])  # last 3 messages
+            test_section = ""
+            if test_results:
+                test_lines = [
+                    f"  {('PASS' if r.get('passed') else 'FAIL')}: "
+                    f"input={r['input']} expected={r['expected']} got={r.get('actual', r.get('error', 'N/A'))}"
+                    for r in test_results
+                ]
+                test_section = "\nACTUAL TEST RESULTS:\n" + "\n".join(test_lines)
+
+            escalation_prompt = (
+                f"You are the STRATEGIST agent being re-consulted because the coder has FAILED "
+                f"{state['attempt']} times on this problem.\n\n"
+                f"PROBLEM: {instruction}\n"
+                f"LANGUAGE: {lang_name}\n\n"
+                f"CURRENT (BROKEN) CODE:\n```{lang}\n{state.get('current_source', '')[:4000]}\n```\n"
+                f"{test_section}\n\n"
+                f"PREVIOUS STRATEGY (which led to failure):\n{strategy[:1000]}\n\n"
+                f"AGENT DISCUSSION:\n{failed_summary}\n\n"
+                f"The previous approach is WRONG. You must propose a FUNDAMENTALLY DIFFERENT "
+                f"algorithm — not a patch. Common escape routes:\n"
+                f"- If using combinatorics → switch to DP\n"
+                f"- If using brute force → switch to greedy or binary search\n"
+                f"- If using BFS → switch to DFS with memoization\n"
+                f"- If using a formula → switch to simulation/DP\n\n"
+                f"1. WHAT WAS WRONG: Why the previous approach cannot work\n"
+                f"2. CORRECT ALGORITHM CLASS: (DP / greedy / graph / etc.)\n"
+                f"3. STATE DEFINITION: Precise dp[i][j] or equivalent\n"
+                f"4. RECURRENCE: Exact formula\n"
+                f"5. PSEUDOCODE: Clear enough to translate directly\n"
+                f"6. TRACE: Walk through first test case\n"
+            )
+            new_strategy = llm_strat.invoke(escalation_prompt).strip()
+            if len(new_strategy) > 4000:
+                new_strategy = new_strategy[:4000] + "\n... (truncated)"
+            logger.info("[DISCUSS] Strategist escalation produced %d chars", len(new_strategy))
+
+            enhanced_feedback += f"\n\nREVISED STRATEGY (from strategist re-consultation):\n{new_strategy}"
+            return {
+                "discussion_log": discussion,
+                "critic_feedback": enhanced_feedback,
+                "strategy": new_strategy,
+            }
+        except Exception as e:
+            logger.warning("[DISCUSS] Strategist escalation failed: %s", e)
 
     return {
         "discussion_log": discussion,

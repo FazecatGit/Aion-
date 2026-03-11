@@ -17,25 +17,6 @@ logger = logging.getLogger("code_agent")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _parse_bullet_items(lines_iter, line_stripped: str, section_name: str) -> list:
-    """Collect bullet/numbered items from an already-entered section.
-
-    *lines_iter* is an iterator of ``(stripped_line, upper_line)`` pairs.
-    Returns a list of cleaned strings.
-    """
-    items: list[str] = []
-    # Process any text on the header line itself (after the colon)
-    rest = line_stripped.split(":", 1)[1].strip() if ":" in line_stripped else ""
-    if rest and rest.lower() != "none":
-        items.append(re.sub(r'^\d+[.)\]]\s*', '', rest.lstrip("-•* ")).strip())
-    return items
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # PLANNER
 # ═══════════════════════════════════════════════════════════════════════════════
 

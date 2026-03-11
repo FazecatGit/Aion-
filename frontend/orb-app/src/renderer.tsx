@@ -934,10 +934,10 @@ return (
             try {
               const res = await fetch('http://localhost:8000/ingest', { method: 'POST' });
               const json = await res.json();
-              const topicCount = Object.keys(json.topics || {}).length;
+              const topics: string[] = Array.isArray(json.topics) ? json.topics : Object.keys(json.topics || {});
               setMessages(prev => [...prev, { 
                 role: 'ai', 
-                text: `✓ Batch ingest complete! Processed all PDFs in data folder. Extracted ${topicCount} topics: ${Object.keys(json.topics || {}).slice(0, 10).join(', ')}${topicCount > 10 ? '...' : ''}` 
+                text: `✓ Batch ingest complete! Processed all PDFs in data folder. Extracted ${topics.length} topics: ${topics.slice(0, 10).join(', ')}${topics.length > 10 ? '...' : ''}` 
               }]);
             } catch (e) {
               setMessages(prev => [...prev, { role: 'ai', text: `Batch ingest failed: ${e.message}` }]);
@@ -949,6 +949,74 @@ return (
           title="Process all PDF files in the data folder at once"
         >
           Batch Ingest All
+        </button>
+
+        <button
+          onClick={async () => {
+            setMode('querying');
+            setMessages(prev => [...prev, { role: 'user', text: 'Re-ingesting all documents (force rebuild)...' }]);
+            try {
+              // Start the background reingest
+              let res = await fetch('http://localhost:8000/reingest', { method: 'POST' });
+              if (res.status === 404 || res.status === 405) {
+                setMessages(prev => [...prev, { role: 'ai', text: '(Server needs restart for force-rebuild — falling back to batch ingest)' }]);
+                res = await fetch('http://localhost:8000/ingest', { method: 'POST' });
+                if (!res.ok) throw new Error(`Server returned ${res.status}`);
+                const json = await res.json();
+                const topics: string[] = Array.isArray(json.topics) ? json.topics : Object.keys(json.topics || {});
+                setMessages(prev => [...prev, { role: 'ai', text: `✓ Ingest complete! ${topics.length} topics extracted.` }]);
+                setMode('idle');
+                return;
+              }
+              if (!res.ok) throw new Error(`Server returned ${res.status}`);
+              const startJson = await res.json();
+              if (startJson.status === 'already_running') {
+                setMessages(prev => [...prev, { role: 'ai', text: 'Re-ingest is already running in the background — check back in a minute.' }]);
+                setMode('idle');
+                return;
+              }
+              setMessages(prev => [...prev, { role: 'ai', text: ' Starting re-ingest... polling for progress.' }]);
+
+              // Poll /reingest/status with log_cursor for incremental verbose logs
+              let done = false;
+              let logCursor = 0;
+              while (!done) {
+                await new Promise(r => setTimeout(r, 3000));
+                const statusRes = await fetch(`http://localhost:8000/reingest/status?log_cursor=${logCursor}`);
+                const statusJson = await statusRes.json();
+
+                // Show new log lines as individual messages
+                const newLines: string[] = statusJson.log || [];
+                if (newLines.length > 0) {
+                  setMessages(prev => [...prev, ...newLines.map((line: string) => ({ role: 'ai' as const, text: `[ingest] ${line}` }))]);
+                  logCursor = statusJson.log_cursor ?? (logCursor + newLines.length);
+                }
+
+                if (statusJson.status === 'done') {
+                  done = true;
+                  const topics: string[] = statusJson.topics || [];
+                  setMessages(prev => [...prev, {
+                    role: 'ai',
+                    text: `Re-ingest complete! ${topics.length} topics extracted: ${topics.slice(0, 15).join(', ')}${topics.length > 15 ? '...' : ''}`
+                  }]);
+                } else if (statusJson.status === 'error') {
+                  done = true;
+                  setMessages(prev => [...prev, {
+                    role: 'ai',
+                    text: `Re-ingest stopped: ${statusJson.error}\n\nProgress has been saved — click Re-ingest again to resume from where it left off.`
+                  }]);
+                }
+              }
+            } catch (e: any) {
+              setMessages(prev => [...prev, { role: 'ai', text: `Re-ingest failed: ${e.message}\n\nClick Re-ingest again to resume from the last checkpoint.` }]);
+            }
+            setMode('idle');
+          }}
+          style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#b85820', color: '#fff', border: 'none', fontWeight: 'bold' }}
+          disabled={mode !== 'idle'}
+          title="Force full re-ingestion: rebuilds everything with improved keyword extraction and topic tagging"
+        >
+          🔄 Re-ingest
         </button>
 
         <input id="pdf-upload" type="file" accept="application/pdf" style={{ display: 'none' }} onChange={async (e) => {

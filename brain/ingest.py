@@ -8,7 +8,7 @@ import shutil
 
 from datetime import datetime
 from pathlib import Path
-from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
@@ -16,6 +16,77 @@ from langchain_chroma import Chroma
 from .utils import pipe
 from .config import CHROMA_DIR, DATA_DIR, EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, INDEX_META_PATH, LLM_MODEL
 from .pdf_utils import load_pdfs
+
+
+# ─── Topic Classification ─────────────────────────────────────────────────────
+# Maps filename patterns → topic labels so retrieval can filter by domain.
+
+_TOPIC_PATTERNS: list[tuple[list[str], str]] = [
+    (["algorithm", "algo", "data_structure", "data-structure", "sorting",
+      "dynamic_programming", "dp", "graph", "tree", "leetcode", "competitive",
+      "binary_search", "backtracking", "greedy", "recursion", "heap", "trie",
+      "hash", "linked_list", "stack", "queue", "bfs", "dfs", "dijkstra",
+      "bellman", "kruskal", "prim", "union_find", "segment_tree", "fenwick",
+      "topological", "sliding_window", "two_pointer", "bit_manipulation",
+      "divide_and_conquer", "memoization", "tabulation", "knapsack",
+      "shortest_path", "minimum_spanning", "network_flow"], "algorithms"),
+    (["clean_code", "clean-code", "refactoring", "design_pattern", "design-pattern",
+      "solid", "legacy", "code_complete", "pragmatic", "architecture",
+      "software_design", "gang_of_four", "gof", "head_first_design",
+      "dependency_injection", "microservice", "domain_driven"], "clean-code"),
+    (["calculus", "linear_algebra", "math", "statistics", "probability",
+      "discrete_math", "number_theory", "combinatorics", "geometry",
+      "numerical_methods", "optimization"], "mathematics"),
+    (["machine_learning", "ml", "deep_learning", "neural", "ai",
+      "natural_language", "nlp", "transformer", "reinforcement_learning",
+      "computer_vision", "tensorflow", "pytorch", "scikit"], "ml"),
+    (["python", "cpython", "django", "flask", "fastapi", "pandas",
+      "numpy", "asyncio"], "python"),
+    (["cpp", "c++", "cplusplus", "stroustrup", "effective_modern",
+      "concurrency_in_action", "stl", "boost", "cmake"], "cpp"),
+    (["golang", "go_programming", "go_in_action"], "go"),
+    (["rust", "rustacean", "cargo", "tokio", "async_rust"], "rust"),
+    (["javascript", "typescript", "angular", "react", "node", "vue",
+      "webpack", "nextjs", "express", "deno"], "web"),
+    (["java", "spring", "jvm", "kotlin", "maven", "gradle",
+      "effective_java", "concurrency_java"], "java"),
+    (["blender", "3d_model", "game_engine", "unity", "unreal",
+      "opengl", "vulkan", "shader", "graphics"], "creative"),
+    (["database", "sql", "nosql", "postgres", "mysql", "mongodb",
+      "redis", "elasticsearch", "indexing"], "database"),
+    (["network", "tcp", "http", "socket", "protocol", "dns",
+      "distributed_system", "rpc", "grpc"], "networking"),
+    (["security", "cryptography", "encryption", "authentication",
+      "oauth", "penetration", "owasp", "vulnerability"], "security"),
+    (["operating_system", "os", "kernel", "linux", "systems_programming",
+      "memory_management", "threading", "concurrency"], "systems"),
+]
+
+
+def _classify_document_topic(source_path: str) -> str:
+    """Classify a document's topic from its filename/path.
+
+    Returns a short label like 'algorithms', 'clean-code', 'python', etc.
+    Falls back to 'general' if no pattern matches.
+    """
+    name = Path(source_path).stem.lower().replace("-", "_").replace(" ", "_")
+    for keywords, topic in _TOPIC_PATTERNS:
+        if any(kw in name for kw in keywords):
+            return topic
+    return "general"
+
+
+def _enrich_metadata(doc) -> dict:
+    """Build clean metadata: keep source filename + add topic classification."""
+    meta = dict(doc.metadata or {})
+    raw_source = meta.get("source") or meta.get("file_path") or ""
+    # Keep just the filename (no full path for privacy)
+    source_name = Path(raw_source).name if raw_source else "unknown"
+    topic = _classify_document_topic(raw_source)
+    return {
+        k: v for k, v in meta.items()
+        if k not in ("file_path",)  # drop file_path, keep everything else
+    } | {"source": source_name, "topic": topic}
 
 
 TOPIC_MAP_PATH = "cache/topic_map.json"
@@ -34,51 +105,227 @@ def _write_index_metadata(doc_count: int) -> None:
 
 def extract_keywords_from_corpus(docs: List[Any]) -> Dict[str, int]:
     stop_words = {
-        'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 'be', 'been',
-        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should',
-        'of', 'in', 'to', 'for', 'with', 'by', 'from', 'as', 'at', 'this', 'that',
-        'it', 'its', 'if', 'can', 'we', 'you', 'your', 'them', 'their', 'more', 'than',
-        'also', 'anyway', 'anything', 'anything else', 'anyone', 'anything at all',
-        'anything in the world', 'anything like that', 'anything more', 'anything other than',
-        'anything similar', 'anything to', 'anything under any circumstances', 'anything whatever',
-        'anything within reason', 'anything you can think of', 'anything you could imagine',
-        'anything whatsoever', 'anybody', 'anybody else', 'anybody in the world', 'anybody like that',
-        'anybody more', 'anybody other than', 'anybody similar', 'anybody to', 'anybody under any circumstances',
-        'anybody whatever', 'anybody within reason', 'anybody you can think of', 'anybody you could imagine',
-        'anybody whatsoever', 
+        # ── Articles / determiners ──
+        'the', 'a', 'an', 'this', 'that', 'these', 'those', 'every', 'each',
+        'some', 'any', 'all', 'both', 'either', 'neither', 'no', 'much',
+        'many', 'few', 'little', 'several', 'enough', 'most', 'other',
+        'another', 'such', 'own',
+        # ── Pronouns ──
+        'i', 'me', 'my', 'mine', 'myself', 'we', 'us', 'our', 'ours', 'ourselves',
+        'you', 'your', 'yours', 'yourself', 'yourselves',
+        'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'herself',
+        'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves',
+        'who', 'whom', 'whose', 'which', 'what', 'whatever', 'whoever',
+        'one', 'ones', 'something', 'anything', 'nothing', 'everything',
+        'someone', 'anyone', 'nobody', 'everybody', 'everyone', 'somewhere',
+        'anywhere', 'nowhere', 'anybody',
+        # ── Prepositions ──
+        'of', 'in', 'to', 'for', 'with', 'on', 'at', 'by', 'from', 'as',
+        'into', 'through', 'during', 'before', 'after', 'above', 'below',
+        'between', 'under', 'over', 'about', 'against', 'without', 'within',
+        'along', 'across', 'behind', 'beyond', 'among', 'around', 'toward',
+        'towards', 'upon', 'onto', 'throughout', 'beside', 'besides',
+        'despite', 'except', 'since', 'until', 'unless', 'per', 'via',
+        # ── Conjunctions ──
+        'and', 'or', 'but', 'nor', 'yet', 'so', 'because', 'although',
+        'though', 'while', 'whereas', 'whether', 'however', 'therefore',
+        'moreover', 'furthermore', 'nevertheless', 'meanwhile', 'otherwise',
+        'hence', 'thus', 'still', 'also', 'too', 'then', 'else',
+        # ── Be / have / do auxiliaries ──
+        'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+        'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'done',
+        # ── Modal verbs ──
+        'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might',
+        'must', 'need', 'dare', 'ought',
+        # ── Common verbs / verb forms ──
+        'get', 'got', 'gets', 'getting', 'make', 'makes', 'made', 'making',
+        'go', 'goes', 'going', 'went', 'gone', 'come', 'came', 'comes',
+        'take', 'takes', 'took', 'taken', 'give', 'gave', 'given',
+        'say', 'said', 'says', 'see', 'saw', 'seen', 'know', 'knew', 'known',
+        'think', 'thought', 'let', 'put', 'keep', 'kept', 'tell', 'told',
+        'find', 'found', 'want', 'seem', 'show', 'shown', 'try', 'tried',
+        'leave', 'left', 'call', 'called', 'ask', 'asked',
+        'look', 'looked', 'looking', 'use', 'used', 'using', 'work', 'worked',
+        # ── Adverbs / filler ──
+        'not', 'just', 'only', 'very', 'really', 'quite', 'rather', 'already',
+        'always', 'never', 'often', 'sometimes', 'usually', 'perhaps', 'maybe',
+        'anyway', 'actually', 'basically', 'simply', 'certainly', 'clearly',
+        'probably', 'possibly', 'especially', 'particularly', 'generally',
+        'typically', 'essentially', 'definitely', 'obviously', 'apparently',
+        'exactly', 'nearly', 'almost', 'well', 'even', 'ever', 'here', 'there',
+        'now', 'then', 'when', 'where', 'how', 'why', 'again', 'further',
+        'once', 'soon', 'later', 'early', 'far', 'long', 'way', 'back',
+        'down', 'up', 'out', 'off', 'away', 'together', 'apart',
+        # ── Common adjectives / filler adjectives ──
+        'new', 'old', 'good', 'bad', 'great', 'small', 'large', 'big',
+        'high', 'low', 'same', 'different', 'important', 'main', 'major',
+        'first', 'last', 'next', 'previous', 'following', 'possible',
+        'available', 'able', 'likely', 'certain', 'sure', 'true', 'right',
+        'real', 'full', 'whole', 'common', 'simple', 'easy', 'hard',
+        'less', 'least', 'more', 'most', 'than', 'better', 'best', 'worse',
+        # ── Textbook / document filler ──
+        'example', 'figure', 'chapter', 'section', 'page', 'note', 'notes',
+        'table', 'see', 'shown', 'given', 'used', 'using', 'like',
+        'consider', 'case', 'cases', 'called', 'known', 'means', 'way',
+        'number', 'order', 'part', 'parts', 'form', 'point', 'end',
+        'time', 'set', 'problem', 'result', 'results', 'step', 'following',
+        'two', 'three', 'four', 'five', 'second', 'third',
+        'may', 'must', 'often', 'etc', 'e.g', 'i.e',
     }
 
     tokenized_docs = [doc.page_content.lower().split() for doc in docs]
-    all_tokens = [token for doc in tokenized_docs 
-                  for token in doc if token not in stop_words and len(token) > 2]
-    
-    word_freq = Counter(all_tokens).most_common(250)
+    # Strip punctuation from tokens and filter noise
+    cleaned = []
+    for doc_tokens in tokenized_docs:
+        for raw in doc_tokens:
+            token = re.sub(r'^[^a-z0-9]+|[^a-z0-9]+$', '', raw)
+            if token and token not in stop_words and len(token) > 2 and not token.isdigit():
+                cleaned.append(token)
+
+    word_freq = Counter(cleaned).most_common(500)
     
     scores = [freq for _, freq in word_freq]
     
     return dict(zip([w for w, f in word_freq], scores))
 
-async def ingest_docs(force: bool = False):
+CHROMA_BATCH_SIZE = 500  # embed in batches to avoid OOM
+CHROMA_PROGRESS_PATH = Path("cache/chroma_progress.json")
+
+# ── Shared log sink (read by api.py for frontend streaming) ──────────────────
+_reingest_log: list[str] = []
+
+def _log(msg: str):
+    """Append msg to the shared log list AND print to stdout."""
+    _reingest_log.append(msg)
+    print(msg, flush=True)
+
+
+def _save_chroma_progress(batch_idx: int, total_batches: int):
+    with open(CHROMA_PROGRESS_PATH, 'w') as f:
+        json.dump({"batch_done": batch_idx, "total": total_batches}, f)
+
+
+def _load_chroma_progress() -> int:
+    """Return the 0-based index of the NEXT batch to process (resume point)."""
+    if CHROMA_PROGRESS_PATH.exists():
+        try:
+            with open(CHROMA_PROGRESS_PATH) as f:
+                data = json.load(f)
+            return data.get("batch_done", 0)
+        except Exception:
+            pass
+    return 0
+
+
+def _clear_chroma_progress():
+    if CHROMA_PROGRESS_PATH.exists():
+        CHROMA_PROGRESS_PATH.unlink()
+
+
+def _add_to_chroma_batched(docs, embeddings, persist_directory, resume: bool = False):
+    """Add documents to Chroma in batches. Resumable: skips already-done batches."""
+    total = len(docs)
+    if total == 0:
+        return
+    total_batches = (total - 1) // CHROMA_BATCH_SIZE + 1
+    start_batch = _load_chroma_progress() if resume else 0
+    if start_batch > 0:
+        _log(f"Resuming Chroma embedding from batch {start_batch + 1}/{total_batches}")
+    for batch_idx in range(start_batch, total_batches):
+        i = batch_idx * CHROMA_BATCH_SIZE
+        batch = docs[i:i + CHROMA_BATCH_SIZE]
+        try:
+            Chroma.from_documents(batch, embedding=embeddings, persist_directory=persist_directory)
+            _save_chroma_progress(batch_idx + 1, total_batches)
+            _log(f"Chroma batch {batch_idx + 1}/{total_batches}: embedded {len(batch)} chunks")
+        except Exception as e:
+            _save_chroma_progress(batch_idx, total_batches)
+            raise RuntimeError(
+                f"Chroma batch {batch_idx + 1}/{total_batches} failed: {e}  "
+                f"(resume will continue from batch {batch_idx + 1})"
+            ) from e
+    _clear_chroma_progress()
+
+
+def ingest_docs(force: bool = False):
     """Ingest PDFs from DATA_DIR.
 
     If force is True, rebuilds from scratch (clears Chroma). Otherwise it will
     load any existing cached splits and only process new PDF files, appending
     their chunks to the existing index and adding new vectors to Chroma.
+
+    Chroma embedding is resumable: if a previous force-rebuild crashed mid-batch,
+    calling this again with force=True will skip already-embedded batches.
     """
+    _reingest_log.clear()
     splits_path = Path("cache/splits.pkl")
     existing_splits = []
+
+    # On force rebuild, check if we have a partially-completed Chroma run
+    resuming = force and _load_chroma_progress() > 0 and os.path.exists(CHROMA_DIR)
+
     if not force and splits_path.exists():
         try:
             with splits_path.open('rb') as f:
                 existing_splits = pickle.load(f)
-            print(f"Loaded {len(existing_splits)} existing chunks from cache")
+            _log(f"Loaded {len(existing_splits)} existing chunks from cache")
         except Exception as e:
-            print(f"Failed to load existing splits.pkl: {e}")
+            _log(f"Failed to load existing splits.pkl: {e}")
             existing_splits = []
 
-    # load all pdf documents (langchain loader returns a list of Documents)
-    loader = DirectoryLoader(DATA_DIR, glob="**/*.pdf", loader_cls=PyPDFLoader)
-    all_docs = loader.load()
+    # If resuming we already have splits.pkl and enriched docs — just redo Chroma
+    if resuming and splits_path.exists():
+        _log("Detected interrupted Chroma build -- resuming where we left off")
+        with splits_path.open('rb') as f:
+            combined_splits = pickle.load(f)
+        _log(f"Loaded {len(combined_splits)} cached chunks")
+
+        # rebuild enriched docs list (same order as original build)
+        cleaned_all = []
+        for doc in combined_splits:
+            clean_doc = doc.copy()
+            clean_doc.metadata = _enrich_metadata(doc)
+            cleaned_all.append(clean_doc)
+
+        embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+        _log(f"Resuming Chroma embedding ({len(cleaned_all)} chunks, batch size {CHROMA_BATCH_SIZE})...")
+        _add_to_chroma_batched(cleaned_all, embeddings, CHROMA_DIR, resume=True)
+        _log(f"Chroma DB complete: {len(cleaned_all)} docs at {CHROMA_DIR}")
+
+        # Load topic map from cache
+        top_keywords = {}
+        if os.path.exists(TOPIC_MAP_PATH):
+            with open(TOPIC_MAP_PATH) as f:
+                top_keywords = json.load(f)
+
+        _write_index_metadata(len(combined_splits))
+        documents = load_pdfs(DATA_DIR)
+        _log(f"Resume complete: {len(combined_splits)} chunks, {len(top_keywords)} keywords")
+        return documents, top_keywords
+
+    # ── Full run (non-resume path) ───────────────────────────────────────────
+
+    # Load PDFs one-by-one so a bad file doesn't kill the whole batch
+    pdf_dir = Path(DATA_DIR)
+    pdf_files = sorted(pdf_dir.glob("**/*.pdf"))
+    _log(f"Found {len(pdf_files)} PDF files in {DATA_DIR}")
+
+    all_docs = []
+    failed_files = []
+    for idx, pdf in enumerate(pdf_files, 1):
+        try:
+            loader = PyPDFLoader(str(pdf))
+            pages = loader.load()
+            all_docs.extend(pages)
+            _log(f"PDF {idx}/{len(pdf_files)}: {pdf.name} ({len(pages)} pages)")
+        except Exception as e:
+            failed_files.append((str(pdf.name), str(e)))
+            _log(f"SKIP PDF {idx}/{len(pdf_files)}: {pdf.name} -- {e}")
+
+    if failed_files:
+        _log(f"WARNING: {len(failed_files)} PDFs failed to load, continuing with {len(all_docs)} pages")
+    else:
+        _log(f"Loaded {len(all_docs)} pages from {len(pdf_files)} PDFs")
 
     # determine which source files are already present
     existing_sources = set()
@@ -88,35 +335,34 @@ async def ingest_docs(force: bool = False):
         if src:
             existing_sources.add(Path(src).resolve())
 
-    # identify new docs (by source path)
+    # identify new docs (by source path) -- deduplicate path lists
     new_docs = []
-    new_paths = []
-    skipped_paths = []
+    new_path_set: set[str] = set()
+    skipped_path_set: set[str] = set()
     for doc in all_docs:
         md = getattr(doc, 'metadata', {})
         src = md.get('source') or md.get('file_path')
         resolved = Path(src).resolve() if src else None
         if resolved and resolved in existing_sources:
-            skipped_paths.append(str(resolved))
+            skipped_path_set.add(str(resolved))
             continue
         new_docs.append(doc)
         if resolved:
-            new_paths.append(str(resolved))
+            new_path_set.add(str(resolved))
 
-    if new_paths:
-        print("New files to ingest:")
-        for p in new_paths:
-            print(" -", p)
-    if skipped_paths:
-        print("Skipped (already ingested):")
-        for p in skipped_paths:
-            print(" -", p)
+    if new_path_set:
+        _log(f"New files to ingest ({len(new_path_set)})")
+        for p in sorted(new_path_set):
+            _log(f"  - {Path(p).name}")
+    if skipped_path_set:
+        _log(f"Skipped {len(skipped_path_set)} already-ingested files")
 
     if not new_docs and existing_splits and not force:
-        print("No new documents to ingest; using existing index.")
-        # still return loaded PDFs and topic map
-        with open(TOPIC_MAP_PATH, 'r') as f:
-            topic_map = json.load(f) if os.path.exists(TOPIC_MAP_PATH) else {}
+        _log("No new documents to ingest; using existing index.")
+        topic_map = {}
+        if os.path.exists(TOPIC_MAP_PATH):
+            with open(TOPIC_MAP_PATH, 'r') as f:
+                topic_map = json.load(f)
         documents = load_pdfs(DATA_DIR)
         return documents, topic_map
 
@@ -126,65 +372,67 @@ async def ingest_docs(force: bool = False):
         new_splits = splitter.split_documents(new_docs)
     combined_splits = existing_splits + new_splits
 
-    print(f"Loaded {len(new_splits)} new chunks (total {len(combined_splits)})")
+    _log(f"Split into {len(new_splits)} new chunks (total {len(combined_splits)})")
 
-    print("Extracting top keywords from corpus...")
+    _log("Extracting keywords from corpus...")
     top_keywords = extract_keywords_from_corpus(combined_splits)
-    print(f"Found {len(top_keywords)} key topics...")
+    _log(f"Found {len(top_keywords)} keywords")
 
     # rebuild BM25 from combined splits
+    _log("Building BM25 index...")
     tokenized_docs = [doc.page_content.lower().split() for doc in combined_splits]
     bm25_idx = BM25Okapi(tokenized_docs)
     pickle.dump(bm25_idx, Path("cache/global_bm25.pkl").open('wb'))
-    print(f"Built BM25 index: {len(combined_splits)} chunks")
+    _log(f"Built BM25 index: {len(combined_splits)} chunks")
 
     with open(TOPIC_MAP_PATH, 'w') as f:
         json.dump(top_keywords, f, indent=2)
 
-    print("Updating Chroma vector DB...")
+    # Cache splits BEFORE Chroma so resume can reload them
+    with Path("cache/splits.pkl").open('wb') as f:
+        pickle.dump(combined_splits, f)
+    _log("Saved splits.pkl (BM25 + resume checkpoint)")
+
+    _log("Starting Chroma vector DB embedding...")
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
 
-    # prepare only the new splits for insertion to avoid re-embedding everything
+    # prepare only the new splits for insertion -- enrich metadata with topic
     cleaned_new = []
     for doc in new_splits:
         clean_doc = doc.copy()
-        clean_doc.metadata = {k: v for k, v in doc.metadata.items() if k not in ['source', 'file_path']}
+        clean_doc.metadata = _enrich_metadata(doc)
         cleaned_new.append(clean_doc)
 
     if os.path.exists(CHROMA_DIR) and not force:
         if cleaned_new:
-            # Add only new documents to existing Chroma store
-            Chroma.from_documents(cleaned_new, embedding=embeddings, persist_directory=CHROMA_DIR)
-            print(f"Appended {len(cleaned_new)} documents to Chroma at {CHROMA_DIR}")
+            _add_to_chroma_batched(cleaned_new, embeddings, CHROMA_DIR)
+            _log(f"Appended {len(cleaned_new)} chunks to Chroma")
         else:
-            print("No new documents to add to Chroma.")
+            _log("No new documents to add to Chroma.")
     else:
         # fresh build (either no CHROMA_DIR or force requested)
         if os.path.exists(CHROMA_DIR):
-            print(f"Clearing old Chroma database at {CHROMA_DIR}...")
+            _log(f"Clearing old Chroma database...")
             shutil.rmtree(CHROMA_DIR)
+        _clear_chroma_progress()
         cleaned_all = []
         for doc in combined_splits:
             clean_doc = doc.copy()
-            clean_doc.metadata = {k: v for k, v in doc.metadata.items() if k not in ['source', 'file_path']}
+            clean_doc.metadata = _enrich_metadata(doc)
             cleaned_all.append(clean_doc)
-        Chroma.from_documents(cleaned_all, embedding=embeddings, persist_directory=CHROMA_DIR)
-        print(f"Built Chroma DB with {len(cleaned_all)} documents at {CHROMA_DIR}")
-
-    # cache updated splits for BM25
-    with Path("cache/splits.pkl").open('wb') as f:
-        pickle.dump(combined_splits, f)
-    print("✓ Cached splits.pkl for BM25")
+        _log(f"Embedding {len(cleaned_all)} chunks into Chroma (batch size {CHROMA_BATCH_SIZE})...")
+        _add_to_chroma_batched(cleaned_all, embeddings, CHROMA_DIR)
+        _log(f"Chroma DB built: {len(cleaned_all)} docs")
 
     _write_index_metadata(len(combined_splits))
 
     documents = load_pdfs(DATA_DIR)
 
-    print(f"Ingest complete: {len(combined_splits)} chunks → {len(documents)} PDFs, {len(top_keywords)} keywords, BM25 ready")
+    _log(f"Ingest complete: {len(combined_splits)} chunks, {len(documents)} PDFs, {len(top_keywords)} keywords")
     return documents, top_keywords
 
 
-async def ingest_file(file_path: str):
+def ingest_file(file_path: str):
     """Ingest a single PDF file (path relative to DATA_DIR or absolute).
 
     Returns (documents, topic_map) similar to ingest_docs, or raises on error.
@@ -242,7 +490,7 @@ async def ingest_file(file_path: str):
     cleaned_new = []
     for doc in new_splits:
         clean_doc = doc.copy()
-        clean_doc.metadata = {k: v for k, v in doc.metadata.items() if k not in ['source', 'file_path']}
+        clean_doc.metadata = _enrich_metadata(doc)
         cleaned_new.append(clean_doc)
 
     if os.path.exists(CHROMA_DIR):
@@ -252,7 +500,7 @@ async def ingest_file(file_path: str):
         cleaned_all = []
         for doc in combined_splits:
             clean_doc = doc.copy()
-            clean_doc.metadata = {k: v for k, v in doc.metadata.items() if k not in ['source', 'file_path']}
+            clean_doc.metadata = _enrich_metadata(doc)
             cleaned_all.append(clean_doc)
         Chroma.from_documents(cleaned_all, embedding=embeddings, persist_directory=CHROMA_DIR)
 
@@ -315,7 +563,7 @@ async def batch_ingest_all(verbose: bool = True):
     if verbose:
         print()
         print("="*70)
-        print("✓ INGESTION COMPLETE")
+        print("INGESTION COMPLETE")
         print("="*70)
         
         if topic_map:

@@ -121,7 +121,7 @@ def build_runtime_error_notes(
             else:
                 runtime_error_note = (
                     "RUNTIME_ERRORS_DETECTED:\n"
-                    f"```\n{run_result.stderr[:2000]}\n```\n\n"
+                    f"```\n{run_result.stderr[:4000]}\n```\n\n"
                     "Output ONE SEARCH/REPLACE block per error fix."
                 )
             logger.info("Compiler errors detected in %s", path)
@@ -327,7 +327,7 @@ def _language_prefilter(chunks: list, file_ext: str) -> list:
     return filtered
 
 
-# ---------- RRF (Reciprocal Rank Fusion) for hybrid retrieval ----------
+# ---------- RRF for hybrid retrieval ----------
 
 def _doc_key(doc) -> tuple:
     """Create a unique key for a doc (matching rag_brain.py implementation)."""

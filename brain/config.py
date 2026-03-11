@@ -79,8 +79,14 @@ LANG_CHECK_CMD: dict[str, list[str]] = {
 # Lint commands per extension (deeper analysis beyond basic compilation)
 # These are only used when the binary is found on PATH.
 LANG_LINT_CMD: dict[str, list[str]] = {
-    '.go':  ['go', 'vet'],
-    '.py':  ['ruff', 'check', '--select', 'E,F,W'],
+    '.go':   ['go', 'vet'],
+    '.py':   ['ruff', 'check', '--select', 'E,F,W'],
+    '.cpp':  ['clang-tidy'],
+    '.c':    ['clang-tidy'],
+    '.rs':   ['cargo', 'clippy', '--message-format=short', '--quiet'],
+    '.java': ['javac', '-Xlint:all'],
+    '.ts':   ['npx', 'eslint'],
+    '.js':   ['npx', 'eslint'],
 }
 
 # Query enhancement keywords for RAG search
@@ -92,6 +98,14 @@ LANG_QUERY_ENHANCEMENT: dict[str, str] = {
     '.cs': 'C# programming', '.rb': 'Ruby programming',
     '.php': 'PHP programming', '.swift': 'Swift programming',
     '.kt': 'Kotlin programming',
+}
+
+# Extension → RAG topic labels (used to build context-aware topic filters).
+# Always combines with ["algorithms", "clean-code"] for code-editing tasks.
+EXT_TO_TOPIC: dict[str, str] = {
+    '.py': 'python', '.go': 'go', '.cpp': 'cpp', '.c': 'cpp',
+    '.rs': 'rust', '.js': 'web', '.ts': 'web',
+    '.java': 'java', '.kt': 'java',
 }
 
 # Document source keywords for language-aware chunk filtering

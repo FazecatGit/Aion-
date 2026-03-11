@@ -39,7 +39,7 @@ def _detect_language(file_path: str) -> str:
     lang_map = {
         ".py": "python", ".go": "go", ".ts": "typescript", ".tsx": "typescript",
         ".js": "javascript", ".jsx": "javascript", ".cpp": "cpp", ".c": "c",
-        ".h": "cpp", ".hpp": "cpp", ".rs": "rust",
+        ".h": "cpp", ".hpp": "cpp", ".rs": "rust", ".java": "java",
     }
     return lang_map.get(ext, "unknown")
 
@@ -162,6 +162,50 @@ def run_tsc_check(file_path: str) -> dict:
     }
 
 
+def run_clang_tidy(file_path: str, fix: bool = False) -> dict:
+    """Run clang-tidy on a C/C++ file."""
+    cmd = ["clang-tidy", file_path]
+    if fix:
+        cmd.append("--fix")
+    result = _run(cmd, timeout=30)
+    issues = [line for line in result["stdout"].splitlines()
+              if "warning:" in line or "error:" in line]
+    return {
+        "tool": "clang-tidy",
+        "file": file_path,
+        "diagnostics": issues,
+        "count": len(issues),
+    }
+
+
+def run_clippy(file_path: str) -> dict:
+    """Run cargo clippy on a Rust file (requires a Cargo project)."""
+    cwd = str(Path(file_path).parent)
+    result = _run(["cargo", "clippy", "--message-format=short", "--quiet"], cwd=cwd, timeout=60)
+    output = result["stderr"] or result["stdout"]
+    issues = [line for line in output.splitlines()
+              if "warning" in line.lower() or "error" in line.lower()]
+    return {
+        "tool": "clippy",
+        "file": file_path,
+        "diagnostics": issues,
+        "count": len(issues),
+    }
+
+
+def run_javac_check(file_path: str) -> dict:
+    """Run javac syntax check on a Java file (compile-only, no output)."""
+    result = _run(["javac", "-Xlint:all", "-d", tempfile.mkdtemp(), file_path], timeout=30)
+    issues = [line for line in result["stderr"].splitlines()
+              if "warning" in line.lower() or "error" in line.lower()]
+    return {
+        "tool": "javac",
+        "file": file_path,
+        "diagnostics": issues,
+        "count": len(issues),
+    }
+
+
 def lint_file(file_path: str, fix: bool = False) -> dict:
     """Auto-detect language and run the appropriate linter."""
     _LINTER_DISPATCH = {
@@ -169,6 +213,8 @@ def lint_file(file_path: str, fix: bool = False) -> dict:
         "go":         lambda fp, fx: run_go_vet(fp),
         "typescript": lambda fp, fx: run_eslint(fp, fix=fx),
         "javascript": lambda fp, fx: run_eslint(fp, fix=fx),
+        "rust":       lambda fp, fx: run_clippy(fp),
+        "java":       lambda fp, fx: run_javac_check(fp),
     }
 
     lang = _detect_language(file_path)
@@ -176,7 +222,11 @@ def lint_file(file_path: str, fix: bool = False) -> dict:
     if handler:
         return handler(file_path, fix)
 
+    # C/C++: prefer clang-tidy (richer diagnostics), fall back to gcc/g++ -fsyntax-only
     if lang in ("cpp", "c"):
+        from shutil import which
+        if which("clang-tidy"):
+            return run_clang_tidy(file_path, fix=fix)
         compiler = "g++" if lang == "cpp" else "gcc"
         result = _run([compiler, "-fsyntax-only", "-Wall", "-Wextra", file_path])
         issues = [line for line in result["stderr"].splitlines() if line.strip()]

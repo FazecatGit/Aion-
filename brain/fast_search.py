@@ -62,7 +62,7 @@ def _bm25_search_single(query: str, bm25_idx: Any, all_chunks: list, top_k: int)
     return [(float(scores[i]), i) for i in ranked]
 
 
-def fast_topic_search(query: str, return_scores: bool = False, top_k: int = 20, candidate_k: int = 100, rerank_method: str = "keyword"):
+def fast_topic_search(query: str, return_scores: bool = False, top_k: int = 20, candidate_k: int = 100, rerank_method: str = "keyword", topic_filter: list[str] | None = None):
     """
     BM25 search with multi-query expansion and keyword reranking.
     - Generates query variants (no LLM needed, instant)
@@ -107,7 +107,15 @@ def fast_topic_search(query: str, return_scores: bool = False, top_k: int = 20, 
     # --- Rerank the candidate pool using specified method ---
     from .query_pipeline import rerank_documents
     from .config import CROSS_ENCODER_MODEL, RERANK_BATCH_SIZE
-    
+
+    # Apply topic filter if provided (e.g. ["algorithms", "clean-code"])
+    if topic_filter:
+        allowed = set(topic_filter)
+        candidates = [c for c in candidates if c.metadata.get("topic", "general") in allowed]
+        if not candidates:
+            # Fall back to unfiltered if filter eliminated everything
+            candidates = [all_chunks[idx] for idx, _ in ranked_pool if idx < len(all_chunks)]
+
     reranked = rerank_documents(
         docs=candidates,
         query=query,
