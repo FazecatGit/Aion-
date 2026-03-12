@@ -494,6 +494,11 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
         'sliding window', 'two pointer', 'divide and conquer', 'memoization',
         'knapsack', 'shortest path', 'topological', 'segment tree',
         'leetcode', 'competitive', 'time complexity', 'space complexity',
+        'big o', 'data structure', 'algorithmic problem', 'coding challenge',
+        'dijkstra', 'floyd warshall', 'bellman ford', 'union find', 'disjoint set',
+        'fibonacci', 'longest common', 'edit distance', 'subarray', 'subsequence',
+        'palindrome', 'anagram', 'permutation', 'combination', 'bit manipulation',
+        'recurrence relation', 'catalan', 'branch and bound',
     ]
     _inst_lower = instruction.lower()
     algo_topic_filter = None

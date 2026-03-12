@@ -1,7 +1,12 @@
 import asyncio
+import logging
+import json
+import time
 import warnings
+from collections import deque
 from fastapi import FastAPI, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
@@ -18,12 +23,52 @@ from brain.config import DATA_DIR
 
 warnings.filterwarnings("ignore")
 
+_api_log = logging.getLogger("tutor")  # reuse the tutor logger so messages flow to SSE
+
 raw_docs = []
 chat_store = ChatSessionStore()
+
+# ── Process log streaming (SSE) ───────────────────────────────────────────────
+# Captures logs from agent/brain modules and streams them to the frontend
+# in real-time via Server-Sent Events so the user can see backend thinking.
+
+_LOG_SUBSCRIBERS: list[asyncio.Queue] = []
+_LOG_HISTORY: deque = deque(maxlen=200)  # keep last 200 log entries for late joiners
+
+
+class _SSELogHandler(logging.Handler):
+    """Logging handler that pushes records into all active SSE subscriber queues."""
+
+    def emit(self, record: logging.LogRecord):
+        entry = {
+            "ts": time.time(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": self.format(record),
+        }
+        _LOG_HISTORY.append(entry)
+        for q in _LOG_SUBSCRIBERS:
+            try:
+                q.put_nowait(entry)
+            except asyncio.QueueFull:
+                pass  # slow consumer — drop oldest
+
+
+def _setup_log_streaming():
+    """Attach SSE handler to all agent/brain loggers."""
+    handler = _SSELogHandler()
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(name)s | %(message)s"))
+    for name in ("code_agent", "multi_agent", "tool_hooks", "ocr", "voice_io", "chat_session_store", "tutor"):
+        lg = logging.getLogger(name)
+        lg.addHandler(handler)
+        lg.setLevel(logging.DEBUG)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global raw_docs
+    _setup_log_streaming()
     raw_docs = load_pdfs(DATA_DIR)
     initialize_bm25(raw_docs)
     yield
@@ -50,6 +95,40 @@ async def health_check():
     except Exception:
         pass
     return {"status": "ok", "llm_connected": llm_ok, "llm_model": llm_model}
+
+
+# ── Process log SSE stream ────────────────────────────────────────────────────
+@app.get("/process/logs")
+async def process_logs_stream():
+    """SSE stream of backend process logs (agent thinking, RAG search, etc.)."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+    _LOG_SUBSCRIBERS.append(queue)
+
+    async def event_generator():
+        try:
+            # Send recent history so late joiners see context
+            for entry in list(_LOG_HISTORY)[-50:]:
+                yield f"data: {json.dumps(entry)}\n\n"
+            # Stream new logs as they arrive
+            while True:
+                try:
+                    entry = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(entry)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"  # prevent connection timeout
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _LOG_SUBSCRIBERS.remove(queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/process/logs/history")
+async def process_logs_history():
+    """Return recent log history (last 200 entries) for initial load."""
+    return {"logs": list(_LOG_HISTORY)}
 
 
 class QueryRequest(BaseModel):
@@ -1042,22 +1121,39 @@ class TutorHintRequest(BaseModel):
 
 @app.post("/tutor/start")
 async def tutor_start(req: TutorStartRequest):
-    """Generate a new tutor problem."""
-    from agent.tutor import generate_problem
-    result = generate_problem(
-        topic=req.topic,
-        difficulty=req.difficulty,
-        language=req.language,
-        style=req.style,
-    )
+    """Generate a new tutor problem. Auto-detects math topics and routes to math tutor."""
+    from agent.tutor import generate_problem, generate_math_problem, is_math_topic
+    _is_math = is_math_topic(req.topic)
+    _api_log.info("[API] /tutor/start — topic=%s, math=%s, style=%s", req.topic, _is_math, req.style)
+    if _is_math:
+        # Route to math-specific problem generation
+        math_style = "mcq" if req.style == "mcq" else "solve"
+        result = generate_math_problem(
+            topic=req.topic,
+            difficulty=req.difficulty,
+            style=math_style,
+        )
+    else:
+        result = generate_problem(
+            topic=req.topic,
+            difficulty=req.difficulty,
+            language=req.language,
+            style=req.style,
+        )
+    _api_log.info("[API] /tutor/start — done ✓")
     return {"status": "ok", **result}
 
 
 @app.post("/tutor/check")
 async def tutor_check(req: TutorAnswerRequest):
-    """Check the user's answer (MCQ letter or free text)."""
-    from agent.tutor import check_answer
-    result = check_answer(req.session_id, req.answer)
+    """Check the user's answer (MCQ letter, free text, or math answer)."""
+    _api_log.info("[API] /tutor/check — session=%s", req.session_id)
+    from agent.tutor import check_answer, check_math_answer, _tutor_sessions
+    state = _tutor_sessions.get(req.session_id)
+    if state and state.get("is_math"):
+        result = check_math_answer(req.session_id, req.answer)
+    else:
+        result = check_answer(req.session_id, req.answer)
     return {"status": "ok", **result}
 
 
@@ -1083,3 +1179,86 @@ async def tutor_learnings(topic: str = "", language: str = "", limit: int = 5):
     from agent.tutor import get_agent_learnings
     learnings = get_agent_learnings(topic=topic, language=language, limit=limit)
     return {"status": "ok", "learnings": learnings}
+
+
+# ── Math Tutor endpoints ───────────────────────────────────────────────────
+
+class MathStartRequest(BaseModel):
+    topic: str
+    difficulty: str = "medium"
+    style: str = "solve"  # "solve", "mcq", "proof"
+
+class MathAnswerRequest(BaseModel):
+    session_id: str
+    answer: str
+
+class MathEvalRequest(BaseModel):
+    expression: str
+    variable: str = "x"
+    values: Optional[list] = None  # custom x-values; defaults to -10..10
+
+class MatrixRequest(BaseModel):
+    operation: str  # "add", "subtract", "multiply", "determinant", "inverse", "transpose"
+    matrices: list  # list of 2D arrays
+
+
+@app.post("/math/start")
+async def math_start(req: MathStartRequest):
+    """Generate a new math practice problem with lesson and step-by-step solution."""
+    _api_log.info("[API] /math/start — topic=%s, difficulty=%s, style=%s", req.topic, req.difficulty, req.style)
+    from agent.tutor import generate_math_problem
+    result = generate_math_problem(topic=req.topic, difficulty=req.difficulty, style=req.style)
+    _api_log.info("[API] /math/start — done ✓")
+    return {"status": "ok", **result}
+
+
+@app.post("/math/check")
+async def math_check(req: MathAnswerRequest):
+    """Check a math answer (supports equivalent forms via LLM evaluation)."""
+    _api_log.info("[API] /math/check — session=%s", req.session_id)
+    from agent.tutor import check_math_answer
+    result = check_math_answer(req.session_id, req.answer)
+    _api_log.info("[API] /math/check — done ✓")
+    return {"status": "ok", **result}
+
+
+@app.post("/math/hint")
+async def math_hint(req: TutorHintRequest):
+    """Get the next progressive hint for a math problem."""
+    _api_log.info("[API] /math/hint — session=%s", req.session_id)
+    from agent.tutor import get_hint
+    result = get_hint(req.session_id)
+    _api_log.info("[API] /math/hint — done ✓")
+    return {"status": "ok", **result}
+
+
+@app.get("/math/steps/{session_id}")
+async def math_steps(session_id: str):
+    """Get the full step-by-step solution (available after solving or 3 attempts)."""
+    _api_log.info("[API] /math/steps — session=%s", session_id)
+    from agent.tutor import get_math_step_by_step
+    result = get_math_step_by_step(session_id)
+    _api_log.info("[API] /math/steps — done ✓")
+    return {"status": "ok", **result}
+
+
+@app.post("/math/evaluate")
+async def math_evaluate(req: MathEvalRequest):
+    """Evaluate a math expression at given points for interactive graphing."""
+    _api_log.info("[API] /math/evaluate — expr=%s", req.expression[:40])
+    from agent.tutor import evaluate_math_expression
+    result = evaluate_math_expression(
+        expression=req.expression,
+        variable=req.variable,
+        values=req.values,
+    )
+    _api_log.info("[API] /math/evaluate — done ✓")
+    return {"status": "ok", **result}
+
+
+@app.post("/math/matrix")
+async def math_matrix(req: MatrixRequest):
+    """Solve a matrix operation with step-by-step solution."""
+    from agent.tutor import solve_matrix_problem
+    result = solve_matrix_problem(operation=req.operation, matrices=req.matrices)
+    return {"status": "ok", **result}

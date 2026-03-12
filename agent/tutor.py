@@ -9,11 +9,14 @@ import json
 import re
 import uuid
 import random
+import logging
 from datetime import datetime
 from typing import Optional
 
 from langchain_ollama import OllamaLLM
 from brain.config import LLM_MODEL, LLM_TEMPERATURE
+
+logger = logging.getLogger("tutor")
 
 # In-memory store of active tutor sessions  {session_id: TutorState}
 _tutor_sessions: dict[str, dict] = {}
@@ -681,3 +684,620 @@ def get_agent_learnings(topic: str = "", language: str = "", limit: int = 5) -> 
         lang_lower = language.lower()
         results = [l for l in results if lang_lower in l.get("language", "").lower()]
     return results[-limit:]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MATH TOPICS — for detecting when to use math tutor mode
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_MATH_TOPIC_KEYWORDS = {
+    'calculus', 'derivative', 'integration', 'integral', 'differentiation',
+    'linear algebra', 'matrix', 'matrices', 'vector', 'eigenvalue',
+    'statistics', 'probability', 'discrete math', 'geometry', 'trigonometry',
+    'optimization', 'number theory', 'combinatorics', 'polynomial',
+    'quadratic', 'logarithm', 'exponential', 'limit', 'continuity',
+    'taylor series', 'fourier', 'laplace', 'differential equation',
+    'partial derivative', 'gradient', 'divergence', 'curl',
+    'determinant', 'inverse matrix', 'systems of equations',
+    'permutation', 'combination', 'binomial', 'factoring',
+    'arithmetic', 'modular arithmetic', 'prime', 'gcd', 'lcm',
+    'complex number', 'imaginary', 'sin', 'cos', 'tan', 'pythagorean',
+    'area', 'volume', 'perimeter', 'mean', 'median', 'variance',
+    'standard deviation', 'regression', 'hypothesis', 'bayes',
+    'math', 'equation', 'simplify', 'evaluate', 'prove',
+}
+
+
+def is_math_topic(topic: str) -> bool:
+    """Return True if the topic string relates to mathematics."""
+    t = topic.lower()
+    return any(kw in t for kw in _MATH_TOPIC_KEYWORDS)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MATH PROBLEM GENERATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_math_problem(
+    topic: str,
+    difficulty: str = "medium",
+    style: str = "solve",  # "solve" | "mcq" | "proof"
+) -> dict:
+    """Generate a math practice problem with step-by-step solution.
+
+    Returns dict with keys:
+      session_id, style, question, correct_answer, steps, hints, lesson
+    """
+    logger.info("[MATH] Generating %s problem — topic=%s, difficulty=%s", style, topic, difficulty)
+    # Generate a math lesson first
+    logger.info("[MATH] Step 1/3: Generating lesson for '%s'...", topic)
+    lesson = _generate_math_lesson(topic, difficulty)
+    logger.info("[MATH] Step 1/3: Lesson generated ✓")
+
+    # Build variation context
+    history_key = (f"math:{topic.lower()}", difficulty, style)
+    prev_questions = _question_history.get(history_key, [])
+    variation_note = ""
+    if prev_questions:
+        recent = prev_questions[-5:]
+        avoid_list = "\n".join(f"  - {q}" for q in recent)
+        variation_note = (
+            f"\n\nIMPORTANT: The student has already seen these problems. "
+            f"Generate a COMPLETELY DIFFERENT problem:\n{avoid_list}\n"
+        )
+
+    angles = [
+        "Focus on a common mistake students make.",
+        "Use a real-world application context.",
+        "Test understanding of edge cases.",
+        "Require multiple steps to solve.",
+        "Combine two related concepts.",
+        "Use larger or unusual numbers.",
+    ]
+    random_angle = random.choice(angles)
+
+    logger.info("[MATH] Step 2/3: Invoking LLM to generate %s problem...", style)
+    llm = _llm(temperature=0.6)
+
+    if style == "mcq":
+        prompt = f"""Generate a multiple-choice math question about {topic} at {difficulty} difficulty.
+
+Angle: {random_angle}
+{variation_note}
+Return ONLY a JSON object:
+{{
+  "question": "The math question with any necessary equations (use plain text math notation)",
+  "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
+  "correct_answer": "A",
+  "steps": [
+    "Step 1: description of first step with computation",
+    "Step 2: description of next step",
+    "Step 3: final step arriving at the answer"
+  ],
+  "explanation": "Why the correct answer is right and common mistakes",
+  "hints": ["First hint", "Second hint"]
+}}"""
+    elif style == "proof":
+        prompt = f"""Generate a mathematical proof problem about {topic} at {difficulty} difficulty.
+
+Angle: {random_angle}
+{variation_note}
+Return ONLY a JSON object:
+{{
+  "question": "Prove that ... (clear statement of what to prove)",
+  "correct_answer": "A model proof with clear logical steps",
+  "steps": [
+    "Step 1: State what we need to prove",
+    "Step 2: Key insight or lemma",
+    "Step 3: Main argument",
+    "Step 4: Conclusion"
+  ],
+  "key_points": ["Key concept 1", "Key concept 2"],
+  "hints": ["First hint about approach", "Second hint with more detail"]
+}}"""
+    else:  # solve
+        prompt = f"""Generate a math problem to solve about {topic} at {difficulty} difficulty.
+
+Angle: {random_angle}
+{variation_note}
+The problem should require step-by-step computation. Provide specific numbers.
+
+Return ONLY a JSON object:
+{{
+  "question": "The problem statement with specific values (use plain text math notation like x^2 for x squared, sqrt(x) for square root)",
+  "correct_answer": "The final numerical or symbolic answer",
+  "steps": [
+    "Step 1: Identify what we need to find and write the equation",
+    "Step 2: Apply the relevant formula or technique",
+    "Step 3: Simplify or compute",
+    "Step 4: State the final answer"
+  ],
+  "hints": ["First hint about what technique to use", "Second hint with more detail", "Third hint nearly giving the approach"],
+  "related_formulas": ["Formula 1: description", "Formula 2: description"]
+}}"""
+
+    raw = llm.invoke(prompt)
+    logger.info("[MATH] Step 2/3: LLM response received ✓")
+    try:
+        problem = _parse_json_from_llm(raw)
+        logger.info("[MATH] Step 3/3: Problem parsed successfully ✓")
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("[MATH] Step 3/3: JSON parse failed — using raw text as question")
+        problem = {
+            "question": raw.strip(),
+            "correct_answer": "",
+            "steps": [],
+            "hints": [],
+        }
+
+    # Sanitize
+    problem = _sanitize_problem(problem, style)
+
+    session_id = str(uuid.uuid4())
+    logger.info("[MATH] Problem ready — session=%s", session_id)
+    state = {
+        "session_id": session_id,
+        "style": style,
+        "topic": topic,
+        "difficulty": difficulty,
+        "language": "math",
+        "problem": problem,
+        "lesson": lesson,
+        "hints_given": 0,
+        "attempts": 0,
+        "solved": False,
+        "is_math": True,
+    }
+    _tutor_sessions[session_id] = state
+
+    # Track history
+    question_summary = problem.get("question", "")[:100]
+    if question_summary:
+        _question_history.setdefault(history_key, []).append(question_summary)
+        if len(_question_history[history_key]) > 20:
+            _question_history[history_key] = _question_history[history_key][-20:]
+
+    resp: dict = {
+        "session_id": session_id,
+        "style": style,
+        "question": problem.get("question", ""),
+        "language": "math",
+        "lesson": lesson,
+        "is_math": True,
+    }
+    if style == "mcq":
+        resp["options"] = problem.get("options", [])
+    if style == "solve":
+        resp["related_formulas"] = problem.get("related_formulas", [])
+    return resp
+
+
+def _generate_math_lesson(topic: str, difficulty: str = "medium") -> dict:
+    """Generate a math lesson (not code-based)."""
+    logger.info("[MATH] Generating lesson for '%s' (%s)...", topic, difficulty)
+    llm = _llm(temperature=0.4)
+    prompt = f"""You are an expert math tutor. Generate a concise lesson about "{topic}" at {difficulty} difficulty.
+
+Return ONLY a JSON object:
+{{
+  "title": "Topic Title (e.g. Derivatives - Chain Rule)",
+  "explanation": "Clear 2-4 paragraph explanation of the concept, its meaning, and when to use it. Use plain text math notation.",
+  "rules": [
+    "Rule 1: key formula or theorem with the formula itself",
+    "Rule 2: when and how to apply it",
+    "Rule 3: common pitfall or edge case"
+  ],
+  "example_code": "A worked example problem with step-by-step solution (not code, but a solved problem)",
+  "example_explanation": "Detailed walkthrough of each step in the example",
+  "key_terms": ["term1", "term2", "term3"]
+}}
+
+Use plain text math notation: x^2 for powers, sqrt(x) for roots, dy/dx for derivatives, integral(f(x)dx) for integrals."""
+
+    raw = llm.invoke(prompt)
+    logger.info("[MATH] Lesson LLM response received")
+    try:
+        lesson = _parse_json_from_llm(raw)
+        logger.info("[MATH] Lesson parsed — title: %s", lesson.get("title", "?")[:50])
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("[MATH] Lesson JSON parse failed — using raw text")
+        lesson = {
+            "title": f"{topic}",
+            "explanation": raw.strip(),
+            "rules": [],
+            "example_code": "",
+            "example_explanation": "",
+            "key_terms": [],
+        }
+    return lesson
+
+
+def check_math_answer(session_id: str, user_answer: str) -> dict:
+    """Check a math answer using LLM evaluation for equivalence.
+
+    Math answers can be expressed in many equivalent forms (e.g. 1/2 = 0.5 = 50%),
+    so we use LLM to judge equivalence rather than exact string matching.
+    """
+    logger.info("[MATH] Checking answer for session=%s", session_id)
+    state = _tutor_sessions.get(session_id)
+    if not state:
+        logger.warning("[MATH] Session not found: %s", session_id)
+        return {"error": "Session not found"}
+
+    state["attempts"] += 1
+    problem = state["problem"]
+    style = state["style"]
+
+    if style == "mcq":
+        correct_letter = problem.get("correct_answer", "").strip().upper()
+        user_letter = user_answer.strip().upper()
+        if user_letter and correct_letter and user_letter[0] == correct_letter[0]:
+            state["solved"] = True
+            return {
+                "correct": True,
+                "feedback": problem.get("explanation", "Correct!"),
+                "steps": problem.get("steps", []),
+                "solved": True,
+                "attempts": state["attempts"],
+            }
+        else:
+            return {
+                "correct": False,
+                "feedback": "That's not right. Think about the steps carefully.",
+                "solved": False,
+                "attempts": state["attempts"],
+            }
+
+    # For solve/proof: use LLM to evaluate equivalence
+    logger.info("[MATH] Using LLM to evaluate answer equivalence...")
+    correct = problem.get("correct_answer", "")
+    steps = problem.get("steps", [])
+    llm = _llm(temperature=0.1)
+    prompt = f"""You are grading a student's math answer.
+
+Question: {problem.get('question', '')}
+Correct answer: {correct}
+Student's answer: {user_answer}
+
+The student's answer may be in a different form (e.g., fraction vs decimal, different notation).
+Evaluate if the student's answer is mathematically equivalent to the correct answer.
+
+Return ONLY a JSON object:
+{{
+  "correct": true/false,
+  "feedback": "Specific feedback on what they got right/wrong, referencing their work",
+  "equivalence_note": "If almost correct, explain what's different"
+}}"""
+
+    raw = llm.invoke(prompt)
+    try:
+        result = _parse_json_from_llm(raw)
+    except (json.JSONDecodeError, ValueError):
+        result = {"correct": False, "feedback": raw.strip()}
+
+    is_correct = result.get("correct", False)
+    if is_correct:
+        state["solved"] = True
+
+    logger.info("[MATH] Answer check done — correct=%s, attempts=%d", is_correct, state["attempts"])
+    return {
+        "correct": is_correct,
+        "feedback": result.get("feedback", ""),
+        "steps": steps if is_correct else [],
+        "solved": is_correct,
+        "attempts": state["attempts"],
+    }
+
+
+def get_math_step_by_step(session_id: str) -> dict:
+    """Return the full step-by-step solution for a math problem.
+
+    Only available after solving or after max hints used.
+    """
+    logger.info("[MATH] Fetching step-by-step for session=%s", session_id)
+    state = _tutor_sessions.get(session_id)
+    if not state:
+        logger.warning("[MATH] Session not found: %s", session_id)
+        return {"error": "Session not found"}
+
+    problem = state["problem"]
+    steps = problem.get("steps", [])
+    correct_answer = problem.get("correct_answer", "")
+
+    if state["solved"] or state["attempts"] >= 3:
+        return {
+            "steps": steps,
+            "correct_answer": correct_answer,
+            "explanation": problem.get("explanation", ""),
+        }
+
+    return {
+        "message": "Solve the problem or use hints first. Step-by-step available after 3 attempts.",
+        "attempts": state["attempts"],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MATH EVALUATION — interactive function evaluation for graphing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_math_expression(expression: str, variable: str = "x", values: list = None) -> dict:
+    """Safely evaluate a math expression at given values for interactive graphing.
+
+    Supports: basic arithmetic, trig, log, exp, sqrt, powers.
+    Returns {points: [{x, y}], derivative_points: [{x, y}], expression, derivative_expression}
+    """
+    logger.info("[MATH] Evaluating expression '%s' for graphing (%d points)", expression, len(values) if values else 41)
+    import math as _math
+
+    if values is None:
+        values = [i * 0.5 for i in range(-20, 21)]  # -10 to 10 in 0.5 steps
+
+    # Sanitize expression — only allow safe math operations
+    _SAFE_NAMES = {
+        'sin': _math.sin, 'cos': _math.cos, 'tan': _math.tan,
+        'asin': _math.asin, 'acos': _math.acos, 'atan': _math.atan,
+        'sinh': _math.sinh, 'cosh': _math.cosh, 'tanh': _math.tanh,
+        'sqrt': _math.sqrt, 'abs': abs,
+        'log': _math.log, 'log2': _math.log2, 'log10': _math.log10,
+        'exp': _math.exp, 'pow': pow,
+        'pi': _math.pi, 'e': _math.e,
+        'floor': _math.floor, 'ceil': _math.ceil,
+    }
+
+    # Block anything with dunder, import, exec, eval, os, sys, etc.
+    _BLOCKED = {'import', 'exec', 'eval', 'compile', 'open', 'os', 'sys',
+                '__', 'globals', 'locals', 'getattr', 'setattr', 'delattr'}
+    expr_lower = expression.lower()
+    for blocked in _BLOCKED:
+        if blocked in expr_lower:
+            return {"error": f"Expression contains blocked keyword: {blocked}"}
+
+    # Normalize expression for Python eval
+    normalized = expression.replace('^', '**')
+
+    # Try to compute a symbolic derivative using simple rules
+    derivative_expr = _symbolic_derivative(expression, variable)
+
+    points = []
+    derivative_points = []
+
+    for val in values:
+        safe_globals = {"__builtins__": {}}
+        safe_globals.update(_SAFE_NAMES)
+        safe_globals[variable] = val
+
+        try:
+            y = eval(normalized, safe_globals)  # noqa: S307 — input is sanitized above
+            if isinstance(y, (int, float)) and _math.isfinite(y):
+                points.append({"x": val, "y": round(y, 6)})
+        except Exception:
+            pass
+
+        if derivative_expr:
+            try:
+                deriv_normalized = derivative_expr.replace('^', '**')
+                dy = eval(deriv_normalized, safe_globals)  # noqa: S307
+                if isinstance(dy, (int, float)) and _math.isfinite(dy):
+                    derivative_points.append({"x": val, "y": round(dy, 6)})
+            except Exception:
+                pass
+
+    logger.info("[MATH] Expression evaluated — %d points, %d derivative points", len(points), len(derivative_points))
+    return {
+        "expression": expression,
+        "derivative_expression": derivative_expr or "Could not compute symbolically",
+        "points": points,
+        "derivative_points": derivative_points,
+        "variable": variable,
+    }
+
+
+def _symbolic_derivative(expression: str, variable: str = "x") -> str:
+    """Attempt symbolic differentiation using pattern matching.
+
+    Falls back to LLM for complex expressions.
+    """
+    expr = expression.strip()
+
+    # Simple pattern-based derivatives
+    if variable not in expr:
+        return "0"
+    if expr == variable:
+        return "1"
+    # x^n -> n*x^(n-1)
+    m = re.match(rf'^{re.escape(variable)}\^(\d+)$', expr)
+    if m:
+        n = int(m.group(1))
+        if n == 2:
+            return f"2*{variable}"
+        return f"{n}*{variable}^{n-1}"
+    # a*x^n -> a*n*x^(n-1)
+    m = re.match(rf'^(\d+)\*?{re.escape(variable)}\^(\d+)$', expr)
+    if m:
+        a, n = int(m.group(1)), int(m.group(2))
+        coeff = a * n
+        if n - 1 == 1:
+            return f"{coeff}*{variable}"
+        if n - 1 == 0:
+            return str(coeff)
+        return f"{coeff}*{variable}^{n-1}"
+    # sin(x) -> cos(x), cos(x) -> -sin(x)
+    if expr == f"sin({variable})":
+        return f"cos({variable})"
+    if expr == f"cos({variable})":
+        return f"-sin({variable})"
+    if expr == f"exp({variable})":
+        return f"exp({variable})"
+    if expr == f"log({variable})":
+        return f"1/{variable}"
+
+    # For complex expressions, use LLM
+    try:
+        llm = _llm(temperature=0.0)
+        prompt = (
+            f"Compute the derivative of f({variable}) = {expression} with respect to {variable}.\n"
+            f"Return ONLY the derivative expression using plain text math notation "
+            f"(^ for powers, sqrt() for roots, etc). No explanation."
+        )
+        result = llm.invoke(prompt).strip()
+        result = re.sub(r"^f'?\(?\w\)?\s*=\s*", "", result)
+        result = result.split('\n')[0].strip()
+        if result and len(result) < 200:
+            return result
+    except Exception:
+        pass
+
+    return ""
+
+
+def solve_matrix_problem(operation: str, matrices: list) -> dict:
+    """Solve a matrix operation with step-by-step explanation.
+
+    Supported operations: add, subtract, multiply, determinant, inverse, transpose
+    """
+    if not matrices:
+        return {"error": "No matrices provided"}
+
+    for i, m in enumerate(matrices):
+        if not isinstance(m, list) or not all(isinstance(row, list) for row in m):
+            return {"error": f"Matrix {i+1} is not a valid 2D array"}
+        row_lens = [len(row) for row in m]
+        if len(set(row_lens)) > 1:
+            return {"error": f"Matrix {i+1} has inconsistent row lengths"}
+
+    op = operation.lower().strip()
+    steps = []
+
+    try:
+        if op in ("add", "subtract"):
+            if len(matrices) < 2:
+                return {"error": f"Need 2 matrices for {op}"}
+            a, b = matrices[0], matrices[1]
+            if len(a) != len(b) or len(a[0]) != len(b[0]):
+                return {"error": "Matrices must have the same dimensions for addition/subtraction"}
+
+            steps.append(f"Step 1: Verify dimensions match: {len(a)}x{len(a[0])} {'+'  if op == 'add' else '-'} {len(b)}x{len(b[0])}")
+            sign = 1 if op == "add" else -1
+            result = []
+            for i in range(len(a)):
+                row = []
+                for j in range(len(a[0])):
+                    val = a[i][j] + sign * b[i][j]
+                    row.append(val)
+                result.append(row)
+            steps.append(f"Step 2: {'Add' if op == 'add' else 'Subtract'} corresponding elements")
+            steps.append(f"Step 3: Result = {result}")
+            return {"result": result, "steps": steps, "operation": op}
+
+        elif op == "multiply":
+            if len(matrices) < 2:
+                return {"error": "Need 2 matrices for multiplication"}
+            a, b = matrices[0], matrices[1]
+            if len(a[0]) != len(b):
+                return {"error": f"Cannot multiply: A is {len(a)}x{len(a[0])}, B is {len(b)}x{len(b[0])}. A's columns must equal B's rows."}
+
+            steps.append(f"Step 1: Verify A({len(a)}x{len(a[0])}) * B({len(b)}x{len(b[0])}) -> Result will be {len(a)}x{len(b[0])}")
+            result = [[0] * len(b[0]) for _ in range(len(a))]
+            for i in range(len(a)):
+                for j in range(len(b[0])):
+                    total = sum(a[i][k] * b[k][j] for k in range(len(b)))
+                    result[i][j] = total
+            steps.append("Step 2: For each element (i,j): sum of row_i(A) * col_j(B)")
+            steps.append(f"Step 3: Result = {result}")
+            return {"result": result, "steps": steps, "operation": op}
+
+        elif op == "determinant":
+            m = matrices[0]
+            if len(m) != len(m[0]):
+                return {"error": "Determinant requires a square matrix"}
+
+            def _det(mat: list) -> float:
+                n = len(mat)
+                if n == 1:
+                    return mat[0][0]
+                if n == 2:
+                    return mat[0][0] * mat[1][1] - mat[0][1] * mat[1][0]
+                total = 0
+                for j in range(n):
+                    minor = [row[:j] + row[j+1:] for row in mat[1:]]
+                    total += ((-1) ** j) * mat[0][j] * _det(minor)
+                return total
+
+            det_val = _det(m)
+            n = len(m)
+            if n == 2:
+                steps.append("Step 1: For 2x2 matrix [[a,b],[c,d]], det = ad - bc")
+                steps.append(f"Step 2: det = {m[0][0]}*{m[1][1]} - {m[0][1]}*{m[1][0]}")
+            else:
+                steps.append("Step 1: Expand along the first row using cofactors")
+                terms = []
+                for j in range(n):
+                    sign = "+" if j % 2 == 0 else "-"
+                    terms.append(f"{sign} {m[0][j]} * M_{1}{j+1}")
+                steps.append(f"Step 2: det = {' '.join(terms)}")
+                steps.append("Step 3: Recursively compute each minor")
+            steps.append(f"Result: det = {det_val}")
+            return {"result": det_val, "steps": steps, "operation": op}
+
+        elif op == "transpose":
+            m = matrices[0]
+            result = [[m[j][i] for j in range(len(m))] for i in range(len(m[0]))]
+            steps.append("Step 1: Swap rows and columns: element (i,j) becomes (j,i)")
+            steps.append(f"Step 2: Original {len(m)}x{len(m[0])} -> Transposed {len(result)}x{len(result[0])}")
+            steps.append(f"Result = {result}")
+            return {"result": result, "steps": steps, "operation": op}
+
+        elif op == "inverse":
+            m = matrices[0]
+            n = len(m)
+            if n != len(m[0]):
+                return {"error": "Inverse requires a square matrix"}
+
+            def _det_inv(mat):
+                sz = len(mat)
+                if sz == 1:
+                    return mat[0][0]
+                if sz == 2:
+                    return mat[0][0] * mat[1][1] - mat[0][1] * mat[1][0]
+                total = 0
+                for j in range(sz):
+                    minor = [row[:j] + row[j+1:] for row in mat[1:]]
+                    total += ((-1) ** j) * mat[0][j] * _det_inv(minor)
+                return total
+
+            det = _det_inv(m)
+            if abs(det) < 1e-10:
+                return {"error": "Matrix is singular (determinant = 0), no inverse exists",
+                        "steps": ["Step 1: Compute determinant", f"det = {det}", "Matrix is not invertible."]}
+
+            steps.append(f"Step 1: Compute determinant = {det}")
+
+            if n == 2:
+                inv = [
+                    [m[1][1] / det, -m[0][1] / det],
+                    [-m[1][0] / det, m[0][0] / det],
+                ]
+                steps.append("Step 2: For 2x2: swap diagonal, negate off-diagonal, divide by det")
+                steps.append(f"Result = {[[round(v, 4) for v in row] for row in inv]}")
+                return {"result": [[round(v, 6) for v in row] for row in inv], "steps": steps, "operation": op}
+
+            # General case: adjugate method
+            cofactors = [[0]*n for _ in range(n)]
+            for i in range(n):
+                for j in range(n):
+                    minor = [row[:j] + row[j+1:] for row in (m[:i] + m[i+1:])]
+                    cofactors[i][j] = ((-1) ** (i+j)) * _det_inv(minor)
+            adj = [[cofactors[j][i] for j in range(n)] for i in range(n)]
+            inv = [[adj[i][j] / det for j in range(n)] for i in range(n)]
+            steps.append("Step 2: Compute cofactor matrix")
+            steps.append("Step 3: Transpose to get adjugate matrix")
+            steps.append("Step 4: Divide by determinant")
+            steps.append(f"Result = {[[round(v, 4) for v in row] for row in inv]}")
+            return {"result": [[round(v, 6) for v in row] for row in inv], "steps": steps, "operation": op}
+
+        else:
+            return {"error": f"Unsupported operation: {operation}. Supported: add, subtract, multiply, determinant, inverse, transpose"}
+
+    except Exception as e:
+        return {"error": str(e)}

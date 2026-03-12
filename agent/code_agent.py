@@ -57,6 +57,8 @@ def _apply_repair_blocks(
     """Apply a list of SEARCH/REPLACE blocks to *source_lines*, skipping oversized ones.
 
     Returns the (possibly mutated) source_lines list.
+    Each block is validated after application: if it causes top-level
+    function definitions to disappear the block is rolled back.
     """
     for idx, (search_text, replace_text) in enumerate(blocks):
         if is_oversized_block(search_text, source_lines, idx + 1, prefix=prefix):
@@ -68,11 +70,21 @@ def _apply_repair_blocks(
             logger.warning("%s %s: Unable to locate SEARCH block. Skipping.", prefix, idx + 1)
             continue
         logger.debug("Applying %s %s at line %s replacing %s lines", prefix, idx + 1, match_idx, matched_len)
+        prev_lines = source_lines[:]
         source_lines = (
             source_lines[:match_idx]
             + replace_lines
             + source_lines[match_idx + matched_len:]
         )
+        # Safety: reject block if it deleted function definitions
+        prev_count = count_top_level_functions(prev_lines)
+        new_count = count_top_level_functions(source_lines)
+        if prev_count > 1 and new_count < prev_count:
+            logger.warning(
+                "%s %s: REJECTED — applying this block reduced functions from %d to %d. Rolling back.",
+                prefix, idx + 1, prev_count, new_count,
+            )
+            source_lines = prev_lines
     return source_lines
 
 
@@ -612,7 +624,25 @@ class CodeAgent:
             logger.warning("Verbatim retry also failed — falling back to whole-function rewrite")
             # Strong language reminder at end of prompt (7B models lose early context)
             lang_reminder = f"\nREMINDER: Output {lang_name} code ONLY. The file extension is {ext}. Do NOT write Python or any other language.\n"
-            if is_implement:
+
+            # If verbatim is empty, the instruction is about a NEW function
+            # that doesn't exist yet — generate it and APPEND to the file.
+            _is_new_function = not verbatim.strip()
+
+            if _is_new_function:
+                rewrite_prompt = (
+                    f"{lang_directive}"
+                    f"Write a NEW function to satisfy the following task.\n\n"
+                    f"TASK: {instruction}\n\n"
+                    f"EXISTING FILE:\n```{lang_fence}\n{file_source[:3000]}\n```\n\n"
+                    "Rules:\n"
+                    "1. Output ONLY the new function — no explanation, no markdown fence.\n"
+                    "2. Do NOT reproduce any existing functions from the file.\n"
+                    "3. Match the coding style and indentation of the existing file.\n"
+                    f"{context_block}"
+                    f"{lang_reminder}"
+                )
+            elif is_implement:
                 rewrite_prompt = (
                     f"{lang_directive}"
                     f"Implement a complete solution for the following task inside the function stub below.\n\n"
@@ -659,11 +689,19 @@ class CodeAgent:
                         # the rewrite would destroy unrelated code — refuse and keep original.
                         is_full_file = func_start == 0 and func_end >= len(file_lines)
                         func_count = count_top_level_functions(file_lines, ext)
+                        span_func_count = count_top_level_functions(original_span_lines, ext)
+                        rewritten_func_count = count_top_level_functions(rewritten_lines, ext)
                         if is_full_file and func_count > 1:
                             logger.warning(
                                 "Whole-function rewrite rejected — span covers the entire file "
                                 "(%d functions detected). Refusing to destroy unrelated code.",
                                 func_count
+                            )
+                        elif span_func_count > 1 and rewritten_func_count < span_func_count:
+                            logger.warning(
+                                "Whole-function rewrite rejected — span has %d functions but "
+                                "rewrite only has %d. Would destroy sibling functions.",
+                                span_func_count, rewritten_func_count
                             )
                         elif line_ratio < 0.70 and len(original_span_lines) > 30:
                             logger.warning(
@@ -672,8 +710,13 @@ class CodeAgent:
                                 line_ratio * 100, len(rewritten_lines), len(original_span_lines)
                             )
                         else:
-                            new_source = whole_function_replace(file_source, rewritten, func_start, func_end)
-                            logger.info("Whole-function rewrite applied (lines %s–%s)", func_start, func_end)
+                            if _is_new_function:
+                                # Append the new function to the file instead of replacing
+                                new_source = file_source.rstrip() + "\n\n" + rewritten.strip() + "\n"
+                                logger.info("New function appended to file")
+                            else:
+                                new_source = whole_function_replace(file_source, rewritten, func_start, func_end)
+                                logger.info("Whole-function rewrite applied (lines %s–%s)", func_start, func_end)
                 else:
                     logger.error("Whole-function rewrite returned empty output. Giving up.")
             except Exception as e:
@@ -727,6 +770,21 @@ class CodeAgent:
         new_source = self._self_correct_output(
             llm, new_source, file_source, is_implement, instruction, lang_fence, FORMAT_BLOCK
         )
+
+        # --- Post-edit function count safety check ---
+        # If the edit decreased the number of top-level functions, something
+        # went wrong (likely the whole-function rewrite destroyed siblings).
+        # Reject the edit and keep the original.
+        if new_source != file_source:
+            orig_func_count = count_top_level_functions(file_lines, ext)
+            new_func_count = count_top_level_functions(new_source.split('\n'), ext)
+            if orig_func_count > 1 and new_func_count < orig_func_count:
+                logger.warning(
+                    "[SAFETY] Edit rejected — function count dropped from %d to %d. "
+                    "Restoring original to prevent data loss.",
+                    orig_func_count, new_func_count,
+                )
+                new_source = file_source
 
         # --- Finalize: diff, explanation, write ---
         return self._finalize_edit(

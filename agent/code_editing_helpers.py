@@ -436,6 +436,52 @@ def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple[s
         if func_name:
             target_idx = _locate_function_definition(lines, func_name)
 
+    # -- Word-matching fallback: scan instruction for any function name in file --
+    if target_idx is None:
+        # Collect all function names defined in the file
+        _file_func_names: list[tuple[str, int]] = []
+        for i, l in enumerate(lines):
+            pm = re.match(r"\s*(?:def|func)\s+(\w+)", l)
+            if pm:
+                _file_func_names.append((pm.group(1), i))
+            else:
+                cm = _C_FUNC_PATTERN.match(l)
+                if cm:
+                    _file_func_names.append((cm.group(1), i))
+        # Check if any file function name appears in the instruction
+        _instr_lower = instruction.lower()
+        for _fn, _fi in _file_func_names:
+            if _fn.lower() in _instr_lower:
+                func_name = _fn
+                target_idx = _fi
+                break
+
+    # -- LLM-based function targeting: ask the LLM which function the instruction refers to --
+    if target_idx is None and _file_func_names:
+        try:
+            from langchain_ollama import OllamaLLM
+            from brain.config import LLM_MODEL
+            _target_llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+            _sig_list = "\n".join(f"  {i+1}. {fn} (line {fi+1})" for i, (fn, fi) in enumerate(_file_func_names))
+            _target_prompt = (
+                f"A user wants to edit code. Their instruction:\n\"{instruction}\"\n\n"
+                f"The file contains these functions:\n{_sig_list}\n\n"
+                "Which function number should be edited? If the instruction is about "
+                "adding a NEW function (not editing existing ones), respond NEW.\n"
+                "Answer with ONLY the number or NEW."
+            )
+            _target_answer = _target_llm.invoke(_target_prompt).strip()
+            if _target_answer.upper() != "NEW":
+                _chosen_idx = int(re.search(r'\d+', _target_answer).group()) - 1
+                if 0 <= _chosen_idx < len(_file_func_names):
+                    func_name, target_idx = _file_func_names[_chosen_idx]
+                    logger.info("[EXTRACT] LLM matched instruction to function '%s' (line %d)",
+                                func_name, target_idx + 1)
+            else:
+                logger.info("[EXTRACT] LLM says instruction is for a NEW function, not an existing one")
+        except Exception as e:
+            logger.debug("[EXTRACT] LLM function targeting failed: %s", e)
+
     # -- Determine function range --
     if target_idx is None:
         start_idx = 0
@@ -452,7 +498,28 @@ def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple[s
     func_start, func_end = _find_function_range(lines, start_idx)
 
     if target_idx is None and start_idx == 0:
-        return "", 0, len(lines)
+        # Could not identify a specific function.  If the file has only one
+        # function, return that function's range (safe).  Otherwise return
+        # the range of just the *first* function to avoid handing back the
+        # entire file which would cause the whole-function-rewrite fallback
+        # to destroy unrelated code.
+        first_func_start, first_func_end = _find_function_range(lines, 0)
+        if first_func_end >= len(lines):
+            # _find_function_range walked to EOF — check if there really is
+            # only one function before returning full-file range.
+            func_count = count_top_level_functions(lines)
+            if func_count <= 1:
+                return '\n'.join(lines), 0, len(lines)
+            # Multiple functions but we can't tell which one — return the
+            # first function only as a safe default.
+            # Re-scan for first real function definition.
+            for _i, _l in enumerate(lines):
+                if FUNC_PATTERN.match(_l) or _C_FUNC_PATTERN.match(_l):
+                    _fs, _fe = _find_function_range(lines, _i)
+                    return '\n'.join(lines[_fs:_fe]), _fs, _fe
+            # No function patterns at all — return full file as last resort.
+            return '\n'.join(lines), 0, len(lines)
+        return '\n'.join(lines[first_func_start:first_func_end]), first_func_start, first_func_end
 
     # -- Call-site expansion --
     call_regions = _find_call_sites(lines, func_name, func_start, func_end) if func_name else []
@@ -602,7 +669,7 @@ def _anchor_match(
         if score > best_score:
             best_score, best_idx = score, i
 
-    if best_score >= max(2, n // 2):
+    if best_score >= max(3, int(n * 0.7)):
         return best_idx, get_replace(best_idx), n
     return -1, None, 0
 
@@ -613,15 +680,23 @@ def _fuzzy_match(
     n: int,
     get_replace,
 ) -> tuple[int, list[str] | None, int]:
-    """Fuzzy difflib-based match as last resort."""
+    """Fuzzy difflib-based match as last resort.
+
+    Only matches if the longest common substring covers a significant
+    portion of the search text to avoid catastrophic mis-replacements
+    that destroy unrelated functions.
+    """
     try:
         source_str = '\n'.join(source_lines)
         search_str = '\n'.join(s.rstrip() for s in search_lines)
         sm = SequenceMatcher(None, source_str, search_str, autojunk=False)
         match = sm.find_longest_match(0, len(source_str), 0, len(search_str))
-        if match.size > 40:
+        # Require the match to cover at least 60% of the search text
+        if match.size > max(60, int(len(search_str) * 0.6)):
             start_line = source_str[:match.a].count('\n')
-            return start_line, get_replace(start_line), n
+            # Clamp replacement span: don't exceed available lines past the start
+            safe_n = min(n, len(source_lines) - start_line)
+            return start_line, get_replace(start_line), safe_n
     except Exception:
         logger.debug("Fuzzy matching failed: %s", traceback.format_exc())
     return -1, None, 0
@@ -661,9 +736,22 @@ def find_first_mismatch(source_lines: list[str], search_lines: list[str]) -> tup
 
 
 def whole_function_replace(source: str, func_text: str, start_idx: int, end_idx: int) -> str:
-    """Replace lines ``[start_idx:end_idx]`` in *source* with *func_text*."""
+    """Replace lines ``[start_idx:end_idx]`` in *source* with *func_text*.
+
+    Includes a safety check: if the replacement would reduce the number of
+    top-level functions, the original source is returned unchanged.
+    """
     source_lines = source.split('\n')
-    return '\n'.join(source_lines[:start_idx] + func_text.strip('\n').split('\n') + source_lines[end_idx:])
+    new_lines = source_lines[:start_idx] + func_text.strip('\n').split('\n') + source_lines[end_idx:]
+    orig_count = count_top_level_functions(source_lines)
+    new_count = count_top_level_functions(new_lines)
+    if orig_count > 1 and new_count < orig_count:
+        logger.warning(
+            "whole_function_replace safety: function count dropped %d → %d. Keeping original.",
+            orig_count, new_count,
+        )
+        return source
+    return '\n'.join(new_lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -696,6 +696,42 @@ def _edit_context_files(
 
     plan_steps = "\n".join(f"- {s}" for s in plan.get("steps", [])) if plan else ""
 
+    # Determine if the user wants the same task applied to ALL context files
+    # (cross-language implementation) vs just keeping them consistent.
+    # Use three signals:
+    #   1. Different file extensions (Go+CPP, Python+Java, etc.) — strong signal
+    #   2. The plan mentions multiple files or languages explicitly
+    #   3. LLM classification of the instruction intent (understands natural language)
+    _has_cross_lang = False
+    _context_exts = set()
+    main_ext = os.path.splitext(main_file_path)[1].lower()
+    for _cp in context_file_paths:
+        _ce = os.path.splitext(_cp)[1].lower()
+        if _ce != main_ext:
+            _has_cross_lang = True
+        _context_exts.add(_ce)
+
+    _apply_to_all = _has_cross_lang  # different extensions → almost always cross-impl
+    if not _apply_to_all and len(context_file_paths) > 0:
+        # Use a fast LLM probe to decide if the user intends changes in all files
+        try:
+            _clf_llm = OllamaLLM(model=LLM_MODEL, temperature=0.0)
+            _file_list = ", ".join(os.path.basename(p) for p in context_file_paths)
+            _clf_prompt = (
+                f"A user gave this instruction to edit code:\n\"{instruction}\"\n\n"
+                f"The main file is {os.path.basename(main_file_path)}.\n"
+                f"Other files in the project: {_file_list}\n\n"
+                "Does the user intend the same change to be applied to ALL these files, "
+                "or only to the main file (with others kept consistent)?\n"
+                "Answer ONLY with: ALL or MAIN"
+            )
+            _clf_result = _clf_llm.invoke(_clf_prompt).strip().upper()
+            _apply_to_all = "ALL" in _clf_result
+            logger.info("[CONTEXT_EDIT] LLM intent classification: %s → apply_to_all=%s",
+                        _clf_result[:20], _apply_to_all)
+        except Exception as e:
+            logger.debug("[CONTEXT_EDIT] LLM classification failed: %s", e)
+
     for cf_path in context_file_paths:
         abs_cf = os.path.abspath(cf_path)
         if abs_cf == os.path.abspath(main_file_path):
@@ -707,27 +743,58 @@ def _edit_context_files(
         if original_cf is None:
             continue
 
-        # Augment instruction with main-file change context
-        augmented = (
-            f"{instruction}\n\n"
-            f"MAIN FILE CHANGES ({main_file_path}):\n"
-            f"```diff\n{main_diff_text}\n```\n\n"
-        )
-        if plan_steps:
-            augmented += f"PLAN:\n{plan_steps}\n\n"
-        augmented += (
-            "Apply any necessary corresponding changes to this file "
-            "to keep it consistent with the main file changes above. "
-            "If no changes are needed, return the file unchanged."
-        )
+        cf_ext = os.path.splitext(abs_cf)[1].lower()
+        main_ext = os.path.splitext(main_file_path)[1].lower()
+        cf_lang = LANG_NAMES.get(cf_ext, cf_ext)
+        main_lang = LANG_NAMES.get(main_ext, main_ext)
+
+        # Build the augmented instruction based on whether this is a
+        # cross-language implementation (same task, different language) or
+        # a dependency-style edit (keep consistent with main file changes)
+        if _apply_to_all or cf_ext != main_ext:
+            # Cross-language or explicit multi-file: apply the SAME original
+            # instruction to this file — the user wants the same task solved here
+            augmented = (
+                f"{instruction}\n\n"
+                f"You are editing the {cf_lang} file ({os.path.basename(abs_cf)}).\n"
+                f"The same task was already implemented in the {main_lang} file.\n"
+                f"Here is what was done in the main file for reference:\n"
+                f"```diff\n{main_diff_text}\n```\n\n"
+            )
+            if plan_steps:
+                augmented += f"PLAN:\n{plan_steps}\n\n"
+            augmented += (
+                f"Implement the same solution in {cf_lang} in this file. "
+                f"Apply edits ONLY to the relevant function — preserve all other code in the file."
+            )
+        else:
+            # Same-language dependency: keep consistent with main file changes
+            augmented = (
+                f"{instruction}\n\n"
+                f"MAIN FILE CHANGES ({main_file_path}):\n"
+                f"```diff\n{main_diff_text}\n```\n\n"
+            )
+            if plan_steps:
+                augmented += f"PLAN:\n{plan_steps}\n\n"
+            augmented += (
+                "Apply any necessary corresponding changes to this file "
+                "to keep it consistent with the main file changes above. "
+                "If no changes are needed, return the file unchanged."
+            )
+
+        # Determine task mode: if we're implementing in the main file,
+        # also implement in context files
+        cf_task_mode = task_mode
+        if _apply_to_all and task_mode in ("solve", "auto"):
+            cf_task_mode = "solve"
 
         try:
             result = agent.edit_code(
                 path=abs_cf,
                 instruction=augmented,
                 dry_run=True,
-                use_rag=False,
-                task_mode=task_mode,
+                use_rag=_apply_to_all,  # use RAG for cross-file implementations
+                task_mode=cf_task_mode,
                 session_id=session_id,
             )
 

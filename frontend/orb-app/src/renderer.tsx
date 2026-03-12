@@ -83,7 +83,7 @@ function App() {
   const [tutorTopic, setTutorTopic] = useState('arrays');
   const [tutorDifficulty, setTutorDifficulty] = useState<'easy' | 'medium' | 'hard'>('medium');
   const [tutorLanguage, setTutorLanguage] = useState('python');
-  const [tutorStyle, setTutorStyle] = useState<'mcq' | 'free_text' | 'code'>('mcq');
+  const [tutorStyle, setTutorStyle] = useState<'mcq' | 'free_text' | 'code' | 'solve' | 'proof'>('mcq');
   const [tutorProblem, setTutorProblem] = useState<TutorProblem | null>(null);
   const [tutorFeedback, setTutorFeedback] = useState<TutorFeedback | null>(null);
   const [tutorHint, setTutorHint] = useState<string | null>(null);
@@ -95,10 +95,55 @@ function App() {
   const [agentLearnings, setAgentLearnings] = useState<{ topic: string; explanation: string; timestamp: string }[] | null>(null);
   const [showLearnings, setShowLearnings] = useState(false);
 
+  // ── Math mode state ────────────────────────────────────────────────────────
+  type GraphPoint = { x: number; y: number };
+  const [isMathMode, setIsMathMode] = useState(false);
+  const [mathExpression, setMathExpression] = useState('x^2');
+  const [mathGraphPoints, setMathGraphPoints] = useState<GraphPoint[]>([]);
+  const [mathDerivPoints, setMathDerivPoints] = useState<GraphPoint[]>([]);
+  const [mathDerivExpr, setMathDerivExpr] = useState('');
+  const [mathHoverX, setMathHoverX] = useState<number | null>(null);
+  const [mathSteps, setMathSteps] = useState<string[] | null>(null);
+  const [showMathGraph, setShowMathGraph] = useState(false);
+
   // ── Tools panel state ──────────────────────────────────────────────────────
   const [showToolsPanel, setShowToolsPanel] = useState(false);
   const [toolsOutput, setToolsOutput] = useState<string | null>(null);
   const [toolsLoading, setToolsLoading] = useState(false);
+
+  // ── Process / backend log panel ────────────────────────────────────────────
+  type ProcessLog = { ts: number; level: string; logger: string; message: string };
+  const [showProcessPanel, setShowProcessPanel] = useState(false);
+  const [processExpanded, setProcessExpanded] = useState(false);
+  const [processLogs, setProcessLogs] = useState<ProcessLog[]>([]);
+  const processEndRef = useRef<HTMLDivElement>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
+
+  // Connect to SSE log stream
+  useEffect(() => {
+    const es = new EventSource('http://localhost:8000/process/logs');
+    eventSourceRef.current = es;
+    es.onmessage = (ev) => {
+      try {
+        const entry: ProcessLog = JSON.parse(ev.data);
+        setProcessLogs(prev => {
+          const next = [...prev, entry];
+          return next.length > 500 ? next.slice(-500) : next;
+        });
+      } catch { /* ignore malformed */ }
+    };
+    es.onerror = () => {
+      // Reconnect handled automatically by EventSource
+    };
+    return () => { es.close(); };
+  }, []);
+
+  // Auto-scroll process log
+  useEffect(() => {
+    if (showProcessPanel && processEndRef.current) {
+      processEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [processLogs, showProcessPanel]);
 
   // ── LLM connection status ──────────────────────────────────────────────────
   const [llmConnected, setLlmConnected] = useState<boolean | null>(null);  // null = unknown
@@ -396,10 +441,17 @@ function App() {
     setTutorProblem(null); setTutorFeedback(null); setTutorHint(null);
     setTutorCode(''); setTutorAnswer(''); setTutorCodeResults(null);
     try {
-      const res = await fetch('http://localhost:8000/tutor/start', {
+      const endpoint = isMathMode ? 'http://localhost:8000/math/start' : 'http://localhost:8000/tutor/start';
+      const payload = isMathMode
+        ? { topic: tutorTopic, difficulty: tutorDifficulty, style: tutorStyle === 'mcq' ? 'mcq' : tutorStyle === 'proof' ? 'proof' : 'solve' }
+        : { topic: tutorTopic, difficulty: tutorDifficulty, language: tutorLanguage, style: tutorStyle };
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 120_000);
+      const res = await fetch(endpoint, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ topic: tutorTopic, difficulty: tutorDifficulty, language: tutorLanguage, style: tutorStyle }),
+        body: JSON.stringify(payload), signal: controller.signal,
       });
+      clearTimeout(timeout);
       const data = await res.json();
       if (data.status === 'ok') {
         // Extract only expected TutorProblem fields to avoid leaking raw JSON/extra fields
@@ -429,9 +481,9 @@ function App() {
         if (q.startsWith('{') && q.endsWith('}')) {
           setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Problem generation returned malformed data. Retrying...' }]);
           // Auto-retry once
-          const retry = await fetch('http://localhost:8000/tutor/start', {
+          const retry = await fetch(endpoint, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ topic: tutorTopic, difficulty: tutorDifficulty, language: tutorLanguage, style: tutorStyle }),
+            body: JSON.stringify(payload),
           });
           const retryData = await retry.json();
           if (retryData.status === 'ok' && retryData.question && !retryData.question.trim().startsWith('{')) {
@@ -466,8 +518,43 @@ function App() {
       } else {
         setMessages(prev => [...prev, { role: 'ai', text: `[TUTOR] Error: ${data.error || 'unknown'}` }]);
       }
-    } catch { setMessages(prev => [...prev, { role: 'ai', text: '[TUTOR] Failed to connect to server.' }]); }
+    } catch (err: any) {
+      const msg = err?.name === 'AbortError' ? '[TUTOR] Request timed out. The LLM may be slow — try again.' : '[TUTOR] Failed to connect to server.';
+      setMessages(prev => [...prev, { role: 'ai', text: msg }]);
+    }
     setTutorLoading(false);
+  };
+
+  // Evaluate math expression for graphing
+  const handleMathGraph = async (expr?: string) => {
+    const expression = expr || mathExpression;
+    if (!expression.trim()) return;
+    try {
+      const values = Array.from({ length: 201 }, (_, i) => -10 + i * 0.1);
+      const res = await fetch('http://localhost:8000/math/evaluate', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expression, variable: 'x', values }),
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        setMathGraphPoints(data.points || []);
+        setMathDerivPoints(data.derivative_points || []);
+        setMathDerivExpr(data.derivative_expression || '');
+        setShowMathGraph(true);
+      }
+    } catch { /* ignore graph errors */ }
+  };
+
+  // Fetch step-by-step solution
+  const handleMathSteps = async () => {
+    if (!tutorProblem) return;
+    try {
+      const res = await fetch(`http://localhost:8000/math/steps/${tutorProblem.session_id}`);
+      const data = await res.json();
+      if (data.status === 'ok' && data.steps) {
+        setMathSteps(data.steps);
+      }
+    } catch { /* ignore */ }
   };
 
   const handleTutorCheckAnswer = async (answer: string) => {
@@ -1527,15 +1614,36 @@ return (
               style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
               <option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option>
             </select>
-            <select value={tutorLanguage} onChange={e => setTutorLanguage(e.target.value)}
-              style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
-              {['python', 'go', 'cpp', 'c', 'javascript', 'typescript', 'java', 'rust'].map(l =>
-                <option key={l} value={l}>{l}</option>
-              )}
-            </select>
+            {/* Math / CS mode toggle */}
+            <button
+              type="button"
+              onClick={() => setIsMathMode(p => !p)}
+              style={{
+                padding: '6px 14px', borderRadius: '8px', fontSize: '12px', fontWeight: 'bold',
+                border: '1px solid',
+                borderColor: isMathMode ? '#00cc88' : '#5533ff',
+                backgroundColor: isMathMode ? 'rgba(0,204,136,0.15)' : 'rgba(85,51,255,0.12)',
+                color: isMathMode ? '#00cc88' : '#b388ff',
+                cursor: 'pointer', transition: 'all 0.2s',
+              }}
+            >
+              {isMathMode ? '📐 Math' : '💻 CS'}
+            </button>
+            {/* Language selector - hidden in math mode */}
+            {!isMathMode && (
+              <select value={tutorLanguage} onChange={e => setTutorLanguage(e.target.value)}
+                style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
+                {['python', 'go', 'cpp', 'c', 'javascript', 'typescript', 'java', 'rust'].map(l =>
+                  <option key={l} value={l}>{l}</option>
+                )}
+              </select>
+            )}
             <select value={tutorStyle} onChange={e => setTutorStyle(e.target.value as any)}
               style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px' }}>
-              <option value="mcq">Multiple Choice</option><option value="free_text">Short Answer</option><option value="code">Coding</option>
+              <option value="mcq">Multiple Choice</option><option value="free_text">Short Answer</option>
+              {!isMathMode && <option value="code">Coding</option>}
+              {isMathMode && <option value="solve">Solve</option>}
+              {isMathMode && <option value="proof">Proof</option>}
             </select>
             <button onClick={() => { handleTutorGenerate(); setShowLesson(true); }} disabled={tutorLoading || !tutorTopic.trim()}
               style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
@@ -1798,12 +1906,24 @@ return (
                 </div>
               )}
 
-              {/* Hint / Next buttons */}
-              <div style={{ display: 'flex', gap: '8px' }}>
+              {/* Hint / Next / Steps buttons */}
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                 <button onClick={handleTutorHint} disabled={tutorLoading || (tutorFeedback?.solved ?? false)}
                   style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#5533ff', cursor: 'pointer', fontSize: '12px' }}>
                   💡 Hint
                 </button>
+                {isMathMode && (
+                  <button onClick={handleMathSteps}
+                    style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #00cc8866', backgroundColor: 'transparent', color: '#00cc88', cursor: 'pointer', fontSize: '12px' }}>
+                    📝 Step-by-Step
+                  </button>
+                )}
+                {isMathMode && (
+                  <button onClick={() => setShowMathGraph(g => !g)}
+                    style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #ff990066', backgroundColor: showMathGraph ? 'rgba(255,153,0,0.15)' : 'transparent', color: '#ff9900', cursor: 'pointer', fontSize: '12px' }}>
+                    📈 Graph
+                  </button>
+                )}
                 {tutorFeedback?.solved && (
                   <button onClick={handleTutorGenerate}
                     style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '12px' }}>
@@ -1811,6 +1931,113 @@ return (
                   </button>
                 )}
               </div>
+
+              {/* Step-by-step solution display */}
+              {mathSteps && mathSteps.length > 0 && (
+                <div style={{ marginTop: '12px', padding: '14px', borderRadius: '10px', backgroundColor: 'rgba(0,204,136,0.06)', border: '1px solid rgba(0,204,136,0.2)' }}>
+                  <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#00cc88', marginBottom: '10px' }}>Step-by-Step Solution</div>
+                  {mathSteps.map((step, i) => (
+                    <div key={i} style={{ padding: '6px 0 6px 14px', borderLeft: '2px solid #00cc8844', marginBottom: '6px', fontSize: '13px', color: '#ddd', lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>
+                      <span style={{ color: '#00cc88', fontWeight: 'bold', marginRight: '6px' }}>Step {i + 1}:</span>{step}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Math Interactive Graph ─────────────────────────────────── */}
+          {isMathMode && showMathGraph && (
+            <div style={{ marginTop: '16px', padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(255,153,0,0.04)', border: '1px solid rgba(255,153,0,0.2)' }}>
+              <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#ff9900', marginBottom: '10px' }}>📈 Interactive Graph</div>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', alignItems: 'center' }}>
+                <span style={{ color: '#888', fontSize: '12px' }}>f(x) =</span>
+                <input value={mathExpression} onChange={e => setMathExpression(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') handleMathGraph(); }}
+                  placeholder="x^2, sin(x), x^3 - 3*x"
+                  style={{ flex: 1, padding: '6px 10px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', fontFamily: 'monospace' }} />
+                <button onClick={() => handleMathGraph()}
+                  style={{ padding: '6px 14px', borderRadius: '6px', border: 'none', backgroundColor: '#ff9900', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '12px' }}>
+                  Plot
+                </button>
+              </div>
+              {mathDerivExpr && (
+                <div style={{ fontSize: '12px', color: '#888', marginBottom: '8px' }}>
+                  f'(x) = <span style={{ color: '#ff6666', fontFamily: 'monospace' }}>{mathDerivExpr}</span>
+                </div>
+              )}
+              {/* SVG Graph */}
+              {mathGraphPoints.length > 0 && (() => {
+                const W = 600, H = 340, PAD = 40;
+                const validPts = mathGraphPoints.filter(p => isFinite(p.y) && Math.abs(p.y) < 1000);
+                const validDeriv = mathDerivPoints.filter(p => isFinite(p.y) && Math.abs(p.y) < 1000);
+                if (validPts.length < 2) return <div style={{ color: '#666', fontSize: '12px' }}>No valid points to plot.</div>;
+                const xMin = Math.min(...validPts.map(p => p.x));
+                const xMax = Math.max(...validPts.map(p => p.x));
+                const allY = [...validPts.map(p => p.y), ...validDeriv.map(p => p.y)];
+                const yMin = Math.min(...allY);
+                const yMax = Math.max(...allY);
+                const xRange = xMax - xMin || 1;
+                const yRange = yMax - yMin || 1;
+                const sx = (x: number) => PAD + ((x - xMin) / xRange) * (W - 2 * PAD);
+                const sy = (y: number) => H - PAD - ((y - yMin) / yRange) * (H - 2 * PAD);
+                const toPath = (pts: GraphPoint[]) => pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ');
+                // Axis lines
+                const zeroX = sx(0), zeroY = sy(0);
+                // Hover point
+                const hoverPt = mathHoverX !== null ? validPts.reduce((a, b) => Math.abs(b.x - mathHoverX!) < Math.abs(a.x - mathHoverX!) ? b : a, validPts[0]) : null;
+                const hoverDeriv = mathHoverX !== null && validDeriv.length > 0 ? validDeriv.reduce((a, b) => Math.abs(b.x - mathHoverX!) < Math.abs(a.x - mathHoverX!) ? b : a, validDeriv[0]) : null;
+                return (
+                  <div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222', cursor: 'crosshair' }}
+                      onMouseMove={e => {
+                        const rect = (e.target as SVGElement).closest('svg')!.getBoundingClientRect();
+                        const px = e.clientX - rect.left;
+                        const xVal = xMin + ((px - PAD) / (W - 2 * PAD)) * xRange;
+                        setMathHoverX(xVal);
+                      }}
+                      onMouseLeave={() => setMathHoverX(null)}
+                    >
+                      {/* Grid lines */}
+                      {Array.from({ length: 11 }, (_, i) => {
+                        const x = PAD + (i / 10) * (W - 2 * PAD);
+                        const y = PAD + (i / 10) * (H - 2 * PAD);
+                        return <g key={i}>
+                          <line x1={x} y1={PAD} x2={x} y2={H - PAD} stroke="#1a1a1a" strokeWidth={1} />
+                          <line x1={PAD} y1={y} x2={W - PAD} y2={y} stroke="#1a1a1a" strokeWidth={1} />
+                        </g>;
+                      })}
+                      {/* Axes */}
+                      {zeroX >= PAD && zeroX <= W - PAD && <line x1={zeroX} y1={PAD} x2={zeroX} y2={H - PAD} stroke="#444" strokeWidth={1} />}
+                      {zeroY >= PAD && zeroY <= H - PAD && <line x1={PAD} y1={zeroY} x2={W - PAD} y2={zeroY} stroke="#444" strokeWidth={1} />}
+                      {/* f(x) curve */}
+                      <path d={toPath(validPts)} fill="none" stroke="#00cc88" strokeWidth={2} />
+                      {/* f'(x) derivative curve */}
+                      {validDeriv.length > 1 && <path d={toPath(validDeriv)} fill="none" stroke="#ff6666" strokeWidth={1.5} strokeDasharray="5,3" />}
+                      {/* Hover crosshair + values */}
+                      {hoverPt && <>
+                        <line x1={sx(hoverPt.x)} y1={PAD} x2={sx(hoverPt.x)} y2={H - PAD} stroke="#ffffff22" strokeWidth={1} />
+                        <circle cx={sx(hoverPt.x)} cy={sy(hoverPt.y)} r={4} fill="#00cc88" />
+                        {hoverDeriv && <circle cx={sx(hoverDeriv.x)} cy={sy(hoverDeriv.y)} r={3} fill="#ff6666" />}
+                        <text x={sx(hoverPt.x) + 8} y={sy(hoverPt.y) - 8} fill="#00cc88" fontSize={11} fontFamily="monospace">
+                          ({hoverPt.x.toFixed(2)}, {hoverPt.y.toFixed(2)})
+                        </text>
+                        {hoverDeriv && <text x={sx(hoverDeriv.x) + 8} y={sy(hoverDeriv.y) + 16} fill="#ff6666" fontSize={10} fontFamily="monospace">
+                          f'={hoverDeriv.y.toFixed(2)}
+                        </text>}
+                      </>}
+                      {/* Axis labels */}
+                      <text x={W - PAD + 5} y={zeroY >= PAD && zeroY <= H - PAD ? zeroY + 4 : H - PAD + 14} fill="#666" fontSize={10}>x</text>
+                      <text x={zeroX >= PAD && zeroX <= W - PAD ? zeroX - 12 : PAD - 12} y={PAD - 5} fill="#666" fontSize={10}>y</text>
+                    </svg>
+                    {/* Legend */}
+                    <div style={{ display: 'flex', gap: '16px', marginTop: '6px', fontSize: '11px' }}>
+                      <span style={{ color: '#00cc88' }}>— f(x) = {mathExpression}</span>
+                      {mathDerivExpr && <span style={{ color: '#ff6666' }}>-- f'(x) = {mathDerivExpr}</span>}
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
 
@@ -2500,6 +2727,27 @@ return (
           {voiceLoading ? '⏳' : isRecording ? '⏹' : '🎤'}
         </button>
 
+        {/* Process log toggle — next to mic */}
+        <button
+          type="button"
+          onClick={() => setShowProcessPanel(p => !p)}
+          title="Toggle backend process logs"
+          style={{
+            padding: '10px 12px',
+            borderRadius: '12px',
+            border: '2px solid',
+            borderColor: showProcessPanel ? '#ff9900' : '#444',
+            backgroundColor: showProcessPanel ? 'rgba(255,153,0,0.15)' : '#111',
+            color: showProcessPanel ? '#ff9900' : '#888',
+            cursor: 'pointer',
+            fontSize: '14px',
+            transition: 'all 0.15s',
+            position: 'relative',
+          }}
+        >
+          ⚙{processLogs.length > 0 && <span style={{ position: 'absolute', top: '-4px', right: '-4px', backgroundColor: '#ff9900', color: '#000', borderRadius: '50%', width: '16px', height: '16px', fontSize: '9px', fontWeight: 'bold', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{processLogs.length > 99 ? '99+' : processLogs.length}</span>}
+        </button>
+
         {/* OCR capture button with dropdown */}
         <div style={{ position: 'relative' }}>
           <input
@@ -2633,6 +2881,75 @@ return (
         </button>
         </div>
       </form>
+      )}
+
+      {/* ── Process Log Panel (collapsible + expandable) ─────────────── */}
+      {showProcessPanel && (
+        <div style={{
+          position: 'fixed', bottom: '80px', right: '16px', zIndex: 55,
+          width: processExpanded ? '700px' : '500px',
+          maxWidth: processExpanded ? '70vw' : '45vw',
+          height: processExpanded ? '550px' : '300px',
+          borderRadius: '12px', overflow: 'hidden',
+          backgroundColor: 'rgba(0, 5, 10, 0.92)', backdropFilter: 'blur(20px)',
+          border: '1px solid rgba(255,153,0,0.2)', boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
+          display: 'flex', flexDirection: 'column',
+          transition: 'width 0.25s, height 0.25s, max-width 0.25s',
+        }}>
+          <div style={{
+            padding: '8px 12px', borderBottom: '1px solid #222',
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          }}>
+            <span style={{ fontSize: '12px', fontWeight: 'bold', color: '#ff9900' }}>⚙ Backend Process Logs</span>
+            <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+              <button onClick={() => setProcessExpanded(p => !p)}
+                title={processExpanded ? 'Shrink panel' : 'Expand panel'}
+                style={{ background: 'none', border: '1px solid #33333366', borderRadius: '4px', color: '#888', cursor: 'pointer', padding: '2px 8px', fontSize: '10px' }}>
+                {processExpanded ? '⊟' : '⊞'}
+              </button>
+              <button onClick={() => setProcessLogs([])}
+                style={{ background: 'none', border: '1px solid #33333366', borderRadius: '4px', color: '#666', cursor: 'pointer', padding: '2px 8px', fontSize: '10px' }}>
+                Clear
+              </button>
+              <button onClick={() => setShowProcessPanel(false)}
+                style={{ background: 'none', border: '1px solid #33333366', borderRadius: '4px', color: '#666', cursor: 'pointer', padding: '2px 8px', fontSize: '10px' }}>
+                ✕
+              </button>
+            </div>
+          </div>
+          <div style={{
+            flex: 1, overflowY: 'auto', padding: '6px 10px',
+            fontFamily: "'Fira Code', 'JetBrains Mono', Consolas, monospace",
+            fontSize: processExpanded ? '12px' : '11px', lineHeight: '1.5',
+          }}>
+            {processLogs.length === 0 && (
+              <div style={{ color: '#555', textAlign: 'center', paddingTop: '40px' }}>
+                Waiting for backend activity...
+              </div>
+            )}
+            {processLogs.map((log, i) => {
+              const levelColor = log.level === 'ERROR' ? '#ff4444'
+                : log.level === 'WARNING' ? '#ffaa33'
+                : log.level === 'INFO' ? '#00cc88'
+                : '#555';
+              return (
+                <div key={i} style={{ padding: '2px 0', borderBottom: '1px solid #111', wordBreak: 'break-word' }}>
+                  <span style={{ color: '#555', marginRight: '6px' }}>
+                    {new Date(log.ts * 1000).toLocaleTimeString()}
+                  </span>
+                  <span style={{ color: levelColor, fontWeight: 'bold', marginRight: '6px' }}>
+                    {log.level}
+                  </span>
+                  <span style={{ color: '#7d7d7d', marginRight: '6px' }}>
+                    [{log.logger}]
+                  </span>
+                  <span style={{ color: '#ccc' }}>{log.message}</span>
+                </div>
+              );
+            })}
+            <div ref={processEndRef} />
+          </div>
+        </div>
       )}
     </div>
   );

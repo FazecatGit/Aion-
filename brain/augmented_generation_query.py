@@ -18,24 +18,109 @@ _last_filters        = {}
 
 # Known topics the system can retrieve docs for
 _KNOWN_TOPICS = [
+    # Programming languages
     'c++', 'cpp', 'go', 'golang', 'python', 'rust', 'typescript', 'javascript',
-    'java', 'blender', 'angular', 'calculus', 'derivative', 'integration',
+    'java', 'blender', 'angular',
+    # Software engineering
     'refactoring', 'concurrency', 'threading', 'multithreading',
-    'linear algebra', 'matrix', 'vector', 'statistics', 'probability',
-    'discrete math', 'geometry', 'optimization', 'number theory',
-    'algorithm', 'data structure', 'dynamic programming', 'graph',
     'security', 'cryptography', 'database', 'sql', 'networking',
+    'design patterns', 'clean code', 'testing',
+    # Mathematics
+    'calculus', 'derivative', 'integration', 'differentiation', 'limit',
+    'linear algebra', 'matrix', 'vector', 'eigenvalue', 'determinant',
+    'statistics', 'probability', 'discrete math', 'geometry', 'trigonometry',
+    'optimization', 'number theory', 'combinatorics', 'set theory',
+    'differential equation', 'partial derivative', 'gradient',
+    'taylor series', 'fourier', 'laplace', 'complex analysis',
+    'logarithm', 'exponential', 'polynomial', 'quadratic', 'factoring',
+    'arithmetic', 'modular arithmetic', 'prime', 'gcd', 'lcm',
+    'permutation', 'combination', 'binomial', 'recurrence relation',
+    'graph theory', 'topology', 'abstract algebra', 'group theory',
+    # Algorithms & data structures
+    'algorithm', 'data structure', 'dynamic programming', 'graph',
+    'sorting', 'searching', 'binary search', 'two pointers', 'sliding window',
+    'greedy', 'backtracking', 'recursion', 'divide and conquer',
+    'breadth first search', 'depth first search', 'bfs', 'dfs',
+    'dijkstra', 'bellman ford', 'floyd warshall', 'topological sort',
+    'minimum spanning tree', 'union find', 'disjoint set',
+    'hash table', 'hash map', 'linked list', 'stack', 'queue', 'deque',
+    'binary tree', 'binary search tree', 'avl tree', 'red black tree',
+    'heap', 'priority queue', 'trie', 'segment tree', 'fenwick tree',
+    'bit manipulation', 'string matching', 'kmp', 'rabin karp',
+    'memoization', 'tabulation', 'knapsack', 'longest common subsequence',
+    'shortest path', 'maximum flow', 'minimum cut',
+    'amortized analysis', 'time complexity', 'space complexity',
 ]
 
 # Topics that are mathematics/science rather than programming
 _MATH_TOPICS = {
+    # Calculus
     'calculus', 'derivative', 'integration', 'integral', 'differentiation',
-    'linear algebra', 'matrix', 'matrices', 'vector', 'eigenvalue',
-    'statistics', 'probability', 'discrete math', 'geometry',
-    'optimization', 'number theory', 'combinatorics',
-    'product rule', 'chain rule', 'quotient rule', 'limit', 'continuity',
-    'taylor series', 'fourier', 'laplace', 'differential equation',
+    'product rule', 'chain rule', 'quotient rule', 'power rule',
+    'limit', 'continuity', 'l\'hopital', 'squeeze theorem',
+    'taylor series', 'maclaurin series', 'fourier', 'laplace',
+    'differential equation', 'ordinary differential equation', 'ode',
     'partial derivative', 'gradient', 'divergence', 'curl',
+    'double integral', 'triple integral', 'line integral', 'surface integral',
+    'green\'s theorem', 'stokes theorem', 'divergence theorem',
+    'implicit differentiation', 'related rates', 'optimization',
+    'riemann sum', 'fundamental theorem of calculus', 'improper integral',
+    'arc length', 'parametric', 'polar coordinates',
+    # Linear algebra
+    'linear algebra', 'matrix', 'matrices', 'vector', 'eigenvalue',
+    'eigenvector', 'determinant', 'inverse matrix', 'transpose',
+    'gaussian elimination', 'row reduction', 'echelon form',
+    'linear transformation', 'vector space', 'basis', 'dimension',
+    'dot product', 'cross product', 'norm', 'orthogonal',
+    'svd', 'singular value decomposition', 'lu decomposition',
+    'rank', 'nullity', 'kernel', 'image', 'span',
+    'cramers rule', 'systems of equations',
+    # Statistics & probability
+    'statistics', 'probability', 'mean', 'median', 'mode', 'variance',
+    'standard deviation', 'normal distribution', 'binomial distribution',
+    'poisson distribution', 'hypothesis testing', 'confidence interval',
+    'regression', 'correlation', 'bayes theorem', 'conditional probability',
+    'expected value', 'random variable', 'central limit theorem',
+    # Discrete math & number theory
+    'discrete math', 'combinatorics', 'permutation', 'combination',
+    'number theory', 'modular arithmetic', 'prime', 'gcd', 'lcm',
+    'euclidean algorithm', 'fermat', 'euler totient',
+    'graph theory', 'pigeonhole principle', 'inclusion exclusion',
+    'recurrence relation', 'generating function',
+    'set theory', 'boolean algebra', 'propositional logic',
+    # Geometry & trig
+    'geometry', 'trigonometry', 'sin', 'cos', 'tan',
+    'pythagorean', 'unit circle', 'radians',
+    'area', 'volume', 'perimeter', 'circumference',
+    'congruence', 'similarity', 'transformation',
+    # Algebra
+    'polynomial', 'quadratic', 'factoring', 'logarithm', 'exponential',
+    'complex number', 'imaginary', 'rational expression',
+    'arithmetic', 'sequence', 'series', 'summation', 'binomial theorem',
+    'complex analysis', 'abstract algebra', 'group theory', 'topology',
+}
+
+# Algorithm/data-structure topics for fallback matching when the problem
+# doesn't match a dedicated known algorithm
+_ALGO_TOPICS = {
+    'dynamic programming', 'dp', 'greedy', 'backtracking', 'recursion',
+    'divide and conquer', 'binary search', 'two pointers', 'sliding window',
+    'breadth first search', 'bfs', 'depth first search', 'dfs',
+    'dijkstra', 'bellman ford', 'floyd warshall', 'topological sort',
+    'minimum spanning tree', 'kruskal', 'prim', 'union find',
+    'hash table', 'hash map', 'linked list', 'stack', 'queue', 'deque',
+    'binary tree', 'binary search tree', 'avl tree', 'heap', 'priority queue',
+    'trie', 'segment tree', 'fenwick tree', 'bit manipulation',
+    'string matching', 'kmp', 'rabin karp', 'suffix array',
+    'memoization', 'tabulation', 'knapsack', 'longest common subsequence',
+    'shortest path', 'maximum flow', 'minimum cut', 'bipartite matching',
+    'sorting', 'merge sort', 'quick sort', 'heap sort', 'counting sort',
+    'radix sort', 'bucket sort', 'insertion sort', 'selection sort',
+    'graph', 'tree', 'array', 'matrix', 'string',
+    'monotonic stack', 'monotonic queue', 'prefix sum', 'difference array',
+    'binary indexed tree', 'sparse table', 'disjoint set',
+    'a star', 'minimax', 'alpha beta pruning',
+    'convex hull', 'sweep line', 'interval scheduling',
 }
 
 
@@ -45,8 +130,18 @@ def _is_math_query(query: str) -> bool:
     return any(topic in q for topic in _MATH_TOPICS)
 
 
+def _is_algo_query(query: str) -> bool:
+    """Detect if the query is about algorithms/data structures."""
+    q = query.lower()
+    return any(topic in q for topic in _ALGO_TOPICS)
+
+
 def _extract_query_topics(query: str) -> list[str]:
-    """Return distinct known topics mentioned in the query."""
+    """Return distinct known topics mentioned in the query.
+
+    Falls back to _ALGO_TOPICS and _MATH_TOPICS if no known topic is found
+    in the primary list, so we still get useful context for uncommon problems.
+    """
     q = query.lower()
     found = []
     for topic in _KNOWN_TOPICS:
@@ -57,6 +152,11 @@ def _extract_query_topics(query: str) -> list[str]:
         found.remove('cpp')
     if 'golang' in found and 'go' in found:
         found.remove('golang')
+    # Fallback: if no known topic matched, check algo and math sets
+    if not found:
+        for topic in _ALGO_TOPICS | _MATH_TOPICS:
+            if topic in q and topic not in found:
+                found.append(topic)
     return found
 
 

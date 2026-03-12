@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, desktopCapturer, screen, dialog, globalShortcut } from 'electron';
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, execSync, ChildProcess } from 'child_process';
 import path from 'path';
 
 // webpack plugin magic constants, replaced at build time
@@ -201,5 +201,14 @@ app.on('window-all-closed', () => {
 });
 
 app.on('will-quit', () => {
-  pythonProcess?.kill();
+  if (pythonProcess?.pid) {
+    // On Windows, process.kill() only kills the parent — the uvicorn --reload
+    // worker child survives as an orphan and keeps holding port 8000.
+    // taskkill /T kills the entire process tree.
+    try {
+      execSync(`taskkill /PID ${pythonProcess.pid} /T /F`);
+    } catch {
+      pythonProcess.kill();
+    }
+  }
 });
