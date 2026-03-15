@@ -167,6 +167,70 @@ class CodeAgent:
         return chosen
 
     @staticmethod
+    def _strip_file_level_declarations(code: str, ext: str) -> str:
+        """Strip package/import/include declarations that the LLM should not generate.
+
+        The whole-function rewrite prompt asks for function code only, but 7B models
+        often prepend ``package main`` or ``import (...)`` blocks. This strips them
+        so the output can be spliced into the existing file safely.
+        """
+        if ext not in ('.go', '.py', '.c', '.cpp', '.h', '.hpp', '.rs', '.java'):
+            return code
+        lines = code.split('\n')
+        cleaned: list[str] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            # Go: strip 'package ...' declarations
+            if ext == '.go' and re.match(r'^package\s+\w+', line):
+                i += 1
+                # skip blank lines after package
+                while i < len(lines) and not lines[i].strip():
+                    i += 1
+                continue
+            # Go: strip 'import (...)' or 'import "..."' blocks
+            if ext == '.go' and line.startswith('import'):
+                if '(' in line:
+                    # multi-line import block
+                    i += 1
+                    while i < len(lines) and ')' not in lines[i]:
+                        i += 1
+                    i += 1  # skip closing ')'
+                    # skip blank lines after import
+                    while i < len(lines) and not lines[i].strip():
+                        i += 1
+                    continue
+                else:
+                    i += 1  # single-line import
+                    while i < len(lines) and not lines[i].strip():
+                        i += 1
+                    continue
+            # Python: strip 'import ...' or 'from ... import ...' at top level
+            if ext == '.py' and re.match(r'^(import |from \S+ import )', line):
+                i += 1
+                continue
+            cleaned.append(lines[i])
+            i += 1
+        # Don't return empty string
+        result = '\n'.join(cleaned).strip()
+        return result if result else code
+        # Heuristic: long/complex instructions warrant cross-encoder; quick/simple ones use keyword
+        COMPLEX_KEYWORDS = {
+            "refactor", "fix", "bug", "error", "crash", "broken", "wrong", "fail",
+            "implement", "add feature", "redesign", "rewrite", "optimize", "performance",
+            "async", "concurrent", "race condition", "exception", "traceback"
+        }
+        instruction_lower = instruction.lower()
+        word_count = len(instruction_lower.split())
+        is_complex = (
+            word_count > 12 or
+            any(kw in instruction_lower for kw in COMPLEX_KEYWORDS)
+        )
+        chosen = "cross_encoder" if is_complex else "keyword"
+        logger.info("[AGENT] rerank auto-selected: %s (complex=%s)", chosen, is_complex)
+        return chosen
+
+    @staticmethod
     def _clarify_instruction(instruction: str, source: str, ext: str) -> str:
         """Normalize casual/vague user instructions into precise technical requirements.
 
@@ -351,7 +415,7 @@ class CodeAgent:
         context_block = combined_context + extra_syntax
 
         # --- Cap context to avoid bloated prompts that stall the LLM ---
-        _MAX_CONTEXT_CHARS = 6000  # ~1500 tokens of reference context
+        _MAX_CONTEXT_CHARS = 12000  # ~3000 tokens of reference context
         if len(context_block) > _MAX_CONTEXT_CHARS:
             logger.warning(
                 "[AGENT] Context block too large (%d chars), truncating to %d",
@@ -396,7 +460,7 @@ class CodeAgent:
         )
 
         # --- Cap original_snippet to prevent enormous prompts ---
-        _MAX_SNIPPET_CHARS = 12000  # ~3000 tokens of code
+        _MAX_SNIPPET_CHARS = 20000  # ~5000 tokens of code
         if len(original_snippet) > _MAX_SNIPPET_CHARS:
             logger.warning(
                 "[AGENT] File snippet too large (%d chars), truncating to %d",
@@ -700,6 +764,11 @@ class CodeAgent:
             logger.warning("Verbatim retry also failed — falling back to whole-function rewrite")
             # Strong language reminder at end of prompt (7B models lose early context)
             lang_reminder = f"\nREMINDER: Output {lang_name} code ONLY. The file extension is {ext}. Do NOT write Python or any other language.\n"
+            # Prevent LLM from regenerating file-level declarations
+            no_package_rule = (
+                "5. Do NOT output 'package', 'import', '#include', or any file-level declarations. "
+                "Output ONLY the function body/definition — the file already has its own package and imports.\n"
+            )
 
             # If verbatim is empty, the instruction is about a NEW function
             # that doesn't exist yet — generate it and APPEND to the file.
@@ -715,6 +784,7 @@ class CodeAgent:
                     "1. Output ONLY the new function — no explanation, no markdown fence.\n"
                     "2. Do NOT reproduce any existing functions from the file.\n"
                     "3. Match the coding style and indentation of the existing file.\n"
+                    f"{no_package_rule}"
                     f"{context_block}"
                     f"{lang_reminder}"
                 )
@@ -729,6 +799,7 @@ class CodeAgent:
                     "2. Write a real, working algorithm. Do NOT leave the body empty or return a placeholder.\n"
                     "3. Keep exact indentation of the original.\n"
                     "4. Output ONLY this function — do NOT include other functions from the file.\n"
+                    f"{no_package_rule}"
                     f"{context_block}"
                     f"{lang_reminder}"
                 )
@@ -748,6 +819,10 @@ class CodeAgent:
             try:
                 rewritten = llm.invoke(rewrite_prompt).strip()
                 rewritten = strip_markdown(rewritten) if "```" in rewritten else rewritten
+
+                # Strip package/import declarations that LLM should not have generated
+                rewritten = self._strip_file_level_declarations(rewritten, ext)
+
                 if rewritten.strip():
                     # Language guard: reject if LLM generated the wrong language
                     if not source_matches_ext(rewritten, ext):
@@ -920,11 +995,16 @@ class CodeAgent:
                 f"You just wrote code to satisfy this requirement:\n"
                 f"REQUIREMENT: {instruction}\n\n"
                 f"YOUR CODE:\n```{lang_fence}\n{new_source}\n```\n\n"
-                "Does this code correctly and completely satisfy the requirement?\n"
+                "Grade this code CRITICALLY. Check ALL of the following:\n"
+                "1. Does the code implement the CORRECT function matching the requirement?\n"
+                "   (e.g., if the requirement says 'getHappyString', does the code define 'getHappyString'?)\n"
+                "2. Does the algorithm actually produce the correct output for the given problem?\n"
+                "3. Does it handle all edge cases?\n"
+                "4. Were any existing unrelated functions accidentally modified or removed?\n\n"
                 "Respond with EXACTLY one of these two formats:\n"
-                "  CORRECT: <brief reason>\n"
-                "  ISSUE: <specific description of the bug or missing logic>\n\n"
-                "Only output one line. No other text."
+                "  CORRECT: <brief reason why it fully satisfies the requirement>\n"
+                "  ISSUE: <specific description of the bug, wrong function, or missing logic>\n\n"
+                "Be STRICT. If in doubt, say ISSUE. Only output one line. No other text."
             )
             grade_result = llm.invoke(grade_prompt).strip()
             logger.info("[AGENT] Self-grade: %s", grade_result[:200])
@@ -1198,6 +1278,7 @@ class CodeAgent:
             )
             rewritten = pivot_llm.invoke(prompt).strip()
             rewritten = strip_markdown(rewritten) if "```" in rewritten else rewritten
+            rewritten = self._strip_file_level_declarations(rewritten, ext)
 
             if not rewritten.strip():
                 logger.warning("[STRATEGY_PIVOT] LLM returned empty output")
@@ -1385,6 +1466,7 @@ class CodeAgent:
                         )
                         rewritten = rewrite_llm.invoke(rewrite_prompt).strip()
                         rewritten = strip_markdown(rewritten) if "```" in rewritten else rewritten
+                        rewritten = self._strip_file_level_declarations(rewritten, ext)
 
                         if rewritten.strip() and source_matches_ext(rewritten, ext):
                             _, func_start, func_end = extract_function(source, instruction)

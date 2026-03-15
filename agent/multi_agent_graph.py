@@ -26,6 +26,7 @@ from langgraph.graph import StateGraph, END
 from langchain_ollama import OllamaLLM
 
 from brain.config import LLM_MODEL, LANG_FENCE, LANG_NAMES, make_llm
+from brain.timed_llm import is_cancelled, CancelledError
 from agent.orchestration import plan_task, format_plan_for_prompt, critique_code, build_critic_feedback_note
 from print_logger import get_logger
 
@@ -138,7 +139,7 @@ def strategist_node(state: AgentState) -> dict:
         rag_results = fast_topic_search(
             rag_query,
             top_k=5,
-            rerank_method="cross_encoder",
+            rerank_method="keyword",
             topic_filter=_topics,
         )
         if rag_results:
@@ -242,6 +243,10 @@ def execute_node(state: AgentState) -> dict:
         augmented += related_context
 
     logger.info("[EXECUTE] Attempt %d — running code agent", state["attempt"])
+
+    # Bail out early if cancellation was requested
+    if is_cancelled():
+        raise CancelledError("Cancelled before execute_node")
 
     # On retry attempts, write the current_source to disk so edit_code reads the
     # updated file rather than the stale original.
@@ -403,6 +408,10 @@ def discuss_node(state: AgentState) -> dict:
     llm = make_llm(temperature=0.3)
     lang = LANG_FENCE.get(state["ext"], state["ext"].lstrip('.'))
     discussion = list(state.get("discussion_log") or [])
+
+    # Bail out early if cancellation was requested
+    if is_cancelled():
+        raise CancelledError("Cancelled before discuss_node")
 
     critic_feedback = state.get("critic_feedback", "No specific feedback")
     current_code = state.get("current_source", "")[:4000]
@@ -913,7 +922,16 @@ def run_multi_agent(
     }
 
     graph = get_agent_graph()
-    final_state = graph.invoke(initial_state)
+    try:
+        final_state = graph.invoke(initial_state)
+    except CancelledError:
+        # Restore original file on cancellation
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(source)
+        except Exception:
+            pass
+        raise
 
     # Restore the original file on disk — the pipeline may have written
     # intermediate sources during retries. The user must approve via the

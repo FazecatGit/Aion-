@@ -23,13 +23,13 @@ MATH_LLM_MODEL = os.getenv("RAG_MATH_LLM_MODEL", "qwen3")  # Dedicated math mode
 LLM_TEMPERATURE = float(os.getenv("RAG_LLM_TEMPERATURE", "0"))
 
 # LLM context / generation limits (adjust based on model VRAM)
-LLM_NUM_CTX = int(os.getenv("RAG_LLM_NUM_CTX", "8192"))          # context window tokens
-LLM_NUM_PREDICT = int(os.getenv("RAG_LLM_NUM_PREDICT", "4096"))   # max output tokens
+LLM_NUM_CTX = int(os.getenv("RAG_LLM_NUM_CTX", "16384"))          # context window tokens
+LLM_NUM_PREDICT = int(os.getenv("RAG_LLM_NUM_PREDICT", "8192"))   # max output tokens
 LLM_TIMEOUT_SECONDS = int(os.getenv("RAG_LLM_TIMEOUT", "180"))    # per-call timeout (seconds)
 
 
-LLM_NUM_CTX_HARD = int(os.getenv("RAG_LLM_NUM_CTX_HARD", "16384"))
-LLM_NUM_PREDICT_HARD = int(os.getenv("RAG_LLM_NUM_PREDICT_HARD", "8192"))
+LLM_NUM_CTX_HARD = int(os.getenv("RAG_LLM_NUM_CTX_HARD", "32768"))
+LLM_NUM_PREDICT_HARD = int(os.getenv("RAG_LLM_NUM_PREDICT_HARD", "16384"))
 
 
 def make_llm(model: str = None, temperature: float = None, *,

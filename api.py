@@ -43,6 +43,10 @@ def check_cancelled():
     """Check if a cancellation has been requested. Agent code can call this."""
     return _cancel_event.is_set()
 
+# Register the cancellation check with TimedLLM so every LLM call can bail out
+from brain.timed_llm import register_cancel_check
+register_cancel_check(check_cancelled)
+
 # ── Process log streaming (SSE) ───────────────────────────────────────────────
 # Captures logs from agent/brain modules and streams them to the frontend
 # in real-time via Server-Sent Events so the user can see backend thinking.
@@ -620,6 +624,10 @@ async def agent_edit(req: AgentEditRequest):
             "new_source": new_source,
         }
     except Exception as e:
+        from brain.timed_llm import CancelledError
+        if isinstance(e, CancelledError) or _cancel_event.is_set():
+            _cancel_event.clear()
+            return {"status": "error", "error": "Cancelled by user"}
         _api_log.error("agent_edit failed: %s\n%s", e, traceback.format_exc())
         return {"error": str(e), "status": "error", "message": f"Agent error: {str(e)}"}
 
@@ -789,6 +797,10 @@ async def agent_edit_with_chunks(req: AgentEditWithChunksRequest):
             "new_source": new_source,
         }
     except Exception as e:
+        from brain.timed_llm import CancelledError
+        if isinstance(e, CancelledError) or _cancel_event.is_set():
+            _cancel_event.clear()
+            return {"status": "error", "error": "Cancelled by user"}
         return {"error": str(e), "status": "error", "message": f"Agent error with {req.max_chunks} chunks: {str(e)}"}
 
 
@@ -890,6 +902,10 @@ async def agent_orchestrate(req: OrchestrateRequest):
         # field ("pending_review" when changes exist) to show approval buttons.
         return result
     except Exception as e:
+        from brain.timed_llm import CancelledError
+        if isinstance(e, CancelledError) or _cancel_event.is_set():
+            _cancel_event.clear()
+            return {"status": "error", "error": "Cancelled by user"}
         return {"error": str(e), "status": "error"}
 
 
@@ -1007,6 +1023,10 @@ async def fix_with_tests_endpoint(req: FixWithTestsRequest):
                 Path(resolved_path).write_text(original_content, encoding="utf-8")
             except Exception:
                 pass
+        from brain.timed_llm import CancelledError
+        if isinstance(e, CancelledError) or _cancel_event.is_set():
+            _cancel_event.clear()
+            return {"status": "error", "error": "Cancelled by user"}
         return {"error": str(e), "status": "error"}
 
 
