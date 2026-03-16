@@ -17,7 +17,7 @@ from brain.config import (
     LLM_MODEL, CHROMA_DIR, EMBEDDING_MODEL,
     LANG_CHECK_CMD, LANG_LINT_CMD, LANG_FENCE, LANG_DOC_KEYWORDS,
     LANG_IRRELEVANT_DOC_KEYWORDS, LANG_QUERY_ENHANCEMENT,
-    UNIVERSAL_DOC_KEYWORDS, IMPLEMENT_KEYWORDS,
+    UNIVERSAL_DOC_KEYWORDS, UNIVERSAL_TOPICS, IMPLEMENT_KEYWORDS,
 )
 from .code_editing_helpers import parse_compiler_errors
 from print_logger import get_logger
@@ -308,7 +308,8 @@ def _language_prefilter(chunks: list, file_ext: str) -> list:
     """Fast pre-filter: remove chunks from docs clearly written for a different language.
     
     Uses source filename matching — no LLM call needed.
-    Language-agnostic docs (clean code, refactoring) are always allowed through.
+    Language-agnostic docs (algorithm textbooks, math, clean code, PDFs about
+    universal concepts) are always allowed through.
     If the file extension has no filter rules, all chunks pass through unchanged.
     """
     ext = file_ext.lower()
@@ -319,8 +320,14 @@ def _language_prefilter(chunks: list, file_ext: str) -> list:
     filtered = []
     for doc in chunks:
         source = doc.metadata.get('source', '').lower().replace(' ', '_').replace('-', '_')
+        topic = doc.metadata.get('topic', '').lower()
 
-        # Always allow language-agnostic docs
+        # Always allow docs whose topic is language-agnostic (algorithms, math, etc.)
+        if topic in UNIVERSAL_TOPICS:
+            filtered.append(doc)
+            continue
+
+        # Always allow docs matching universal keyword patterns (textbooks, etc.)
         if any(u in source for u in UNIVERSAL_DOC_KEYWORDS):
             filtered.append(doc)
             continue
@@ -402,10 +409,12 @@ def _grade_chunks(chunks: list, instruction: str, llm, file_ext: str = "") -> li
     needs_grading = []
     for doc in chunks:
         source = doc.metadata.get('source', '').lower().replace(' ', '_').replace('-', '_')
+        topic = doc.metadata.get('topic', '').lower()
         
-        # Auto-pass: correct language OR universal doc
+        # Auto-pass: correct language OR universal doc (by keyword or topic)
         if (source_keywords and any(kw.replace('-', '_') in source for kw in source_keywords)) or \
-           any(u in source for u in UNIVERSAL_DOC_KEYWORDS):
+           any(u in source for u in UNIVERSAL_DOC_KEYWORDS) or \
+           topic in UNIVERSAL_TOPICS:
             doc.metadata['graded'] = True
             doc.metadata['auto_pass'] = True
             auto_pass.append(doc)
@@ -516,6 +525,22 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
     if any(kw in _inst_lower for kw in _algo_keywords):
         algo_topic_filter = ["algorithms"]
         logger.info("[RAG] Detected algorithm-related instruction, adding topic filter")
+
+        # Query expansion: use a single LLM call to extract precise algorithm
+        # keywords from the problem description.  This turns vague descriptions
+        # like "Fancy sequence" into "lazy evaluation modular inverse prefix sum"
+        # so BM25 and semantic search can actually find the right textbook chunks.
+        try:
+            from brain.config import make_llm
+            from brain.prompts import build_code_query_expansion_prompt
+            expand_llm = make_llm(temperature=0.0)
+            expansion_prompt = build_code_query_expansion_prompt(instruction)
+            expanded_terms = expand_llm.invoke(expansion_prompt).strip()
+            if expanded_terms and len(expanded_terms) < 300:
+                enhanced_query = f"{enhanced_query} {expanded_terms}"
+                logger.info("[RAG] Query expansion added: %s", expanded_terms)
+        except Exception as e:
+            logger.warning("[RAG] Query expansion failed (continuing without): %s", e)
     
     # --- BM25 Search (keyword-based) ---
     bm25_results = []
@@ -545,8 +570,10 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
             embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
             vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
             
+            # Truncate query to prevent embedding model overflow
+            semantic_query = enhanced_query[:2000] if len(enhanced_query) > 2000 else enhanced_query
             # Get semantic results (more than max_chunks for RRF fusion)
-            semantic_docs = vectorstore.similarity_search(enhanced_query, k=max_chunks * 2)
+            semantic_docs = vectorstore.similarity_search(semantic_query, k=max_chunks * 2)
             
             if semantic_docs and file_path:
                 # Apply language pre-filter
@@ -575,6 +602,23 @@ def build_rag_context(instruction: str, use_rag: bool, rerank_method: str = "cro
     elif search_method == "semantic":
         final_results = chroma_results[:max_chunks * 2]
     
+    # --- Cross-encoder rerank after fusion (better precision on top-k) ---
+    if final_results and rerank_method == "cross_encoder":
+        try:
+            from brain.query_pipeline import rerank_documents
+            from brain.config import CROSS_ENCODER_MODEL, RERANK_BATCH_SIZE
+            pre_rerank = len(final_results)
+            final_results = rerank_documents(
+                docs=final_results,
+                query=instruction,
+                method="cross_encoder",
+                cross_encoder_model=CROSS_ENCODER_MODEL,
+                batch_size=RERANK_BATCH_SIZE,
+            )
+            logger.info("[RAG] Cross-encoder reranked %d → %d results", pre_rerank, len(final_results))
+        except Exception as e:
+            logger.warning("[RAG] Cross-encoder rerank failed (continuing without): %s", e)
+
     # --- Grade fused results for relevance ---
     if final_results:
         logger.info("[RAG] Grading %d fused chunks...", len(final_results))

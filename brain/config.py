@@ -171,7 +171,27 @@ LANG_IRRELEVANT_DOC_KEYWORDS: dict[str, list[str]] = {
 }
 
 # Language-agnostic docs always pass through filters
-UNIVERSAL_DOC_KEYWORDS: list[str] = ['clean-code', 'clean_code', 'refactoring', 'legacy', 'design', 'design_patterns']
+# These match against source filenames (after normalising spaces/hyphens to _)
+UNIVERSAL_DOC_KEYWORDS: list[str] = [
+    # Software-design classics
+    'clean-code', 'clean_code', 'refactoring', 'legacy', 'design', 'design_patterns',
+    # Algorithm / DS textbooks & concepts
+    'algorithm', 'data_structure', 'data-structure', 'leetcode', 'competitive',
+    'introduction_to_algo', 'clrs', 'skiena', 'sedgewick', 'cormen',
+    'cracking_the_coding', 'programming_pearls', 'art_of_programming',
+    'elements_of_programming', 'competitive_programming',
+    # Math / theory
+    'math', 'discrete', 'combinatorics', 'number_theory', 'probability',
+    'linear_algebra', 'calculus',
+    # Generic reference markers
+    'handbook', 'textbook', 'tutorial', 'reference', 'cheat_sheet',
+    'editorial', 'solution_explanation',
+]
+
+# Topic labels (from ingest metadata) that are language-agnostic
+UNIVERSAL_TOPICS: set[str] = {
+    'algorithms', 'clean-code', 'mathematics',
+}
 
 # Keywords that identify implementation/solve tasks
 IMPLEMENT_KEYWORDS: set[str] = {

@@ -302,6 +302,9 @@ class FeedbackRequest(BaseModel):
 
 @app.post("/query")
 async def query(req: QueryRequest):
+    # Always clear any stale cancellation from a previous agent operation so
+    # the chat endpoint is never silently broken after a user cancels the agent.
+    _cancel_event.clear()
     try:
         # Build context from persistent session if session_id provided
         if req.session_id:

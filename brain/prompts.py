@@ -75,6 +75,18 @@ Keep it focused and under 20 extra words. Return only expanded query text.
 Question: {query}"""
 
 
+CODE_QUERY_EXPANSION_PROMPT = """You are helping a code agent retrieve relevant algorithm documentation.
+
+Given a coding problem description, output 3-8 precise technical keywords that would appear in an algorithm textbook covering the solution technique. Focus on:
+- The algorithmic technique (e.g. "dynamic programming", "segment tree", "lazy propagation")
+- The mathematical concept (e.g. "modular inverse", "prefix sum", "recurrence relation")
+- The data structure (e.g. "monotonic stack", "trie", "union-find")
+
+Return ONLY the keywords separated by spaces, no explanations.
+
+Problem: {query}"""
+
+
 def build_spell_correction_prompt(query: str) -> str:
     return QUERY_SPELL_CORRECTION_PROMPT.format(query=query)
 
@@ -85,3 +97,7 @@ def build_query_rewrite_prompt(query: str) -> str:
 
 def build_query_expansion_prompt(query: str) -> str:
     return QUERY_EXPANSION_PROMPT.format(query=query)
+
+
+def build_code_query_expansion_prompt(query: str) -> str:
+    return CODE_QUERY_EXPANSION_PROMPT.format(query=query)

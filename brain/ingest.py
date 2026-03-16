@@ -116,6 +116,11 @@ def _enrich_metadata(doc) -> dict:
     } | {"source": source_name, "topic": topic}
     if algo_category:
         result["algo_category"] = algo_category
+
+    # Detect editorial / solution-explanation content
+    name_lower = Path(raw_source).stem.lower().replace("-", "_").replace(" ", "_")
+    if any(tag in name_lower for tag in ("editorial", "solution_explanation", "approach", "walkthrough")):
+        result["doc_type"] = "editorial"
     return result
 
 
@@ -667,6 +672,98 @@ async def batch_ingest_all(verbose: bool = True):
         print()
     
     return docs, topic_map
+
+
+# ── Problem → Editorial pair ingestion ────────────────────────────────────────
+
+def ingest_editorials(pairs: list[dict]) -> int:
+    """Ingest problem→editorial pairs into Chroma and BM25 for hard-problem reasoning.
+
+    Each dict in *pairs* should have:
+        - "problem":   str  – the problem statement / title
+        - "editorial": str  – the explanation of *why* the solution works
+        - "tags":      list[str] (optional) – e.g. ["dp", "segment-tree", "lazy-propagation"]
+
+    The editorial text is chunked normally and stored with metadata:
+        topic = "algorithms", doc_type = "editorial",
+        problem_title = <problem>, algo_category = first tag (if any).
+
+    Returns the number of new chunks added.
+    """
+    from langchain_core.documents import Document
+
+    if not pairs:
+        return 0
+
+    splits_path = Path("cache/splits.pkl")
+    existing_splits = []
+    if splits_path.exists():
+        with splits_path.open("rb") as f:
+            existing_splits = pickle.load(f)
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+
+    new_chunks = []
+    for entry in pairs:
+        problem = entry.get("problem", "").strip()
+        editorial = entry.get("editorial", "").strip()
+        tags = entry.get("tags", [])
+        if not editorial:
+            continue
+
+        # Combine problem statement + editorial so the chunk is self-contained
+        combined = f"Problem: {problem}\n\nEditorial / Solution Explanation:\n{editorial}"
+        raw_doc = Document(
+            page_content=combined,
+            metadata={
+                "source": f"editorial_{problem[:60].replace(' ', '_')}",
+                "topic": "algorithms",
+                "doc_type": "editorial",
+                "problem_title": problem,
+                "algo_category": tags[0] if tags else "",
+            },
+        )
+        new_chunks.extend(splitter.split_documents([raw_doc]))
+
+    if not new_chunks:
+        return 0
+
+    combined_splits = existing_splits + new_chunks
+
+    # Update BM25
+    tokenized = [doc.page_content.lower().split() for doc in combined_splits]
+    bm25_idx = BM25Okapi(tokenized)
+    pickle.dump(bm25_idx, Path("cache/global_bm25.pkl").open("wb"))
+
+    # Update Chroma
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+    cleaned = []
+    for doc in new_chunks:
+        c = doc.copy()
+        c.metadata = _enrich_metadata(doc)
+        # Preserve editorial-specific fields that _enrich_metadata may not set
+        c.metadata.setdefault("doc_type", "editorial")
+        c.metadata.setdefault("problem_title", doc.metadata.get("problem_title", ""))
+        cleaned.append(c)
+
+    if os.path.exists(CHROMA_DIR):
+        Chroma.from_documents(
+            cleaned, embedding=embeddings, persist_directory=CHROMA_DIR,
+            collection_metadata={"hnsw:space": "cosine"},
+        )
+    else:
+        Chroma.from_documents(
+            cleaned, embedding=embeddings, persist_directory=CHROMA_DIR,
+            collection_metadata={"hnsw:space": "cosine"},
+        )
+
+    # Save updated splits
+    with splits_path.open("wb") as f:
+        pickle.dump(combined_splits, f)
+
+    _write_index_metadata(len(combined_splits))
+    _log(f"Ingested {len(new_chunks)} editorial chunks from {len(pairs)} problem/editorial pairs")
+    return len(new_chunks)
 
 
 # Entry point for running as script: python -m brain.ingest

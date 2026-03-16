@@ -99,9 +99,11 @@ class SessionMemory:
         k: int = 5,
     ) -> List[Document]:
         """Retrieve the most relevant past turns for a given query within a session."""
+        # Truncate query to prevent embedding model overflow (nomic-embed-text has 8192 token limit)
+        truncated_query = query[:2000] if len(query) > 2000 else query
         # Fetch more than k so we can filter by session_id
         results = self._store.similarity_search(
-            query,
+            truncated_query,
             k=k * 3,
             filter={"session_id": session_id},
         )
@@ -126,7 +128,8 @@ class SessionMemory:
 
     def build_context_block(self, session_id: str, query: str, k: int = 4) -> str:
         """Build a formatted context string from relevant past turns."""
-        docs = self.recall(session_id, query, k=k)
+        # Truncate query for recall (embedding overflow protection)
+        docs = self.recall(session_id, query[:2000], k=k)
         if not docs:
             return ""
 

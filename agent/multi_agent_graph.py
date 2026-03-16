@@ -67,6 +67,8 @@ class AgentState(TypedDict):
     # Test-driven execution
     test_cases: Optional[List[Dict]]    # [{input, expected}] — enables execution-based critique
     test_results: Optional[List[Dict]]  # [{input, expected, actual, passed, error}]
+    # Critic confidence (used for early strategy rejection)
+    critic_confidence: float
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -129,8 +131,10 @@ def strategist_node(state: AgentState) -> dict:
     rag_section = ""
     try:
         from brain.fast_search import fast_topic_search
-        # Build a query targeting algorithm patterns, not just the language
-        rag_query = f"algorithm {approach} dynamic programming combinatorics {instruction[:150]}"
+        # Build a query from the problem statement only — do NOT include the
+        # planner's approach, as it may be wrong and would bias retrieval toward
+        # the same incorrect algorithm.
+        rag_query = f"algorithm data structure {instruction[:300]}"
         from brain.config import EXT_TO_TOPIC
         _topics = ["algorithms", "clean-code"]
         _lang_topic = EXT_TO_TOPIC.get(ext)
@@ -355,8 +359,10 @@ def critique_node(state: AgentState) -> dict:
             "Fix the specific logic errors causing wrong output."
         )
         feedback = "\n".join(feedback_lines)
-        logger.info("[CRITIQUE] %d/%d tests pass \u2014 FAIL", pass_count, total)
-        return {"verdict": "FAIL", "critic_feedback": feedback, "test_results": test_results}
+        # Derive confidence from pass ratio — 0/5 = 0.0, 3/5 = 0.6
+        exec_confidence = pass_count / total if total > 0 else 0.0
+        logger.info("[CRITIQUE] %d/%d tests pass — FAIL (confidence %.2f)", pass_count, total, exec_confidence)
+        return {"verdict": "FAIL", "critic_feedback": feedback, "test_results": test_results, "critic_confidence": exec_confidence}
 
     # LLM-based critique (no tests available) 
     logger.info("[CRITIQUE] Reviewing code changes...")
@@ -378,7 +384,7 @@ def critique_node(state: AgentState) -> dict:
             return {"verdict": "PASS", "critic_feedback": ""}
 
         feedback = build_critic_feedback_note(critique)
-        return {"verdict": "FAIL", "critic_feedback": feedback}
+        return {"verdict": "FAIL", "critic_feedback": feedback, "critic_confidence": critique["confidence"]}
 
     except Exception as e:
         logger.warning("[CRITIQUE] Failed: %s", e)
@@ -497,11 +503,16 @@ def discuss_node(state: AgentState) -> dict:
         f"AGENT DISCUSSION CONSENSUS:\n{consensus}"
     )
 
-    # ── Strategist escalation on repeated failures ──────────────────
-    # If we've failed 2+ times, the algorithm itself may be wrong.
-    # Re-invoke the strategist with the full failure context so it can
-    # propose a fundamentally different approach rather than patching.
-    if state["attempt"] >= 2:
+    # ── Strategist escalation on repeated failures or low confidence ─
+    # If we've failed 2+ times OR critic confidence is very low (≤0.2),
+    # the algorithm itself is likely wrong. Re-invoke the strategist with
+    # the full failure context so it can propose a fundamentally different
+    # approach rather than patching.
+    critic_confidence = state.get("critic_confidence", 1.0)
+    needs_strategy_rethink = state["attempt"] >= 2 or critic_confidence <= 0.2
+    if needs_strategy_rethink:
+        if critic_confidence <= 0.2:
+            logger.info("[DISCUSS] LOW CONFIDENCE (%.2f) — forcing strategy rethink at attempt %d", critic_confidence, state["attempt"])
         logger.info("[DISCUSS] Escalating to strategist (attempt %d)", state["attempt"])
         try:
             llm_strat = make_llm(temperature=0.2)

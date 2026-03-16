@@ -624,85 +624,73 @@ class CodeAgent:
             logger.debug("Block %s REPLACE:\n%s", i + 1, r)
 
         # --- Auto-retry if no valid blocks found ---
-        retry_count = 0
-        max_retries = 2
-        while not blocks and retry_count < max_retries:
-            logger.warning("Bad format from LLM: SEARCH/REPLACE not found. Retry %s/%s", retry_count + 1, max_retries)
-            followup = (
-                f"You must ONLY output a SEARCH/REPLACE block in this exact format (no explanation):\n"
-                f"{FORMAT_BLOCK}\n\n"
-                "The SEARCH block must include the exact surrounding lines from the target file "
-                "so it matches character-for-character.\n"
-                "Previous LLM output:\n" + raw_output[:8000] + "\n\n"
-                "Re-output the corrected SEARCH/REPLACE block now."
-            )
-            try:
-                raw_output = llm.invoke(followup).strip()
-            except Exception as e:
-                logger.error("LLM re-invocation failed: %s", e)
-                logger.debug(traceback.format_exc())
-                break
-            blocks, raw_output = parse_blocks_with_retry(raw_output)
-            retry_count += 1
-
+        # Skip expensive format retry chain — go straight to whole-function rewrite
+        format_failed = False
         if not blocks:
-            logger.error("Bad format from LLM after retries: SEARCH/REPLACE not found.")
-            return file_source
+            logger.warning("Bad format from LLM: SEARCH/REPLACE not found. Skipping to whole-function rewrite.")
+            format_failed = True
 
-        # --- Apply blocks sequentially ---
-        source_lines = _apply_repair_blocks(blocks, file_lines[:], prefix="Block")
+        if format_failed:
+            # Jump to whole-function rewrite — extract_function needs to run first
+            verbatim, func_start, func_end = extract_function(file_source, instruction, hint_blocks=None)
+            new_source = file_source
 
-        post_errors = collect_syntax_errors("\n".join(source_lines), path) if is_python else []
+        # --- Apply blocks sequentially (skip if format failed) ---
+        if not format_failed:
+            source_lines = _apply_repair_blocks(blocks, file_lines[:], prefix="Block")
 
-        if post_errors and not syntax_errors:
-            logger.warning("LLM edits introduced %s new syntax error(s) in %s", len(post_errors), path)
-            current_source = "\n".join(source_lines)
-            current_lines = current_source.split('\n')
-            post_error_note = build_post_error_note(post_errors, current_lines)
-            reinvoke_prompt = (
-                f"CURRENT FILE STATE:\n```{lang_fence}\n{current_source}\n```\n\n"
-                "Your previous edits introduced new syntax errors listed below. "
-                "Fix them without reverting the intended changes.\n\n"
-                f"{post_error_note}"
-                "Output ONE SEARCH/REPLACE block per error, top to bottom.\n"
-                "Each SEARCH block must match the CURRENT FILE STATE exactly."
-            )
-            try:
-                raw_output = llm.invoke(reinvoke_prompt).strip()
-                repair_blocks, raw_output = parse_blocks_with_retry(raw_output)
-                source_lines = _apply_repair_blocks(
-                    repair_blocks, source_lines, prefix="Self-repair Block"
-                )
-            except Exception as e:
-                logger.error("Self-repair LLM call failed: %s", e)
-                logger.debug(traceback.format_exc())
+            post_errors = collect_syntax_errors("\n".join(source_lines), path) if is_python else []
 
-        new_source = "\n".join(source_lines)
-
-        # --- Structural validation (all languages: brace balance, unreachable code, indentation) ---
-        structural_issues = validate_code_structure(new_source, ext)
-        if structural_issues and new_source != file_source:
-            logger.warning("Structural issues after edit: %s", [i['msg'] for i in structural_issues])
-            structural_note = build_structural_issue_note(structural_issues, source_lines)
-            try:
-                repair_prompt = (
-                    f"CURRENT FILE STATE:\n```{lang_fence}\n{new_source}\n```\n\n"
-                    "Your previous edits introduced structural issues. "
+            if post_errors and not syntax_errors:
+                logger.warning("LLM edits introduced %s new syntax error(s) in %s", len(post_errors), path)
+                current_source = "\n".join(source_lines)
+                current_lines = current_source.split('\n')
+                post_error_note = build_post_error_note(post_errors, current_lines)
+                reinvoke_prompt = (
+                    f"CURRENT FILE STATE:\n```{lang_fence}\n{current_source}\n```\n\n"
+                    "Your previous edits introduced new syntax errors listed below. "
                     "Fix them without reverting the intended changes.\n\n"
-                    f"{structural_note}"
-                    "Output ONE SEARCH/REPLACE block per issue.\n"
+                    f"{post_error_note}"
+                    "Output ONE SEARCH/REPLACE block per error, top to bottom.\n"
                     "Each SEARCH block must match the CURRENT FILE STATE exactly."
                 )
-                raw_repair = llm.invoke(repair_prompt).strip()
-                repair_blocks, _ = parse_blocks_with_retry(raw_repair)
-                source_lines = _apply_repair_blocks(
-                    repair_blocks, source_lines, prefix="Structural-repair"
-                )
-                new_source = "\n".join(source_lines)
-            except Exception as e:
-                logger.warning("Structural repair LLM call failed: %s", e)
+                try:
+                    raw_output = llm.invoke(reinvoke_prompt).strip()
+                    repair_blocks, raw_output = parse_blocks_with_retry(raw_output)
+                    source_lines = _apply_repair_blocks(
+                        repair_blocks, source_lines, prefix="Self-repair Block"
+                    )
+                except Exception as e:
+                    logger.error("Self-repair LLM call failed: %s", e)
+                    logger.debug(traceback.format_exc())
 
-        if new_source == file_source and blocks:
+            new_source = "\n".join(source_lines)
+
+        # --- Structural validation (all languages: brace balance, unreachable code, indentation) ---
+        if not format_failed:
+            structural_issues = validate_code_structure(new_source, ext)
+            if structural_issues and new_source != file_source:
+                logger.warning("Structural issues after edit: %s", [i['msg'] for i in structural_issues])
+                structural_note = build_structural_issue_note(structural_issues, source_lines)
+                try:
+                    repair_prompt = (
+                        f"CURRENT FILE STATE:\n```{lang_fence}\n{new_source}\n```\n\n"
+                        "Your previous edits introduced structural issues. "
+                        "Fix them without reverting the intended changes.\n\n"
+                        f"{structural_note}"
+                        "Output ONE SEARCH/REPLACE block per issue.\n"
+                        "Each SEARCH block must match the CURRENT FILE STATE exactly."
+                    )
+                    raw_repair = llm.invoke(repair_prompt).strip()
+                    repair_blocks, _ = parse_blocks_with_retry(raw_repair)
+                    source_lines = _apply_repair_blocks(
+                        repair_blocks, source_lines, prefix="Structural-repair"
+                    )
+                    new_source = "\n".join(source_lines)
+                except Exception as e:
+                    logger.warning("Structural repair LLM call failed: %s", e)
+
+        if not format_failed and new_source == file_source and blocks:
             logger.warning("Blocks parsed but no changes landed — triggering verbatim retry")
 
             try:
@@ -760,8 +748,11 @@ class CodeAgent:
                 logger.debug(traceback.format_exc())
 
         # --- Whole-function rewrite fallback ---
-        if new_source == file_source and blocks:
-            logger.warning("Verbatim retry also failed — falling back to whole-function rewrite")
+        if new_source == file_source and (blocks or format_failed):
+            if format_failed:
+                logger.warning("Format failed — skipping retry chain, going direct to whole-function rewrite")
+            else:
+                logger.warning("Verbatim retry also failed — falling back to whole-function rewrite")
             # Strong language reminder at end of prompt (7B models lose early context)
             lang_reminder = f"\nREMINDER: Output {lang_name} code ONLY. The file extension is {ext}. Do NOT write Python or any other language.\n"
             # Prevent LLM from regenerating file-level declarations
@@ -868,6 +859,16 @@ class CodeAgent:
                             else:
                                 new_source = whole_function_replace(file_source, rewritten, func_start, func_end)
                                 logger.info("Whole-function rewrite applied (lines %s–%s)", func_start, func_end)
+
+                        # Go file safety: ensure package declaration survived the rewrite
+                        if ext == '.go' and new_source != file_source:
+                            if not any(ln.strip().startswith('package ') for ln in new_source.split('\n')[:5]):
+                                # Recover package line from original source
+                                for orig_line in file_source.split('\n'):
+                                    if orig_line.strip().startswith('package '):
+                                        new_source = orig_line + '\n\n' + new_source
+                                        logger.info("[SAFETY] Restored missing Go package declaration")
+                                        break
                 else:
                     logger.error("Whole-function rewrite returned empty output. Giving up.")
             except Exception as e:
@@ -995,22 +996,31 @@ class CodeAgent:
                 f"You just wrote code to satisfy this requirement:\n"
                 f"REQUIREMENT: {instruction}\n\n"
                 f"YOUR CODE:\n```{lang_fence}\n{new_source}\n```\n\n"
-                "Grade this code CRITICALLY. Check ALL of the following:\n"
+                "Grade this code CRITICALLY. You MUST do the following:\n"
                 "1. Does the code implement the CORRECT function matching the requirement?\n"
                 "   (e.g., if the requirement says 'getHappyString', does the code define 'getHappyString'?)\n"
-                "2. Does the algorithm actually produce the correct output for the given problem?\n"
-                "3. Does it handle all edge cases?\n"
+                "2. TRACE TEST: Pick a concrete input from the requirement (or make one up if none given).\n"
+                "   Walk through YOUR code line by line with that input.\n"
+                "   Show the variable values at each step.\n"
+                "   Does it produce the expected output? If not, what goes wrong and where?\n"
+                "3. Does it handle edge cases (empty input, single element, max values)?\n"
                 "4. Were any existing unrelated functions accidentally modified or removed?\n\n"
-                "Respond with EXACTLY one of these two formats:\n"
+                "You MUST show the trace before giving your verdict.\n\n"
+                "After the trace, respond with EXACTLY one of these two lines:\n"
                 "  CORRECT: <brief reason why it fully satisfies the requirement>\n"
-                "  ISSUE: <specific description of the bug, wrong function, or missing logic>\n\n"
-                "Be STRICT. If in doubt, say ISSUE. Only output one line. No other text."
+                "  ISSUE: <specific description of the bug — reference the trace step where it fails>\n\n"
+                "Be STRICT. If the trace shows wrong output, say ISSUE."
             )
             grade_result = llm.invoke(grade_prompt).strip()
-            logger.info("[AGENT] Self-grade: %s", grade_result[:200])
+            logger.info("[AGENT] Self-grade: %s", grade_result[-300:])
 
-            if grade_result.upper().startswith("ISSUE:"):
-                issue = grade_result[len("ISSUE:"):].strip()
+            # The LLM outputs a trace first, then CORRECT: or ISSUE: — search the whole response
+            import re as _re
+            issue_match = _re.search(r'^ISSUE:\s*(.+)', grade_result, _re.MULTILINE | _re.IGNORECASE)
+            correct_match = _re.search(r'^CORRECT:\s*(.+)', grade_result, _re.MULTILINE | _re.IGNORECASE)
+
+            if issue_match and not correct_match:
+                issue = issue_match.group(1).strip()
                 logger.info("[AGENT] Self-correction triggered: %s", issue)
                 correction_prompt = (
                     f"Your previous code has a logical error:\n"
@@ -1720,6 +1730,13 @@ class CodeAgent:
                     )
                     break
                 source = new_source_candidate
+                # Go file safety: ensure package declaration survived
+                if ext == '.go' and not any(ln.strip().startswith('package ') for ln in source.split('\n')[:5]):
+                    for orig_line in original_source.split('\n'):
+                        if orig_line.strip().startswith('package '):
+                            source = orig_line + '\n\n' + source
+                            logger.info("[FIX_WITH_TESTS] Restored missing Go package declaration")
+                            break
                 logger.info("[FIX_WITH_TESTS] Code updated on attempt %d, re-running tests...", attempt)
             else:
                 logger.warning("[FIX_WITH_TESTS] LLM made no changes on attempt %d — stopping.", attempt)
