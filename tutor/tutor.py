@@ -11,6 +11,7 @@ import uuid
 import random
 import logging
 import math as _math_module
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -18,15 +19,27 @@ from langchain_ollama import OllamaLLM
 import brain.config as _cfg
 from brain.config import LLM_TEMPERATURE, MATH_LLM_MODEL, make_llm
 from print_logger import get_logger
+from tutor.gamification import record_solve, spend_xp_for_hint, get_profile
 
 logger = get_logger("tutor")
 
 # In-memory store of active tutor sessions  {session_id: TutorState}
 _tutor_sessions: dict[str, dict] = {}
+_tutor_lock = threading.Lock()
 
 # Track recently generated questions per topic to avoid repetition
 # Key: (topic, difficulty, style), Value: list of question summaries
 _question_history: dict[tuple, list] = {}
+
+
+def _gamification_category(state: dict) -> str:
+    """Map tutor session state to a gamification category."""
+    if state.get("is_math"):
+        return "math"
+    style = state.get("style", "")
+    if style == "code":
+        return "code_challenge"
+    return "concept"
 
 # Track completed chapters per subject  {subject_id: set of chapter_ids}
 _curriculum_progress: dict[str, set] = {}
@@ -996,11 +1009,17 @@ def check_answer(session_id: str, user_answer: str) -> dict:
         # Accept "A", "A)", "A) ..." formats
         if user_letter and user_letter[0] == correct_letter[0] if correct_letter else False:
             state["solved"] = True
+            cat = _gamification_category(state)
+            record_solve(cat, correct=True, used_hint=state["hints_given"] > 0,
+                         is_math=state.get("is_math", False),
+                         is_code=(state.get("style") == "code"),
+                         first_try=(state["attempts"] == 1))
             return {
                 "correct": True,
                 "feedback": problem.get("explanation", "Correct!"),
                 "solved": True,
                 "attempts": state["attempts"],
+                "xp": get_profile()["xp"],
             }
         else:
             return {
@@ -1040,6 +1059,11 @@ Evaluate the student's answer. Return ONLY a JSON object:
         is_correct = result.get("correct", False) or result.get("score", 0) >= 70
         if is_correct:
             state["solved"] = True
+            cat = _gamification_category(state)
+            record_solve(cat, correct=True, used_hint=state["hints_given"] > 0,
+                         is_math=state.get("is_math", False),
+                         is_code=(state.get("style") == "code"),
+                         first_try=(state["attempts"] == 1))
         return {
             "correct": is_correct,
             "feedback": result.get("feedback", ""),
@@ -1047,6 +1071,7 @@ Evaluate the student's answer. Return ONLY a JSON object:
             "missing_points": result.get("missing_points", []),
             "solved": is_correct,
             "attempts": state["attempts"],
+            **({"xp": get_profile()["xp"]} if is_correct else {}),
         }
 
     else:  # code — just tell the user to use the run endpoint
@@ -1088,6 +1113,10 @@ def run_tutor_code(session_id: str, user_code: str) -> dict:
     all_passed = all(r["passed"] for r in results)
     if all_passed:
         state["solved"] = True
+        cat = _gamification_category(state)
+        record_solve(cat, correct=True, used_hint=state["hints_given"] > 0,
+                     is_math=False, is_code=True,
+                     first_try=(state["attempts"] == 0))
         state["attempts"] += 1
 
     return {
@@ -1095,6 +1124,7 @@ def run_tutor_code(session_id: str, user_code: str) -> dict:
         "all_passed": all_passed,
         "solved": all_passed,
         "attempts": state["attempts"],
+        **({"xp": get_profile()["xp"]} if all_passed else {}),
     }
 
 
@@ -1107,6 +1137,12 @@ def get_hint(session_id: str) -> dict:
     state = _tutor_sessions.get(session_id)
     if not state:
         return {"error": "Session not found"}
+
+    # First hint is free, subsequent ones cost XP
+    if state["hints_given"] > 0:
+        hint_result = spend_xp_for_hint()
+        if not hint_result["success"]:
+            return {"error": hint_result["reason"], "xp": hint_result.get("current_xp", 0)}
 
     problem = state["problem"]
     hints = problem.get("hints", [])
@@ -1645,12 +1681,15 @@ def check_math_answer(session_id: str, user_answer: str) -> dict:
         user_letter = user_answer.strip().upper()
         if user_letter and correct_letter and user_letter[0] == correct_letter[0]:
             state["solved"] = True
+            record_solve("math", correct=True, used_hint=state["hints_given"] > 0,
+                         is_math=True, first_try=(state["attempts"] == 1))
             return {
                 "correct": True,
                 "feedback": problem.get("explanation", "Correct!"),
                 "steps": problem.get("steps", []),
                 "solved": True,
                 "attempts": state["attempts"],
+                "xp": get_profile()["xp"],
             }
         else:
             return {
@@ -1690,6 +1729,8 @@ Return ONLY a JSON object:
     is_correct = result.get("correct", False)
     if is_correct:
         state["solved"] = True
+        record_solve("math", correct=True, used_hint=state["hints_given"] > 0,
+                     is_math=True, first_try=(state["attempts"] == 1))
 
     logger.info("[MATH] Answer check done — correct=%s, attempts=%d", is_correct, state["attempts"])
     return {
@@ -1698,6 +1739,7 @@ Return ONLY a JSON object:
         "steps": steps if is_correct else [],
         "solved": is_correct,
         "attempts": state["attempts"],
+        **({"xp": get_profile()["xp"]} if is_correct else {}),
     }
 
 

@@ -166,7 +166,7 @@ def strategist_node(state: AgentState) -> dict:
     test_section = ""
     if test_cases:
         test_lines = [
-            f"  Test {i+1}: input=({tc['input']}) → expected={tc['expected']}"
+            f"  Test {i+1}: input=({tc['input']}) -> expected={tc['expected']}"
             for i, tc in enumerate(test_cases[:5])
         ]
         test_section = "\n\nTEST CASES:\n" + "\n".join(test_lines)
@@ -218,6 +218,34 @@ def strategist_node(state: AgentState) -> dict:
         return {"strategy": ""}
 
 
+def _sanitize_strategy_for_coder(strategy: str, target_lang: str) -> str:
+    """Strip compilable code / raw pseudocode from strategy, keep only the algorithm description.
+
+    The planner's Python pseudocode must never enter the code agent's prompt verbatim —
+    it causes the coder to copy the pseudocode instead of translating the algorithm.
+    We keep: problem classification, key insights, state definitions, recurrence relations, traces.
+    We strip: any fenced code blocks and inline code that looks compilable.
+    """
+    if not strategy:
+        return ""
+    import re as _re
+    # Remove fenced code blocks (```...```)
+    cleaned = _re.sub(r'```[\s\S]*?```', '[pseudocode removed — implement from the description above]', strategy)
+    # Remove lines that look like raw code (def/func/class/int main/for/while with braces)
+    lines = cleaned.split('\n')
+    filtered = []
+    for line in lines:
+        stripped = line.strip()
+        # Skip lines that are clearly compilable code
+        if _re.match(r'^(def |func |class |int |void |for\s*\(|while\s*\(|if\s*\(.*\)\s*\{)', stripped):
+            continue
+        # Skip lines that are just variable assignments in code style
+        if _re.match(r'^\w+\s*=\s*\[', stripped) and 'Step' not in stripped:
+            continue
+        filtered.append(line)
+    return '\n'.join(filtered).strip()
+
+
 def execute_node(state: AgentState) -> dict:
     """Code agent: apply edits based on plan + strategy + any critic feedback.
 
@@ -228,7 +256,12 @@ def execute_node(state: AgentState) -> dict:
 
     instruction = state["instruction"]
     critic_feedback = state.get("critic_feedback", "")
-    strategy = state.get("strategy", "")
+    raw_strategy = state.get("strategy", "")
+    ext = state.get("ext", "")
+    lang_name = LANG_NAMES.get(ext, ext.lstrip('.').upper() if ext else 'code')
+
+    # Sanitize strategy: strip compilable pseudocode, keep algorithm description only
+    strategy = _sanitize_strategy_for_coder(raw_strategy, lang_name)
 
     # Augment instruction with plan, strategy, and critic feedback
     augmented = instruction
@@ -540,10 +573,10 @@ def discuss_node(state: AgentState) -> dict:
                 f"AGENT DISCUSSION:\n{failed_summary}\n\n"
                 f"The previous approach is WRONG. You must propose a FUNDAMENTALLY DIFFERENT "
                 f"algorithm — not a patch. Common escape routes:\n"
-                f"- If using combinatorics → switch to DP\n"
-                f"- If using brute force → switch to greedy or binary search\n"
-                f"- If using BFS → switch to DFS with memoization\n"
-                f"- If using a formula → switch to simulation/DP\n\n"
+                f"- If using combinatorics -> switch to DP\n"
+                f"- If using brute force -> switch to greedy or binary search\n"
+                f"- If using BFS -> switch to DFS with memoization\n"
+                f"- If using a formula -> switch to simulation/DP\n\n"
                 f"1. WHAT WAS WRONG: Why the previous approach cannot work\n"
                 f"2. CORRECT ALGORITHM CLASS: (DP / greedy / graph / etc.)\n"
                 f"3. STATE DEFINITION: Precise dp[i][j] or equivalent\n"
@@ -989,4 +1022,167 @@ def run_multi_agent(
         "discussion_log": final_state.get("discussion_log", []),
         "context_file_edits": context_file_edits,
         "test_results": final_state.get("test_results"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TWO-MODE SYSTEM: Do-It Mode / Explain Mode
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _classify_difficulty(instruction: str, source: str, ext: str) -> str:
+    """Classify problem difficulty: SIMPLE, MODERATE, or HARD.
+
+    Uses heuristics first, falls back to LLM for ambiguous cases.
+    """
+    # Heuristic signals for HARD
+    func_count = source.count('\ndef ') + source.count('\nfunc ') + source.count('\nvoid ') + source.count('\nint ')
+    line_count = len(source.strip().split('\n'))
+    instr_lower = instruction.lower()
+
+    hard_signals = 0
+    if func_count > 5:
+        hard_signals += 1
+    if line_count > 300:
+        hard_signals += 1
+    if any(kw in instr_lower for kw in ['refactor', 'redesign', 'architecture', 'multi-file', 'multiple files']):
+        hard_signals += 1
+    if any(kw in instr_lower for kw in ['dp', 'dynamic programming', 'segment tree', 'suffix array', 'advanced']):
+        hard_signals += 1
+
+    simple_signals = 0
+    if line_count < 50:
+        simple_signals += 1
+    if func_count <= 1:
+        simple_signals += 1
+    if any(kw in instr_lower for kw in ['fix bug', 'typo', 'rename', 'add comment', 'simple']):
+        simple_signals += 1
+
+    if hard_signals >= 2:
+        return "HARD"
+    if simple_signals >= 2:
+        return "SIMPLE"
+    return "MODERATE"
+
+
+def generate_explain_mode_output(instruction: str, source: str, ext: str, test_cases: list = None) -> dict:
+    """Explain Mode: break down the approach in plain English with pseudocode comments.
+
+    No compilable logic — highlights edge cases and gotchas.
+    The user writes the actual implementation.
+    """
+    lang = LANG_FENCE.get(ext, ext.lstrip('.'))
+    lang_name = LANG_NAMES.get(ext, ext.lstrip('.').upper())
+    llm = make_llm(temperature=0.2)
+
+    test_section = ""
+    if test_cases:
+        test_lines = [f"  Test {i+1}: input={tc['input']} -> expected={tc['expected']}"
+                      for i, tc in enumerate(test_cases[:5])]
+        test_section = "\nTEST CASES:\n" + "\n".join(test_lines)
+
+    prompt = (
+        f"You are an expert algorithm tutor. The student needs to implement a solution "
+        f"but should write the code themselves.\n\n"
+        f"PROBLEM:\n{instruction}\n\n"
+        f"LANGUAGE: {lang_name}\n\n"
+        f"CURRENT CODE:\n```{lang}\n{source[:4000]}\n```\n"
+        f"{test_section}\n\n"
+        f"Provide a COMMENT-ONLY approach breakdown. Your output must be:\n"
+        f"1. A comment block in {lang_name} syntax containing:\n"
+        f"   - APPROACH: one-line summary of the algorithm\n"
+        f"   - STEP 1, STEP 2, etc.: each step described in plain English\n"
+        f"   - EDGE CASES: list of tricky inputs and how to handle them\n"
+        f"   - TIME/SPACE COMPLEXITY: expected Big-O\n"
+        f"2. NO compilable code — only comments describing what to do\n"
+        f"3. Use the correct comment syntax for {lang_name}\n\n"
+        f"Return ONLY the comment block, nothing else."
+    )
+
+    approach = llm.invoke(prompt).strip()
+    return {
+        "mode": "explain",
+        "approach": approach,
+        "language": lang_name,
+        "message": "Explain Mode: approach breakdown provided. Write the implementation yourself.",
+    }
+
+
+def run_two_mode_agent(
+    instruction: str,
+    file_path: str,
+    task_mode: str = "auto",
+    session_id: str = None,
+    test_cases: list = None,
+    extra_context_files: list = None,
+) -> dict:
+    """Two-mode execution pipeline.
+
+    Flow:
+      1. Classify difficulty (SIMPLE/MODERATE/HARD)
+      2. SIMPLE/MODERATE -> Do-It Mode (code gen + test, 1 retry max)
+         - If Do-It fails -> automatic fallback to Explain Mode
+      3. HARD/MULTI-FILE -> Explain Mode directly
+
+    Returns same shape as run_multi_agent plus 'mode' and 'approach' fields.
+    """
+    source = _read_file_safe(file_path)
+    if source is None:
+        return {"status": "error", "error": f"Cannot read file: {file_path}"}
+
+    ext = os.path.splitext(file_path)[1].lower()
+    difficulty = _classify_difficulty(instruction, source, ext)
+    logger.info("[TWO_MODE] Difficulty classified: %s", difficulty)
+
+    # HARD problems -> Explain Mode directly
+    if difficulty == "HARD":
+        logger.info("[TWO_MODE] HARD problem -> Explain Mode directly")
+        explain = generate_explain_mode_output(instruction, source, ext, test_cases)
+        return {
+            "status": "ok",
+            "mode": "explain",
+            "difficulty": difficulty,
+            **explain,
+        }
+
+    # SIMPLE/MODERATE -> Do-It Mode with max 1 retry
+    logger.info("[TWO_MODE] %s problem -> Do-It Mode", difficulty)
+    result = run_multi_agent(
+        instruction=instruction,
+        file_path=file_path,
+        task_mode=task_mode,
+        session_id=session_id,
+        max_attempts=2,  # 1 attempt + 1 retry max
+        include_related=True,
+        extra_context_files=extra_context_files,
+        test_cases=test_cases,
+    )
+
+    # Check if Do-It Mode succeeded
+    do_it_passed = False
+    if result.get("verdict") == "PASS":
+        do_it_passed = True
+    elif result.get("test_results"):
+        pass_count = sum(1 for r in result["test_results"] if r.get("passed"))
+        total = len(result["test_results"])
+        do_it_passed = pass_count == total
+
+    if do_it_passed:
+        logger.info("[TWO_MODE] Do-It Mode succeeded")
+        result["mode"] = "do_it"
+        result["difficulty"] = difficulty
+        return result
+
+    # Do-It failed -> fall back to Explain Mode
+    logger.info("[TWO_MODE] Do-It Mode failed -> falling back to Explain Mode")
+    explain = generate_explain_mode_output(instruction, source, ext, test_cases)
+
+    # Include the failed attempt info so the user can see what was tried
+    return {
+        "status": "ok",
+        "mode": "explain_fallback",
+        "difficulty": difficulty,
+        "do_it_attempted": True,
+        "do_it_verdict": result.get("verdict", "FAIL"),
+        "do_it_test_results": result.get("test_results"),
+        **explain,
     }

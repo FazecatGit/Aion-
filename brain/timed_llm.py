@@ -1,6 +1,7 @@
 import time
 import logging
 import threading
+from agent.agent_metrics import get_active_collector
 
 _llm_logger = logging.getLogger("llm_calls")
 
@@ -84,6 +85,10 @@ class TimedLLM:
                 f"[ERROR] [LLM #{call_id}] invoke FAILED after {elapsed:.1f}s — {exc}",
                 flush=True,
             )
+            mc = get_active_collector()
+            if mc:
+                mc.record_llm_call(call_id, self._llm.model, prompt_tokens, 0,
+                                   elapsed, success=False)
             raise
         elapsed = time.monotonic() - t0
         out_chars = len(result)
@@ -108,6 +113,12 @@ class TimedLLM:
                 f"(prompt ~{prompt_tokens} tok, output ~{out_tokens} tok)",
                 flush=True,
             )
+
+        # Push to active metrics collector
+        mc = get_active_collector()
+        if mc:
+            mc.record_llm_call(call_id, self._llm.model, prompt_tokens, out_tokens,
+                               elapsed, success=True)
 
         # Check cancellation after call completes (user may have cancelled during)
         if is_cancelled():

@@ -680,9 +680,9 @@ def ingest_editorials(pairs: list[dict]) -> int:
     """Ingest problem→editorial pairs into Chroma and BM25 for hard-problem reasoning.
 
     Each dict in *pairs* should have:
-        - "problem":   str  – the problem statement / title
-        - "editorial": str  – the explanation of *why* the solution works
-        - "tags":      list[str] (optional) – e.g. ["dp", "segment-tree", "lazy-propagation"]
+        - "problem":   str   the problem statement / title
+        - "editorial": str   the explanation of *why* the solution works
+        - "tags":      list[str] (optional) e.g. ["dp", "segment-tree", "lazy-propagation"]
 
     The editorial text is chunked normally and stored with metadata:
         topic = "algorithms", doc_type = "editorial",

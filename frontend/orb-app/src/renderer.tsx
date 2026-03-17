@@ -45,6 +45,7 @@ function App() {
   const [editTitle, setEditTitle] = useState('');
   const sessionCreatedRef = useRef(false);  // track if current session was persisted
   const [useMultiAgent, setUseMultiAgent] = useState(false);  // multi-agent orchestration toggle
+  const [useTwoMode, setUseTwoMode] = useState(false);  // two-mode agent: auto-routes between Do-It and Explain
   // ── Multi-file context ─────────────────────────────────────────────────────
   const [contextFiles, setContextFiles] = useState<string[]>([]);  // additional files for cross-file context
   // ── Infinite scroll / pagination ───────────────────────────────────────────
@@ -94,6 +95,37 @@ function App() {
   const [showLesson, setShowLesson] = useState(true);
   const [agentLearnings, setAgentLearnings] = useState<{ topic: string; explanation: string; timestamp: string }[] | null>(null);
   const [showLearnings, setShowLearnings] = useState(false);
+
+  // ── Gamification state ──────────────────────────────────────────────────────
+  type GamifBadge = { id: string; name: string; icon: string; desc: string };
+  type GamifProfile = {
+    xp: number; level: number;
+    level_progress: { level: number; current_xp_in_level: number; xp_needed_for_next: number; progress_pct: number };
+    badges: GamifBadge[]; all_badges: GamifBadge[];
+    streak_days: number; last_activity_date: string | null;
+    total_solved: number; total_attempted: number;
+    topic_streaks: Record<string, number>; daily_xp: Record<string, number>;
+  };
+  const [gamifProfile, setGamifProfile] = useState<GamifProfile | null>(null);
+  const [showGamifPanel, setShowGamifPanel] = useState(false);
+
+  // ── Problem bank state ─────────────────────────────────────────────────────
+  type ProblemBankStats = { total_problems: number; by_category: Record<string, number>; by_difficulty: Record<string, number>; categories: string[] };
+  const [showProblemBank, setShowProblemBank] = useState(false);
+  const [problemBankStats, setProblemBankStats] = useState<ProblemBankStats | null>(null);
+  const [pbCategory, setPbCategory] = useState('general');
+  const [pbDifficulty, setPbDifficulty] = useState('medium');
+
+  const fetchGamifProfile = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/gamification/profile');
+      const data = await res.json();
+      if (data.status === 'ok') {
+        const { status, ...profile } = data;
+        setGamifProfile(profile as GamifProfile);
+      }
+    } catch { /* server not running */ }
+  };
 
   // ── Math mode state ────────────────────────────────────────────────────────
   type GraphPoint = { x: number; y: number };
@@ -147,6 +179,11 @@ function App() {
   // ── Normal distribution viz state ──────────────────────────────────────────
   const [vizNormMean, setVizNormMean] = useState(0);
   const [vizNormStd, setVizNormStd] = useState(1);
+  const [vizNormSigmaShow, setVizNormSigmaShow] = useState(1); // which σ region to highlight: 1, 2, or 3
+  const [vizNormShowArea, setVizNormShowArea] = useState(true);
+  const [vizNormCompare, setVizNormCompare] = useState(false); // overlay a second curve
+  const [vizNormMean2, setVizNormMean2] = useState(1);
+  const [vizNormStd2, setVizNormStd2] = useState(0.5);
 
   // ── Bezier curve viz state ─────────────────────────────────────────────────
   const [vizBezierPts, setVizBezierPts] = useState<{x: number; y: number}[]>([
@@ -362,6 +399,16 @@ function App() {
     setVisibleCount(prev => Math.max(prev, Math.min(messages.length, MESSAGES_PER_PAGE)));
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Fetch gamification profile when entering tutor mode
+  useEffect(() => {
+    if (activeMode === 'tutor') fetchGamifProfile();
+  }, [activeMode]);
+
+  // Refresh gamification profile after solving a problem
+  useEffect(() => {
+    if (tutorFeedback?.solved) fetchGamifProfile();
+  }, [tutorFeedback?.solved]);
 
   // Close model picker on outside click
   useEffect(() => {
@@ -851,8 +898,8 @@ const handleSubmit = async (e: React.FormEvent) => {
       }
       
       lastAgentInstruction.current = userMsg;
-      const endpoint = useMultiAgent ? '/agent/orchestrate' : '/agent/edit';
-      const label = useMultiAgent ? '[MULTI-AGENT] Planner → Agent → Critic pipeline running...' : '[CODE AGENT] Processing your code request...';
+      const endpoint = useTwoMode ? '/agent/two-mode' : (useMultiAgent ? '/agent/orchestrate' : '/agent/edit');
+      const label = useTwoMode ? '[TWO-MODE] Auto-routing: Do-It vs Explain...' : (useMultiAgent ? '[MULTI-AGENT] Planner → Agent → Critic pipeline running...' : '[CODE AGENT] Processing your code request...');
       setMessages(prev => [...prev, { role: 'ai', text: label }]);
       const res = await fetch(`http://localhost:8000${endpoint}`, {
         method: 'POST',
@@ -861,17 +908,41 @@ const handleSubmit = async (e: React.FormEvent) => {
         body: JSON.stringify({
           instruction: userMsg,
           file_path: selectedFilePath,
-          task_mode: agentTaskMode,
-          session_id: sid,
-          context_files: contextFiles,
-          ...(useMultiAgent && testCases.length > 0 ? {
-            test_cases: testCases.map(tc => ({ input: tc.input, expected: tc.expected })),
-          } : {}),
+          ...(useTwoMode ? {
+            source_code: '',
+            test_cases: testCases.length > 0 ? testCases.map(tc => ({ input: tc.input, expected: tc.expected })) : [],
+          } : {
+            task_mode: agentTaskMode,
+            session_id: sid,
+            context_files: contextFiles,
+            ...(useMultiAgent && testCases.length > 0 ? {
+              test_cases: testCases.map(tc => ({ input: tc.input, expected: tc.expected })),
+            } : {}),
+          }),
         }),
       });
       const data = await safeJson(res);
 
-      if (useMultiAgent && (data.status === 'ok' || data.status === 'pending_review')) {
+      if (useTwoMode && data.status === 'ok') {
+        // Two-mode returns {mode, difficulty, ...}
+        const twoModeMsgs: Message[] = [];
+        const tMode = data.mode === 'do_it' ? 'Do-It' : data.mode === 'explain' ? 'Explain' : 'Explain (fallback)';
+        twoModeMsgs.push({ role: 'ai', text: `[TWO-MODE] Route: ${tMode} · Difficulty: ${data.difficulty}` });
+        if (data.do_it_attempted && data.do_it_verdict === 'FAIL') {
+          twoModeMsgs.push({ role: 'ai', text: `[DO-IT ATTEMPTED] Tests failed — falling back to explanation mode` });
+        }
+        if (data.diff) twoModeMsgs.push({ role: 'ai', text: `[DRY RUN PREVIEW]\n\n${data.diff}`, isDiff: true });
+        if (data.explanation) twoModeMsgs.push({ role: 'ai', text: `[EXPLANATION]\n${data.explanation}` });
+        if (data.plan?.steps) {
+          const steps = data.plan.steps.map((s: string, i: number) => `  ${i + 1}. ${s}`).join('\n');
+          twoModeMsgs.push({ role: 'ai', text: `[PLAN]\n${steps}` });
+        }
+        setMessages(prev => [...prev, ...twoModeMsgs]);
+        if (data.diff && data.file_path) {
+          setPendingAgentEdit({ instruction: userMsg, output: data.diff, filePath: data.file_path, newSource: data.new_source, contextEdits: data.context_file_edits || [] });
+          setSelectedFilePath(data.file_path);
+        }
+      } else if (useMultiAgent && (data.status === 'ok' || data.status === 'pending_review')) {
         // Multi-agent returns {diff, explanation, citations, plan, verdict, attempts, related_files, new_source, critic_feedback, discussion_log}
         const planSteps = data.plan?.steps?.map((s: string, i: number) => `  ${i + 1}. ${s}`).join('\n') || '';
         const relatedNote = data.related_files?.length > 0 ? `\n📎 Related files read: ${data.related_files.join(', ')}` : '';
@@ -1877,7 +1948,228 @@ return (
               style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#b388ff', fontWeight: 'bold', cursor: tutorLoading ? 'not-allowed' : 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
               Learnings
             </button>
+            <button onClick={async () => {
+              setShowProblemBank(v => !v);
+              if (!problemBankStats) {
+                try {
+                  const r = await fetch('http://localhost:8000/problem-bank/stats');
+                  const d = await r.json();
+                  if (d.status === 'ok') { const { status, ...stats } = d; setProblemBankStats(stats as ProblemBankStats); }
+                } catch {}
+              }
+            }} disabled={tutorLoading}
+              style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #ff990066', backgroundColor: showProblemBank ? 'rgba(255,153,0,0.15)' : 'transparent', color: '#ff9900', fontWeight: 'bold', cursor: tutorLoading ? 'not-allowed' : 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
+              Problem Bank
+            </button>
           </div>
+
+          {/* ── Gamification Status Bar ─────────────────────────────────────── */}
+          {gamifProfile && (
+            <div style={{ marginBottom: '12px' }}>
+              {/* Compact stats row */}
+              <div
+                onClick={() => setShowGamifPanel(p => !p)}
+                style={{
+                  display: 'flex', gap: '12px', alignItems: 'center', padding: '8px 14px', borderRadius: '10px',
+                  backgroundColor: 'rgba(255,204,0,0.04)', border: '1px solid rgba(255,204,0,0.2)',
+                  cursor: 'pointer', transition: 'background 0.15s', userSelect: 'none',
+                }}
+                onMouseEnter={e => { (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(255,204,0,0.08)'; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLElement).style.backgroundColor = 'rgba(255,204,0,0.04)'; }}
+              >
+                {/* Level badge */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ fontSize: '16px' }}>⚡</span>
+                  <span style={{ color: '#ffcc00', fontWeight: 'bold', fontSize: '13px' }}>Lv.{gamifProfile.level}</span>
+                </div>
+                {/* XP progress bar */}
+                <div style={{ flex: 1, maxWidth: '200px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: '#888', marginBottom: '2px' }}>
+                    <span>{gamifProfile.level_progress.current_xp_in_level} / {gamifProfile.level_progress.xp_needed_for_next} XP</span>
+                    <span>{gamifProfile.level_progress.progress_pct}%</span>
+                  </div>
+                  <div style={{ height: '6px', borderRadius: '3px', backgroundColor: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
+                    <div style={{
+                      height: '100%', borderRadius: '3px', transition: 'width 0.5s ease-out',
+                      width: `${Math.min(gamifProfile.level_progress.progress_pct, 100)}%`,
+                      background: 'linear-gradient(90deg, #ffcc00, #ff9900)',
+                    }} />
+                  </div>
+                </div>
+                {/* Total XP */}
+                <span style={{ color: '#ffcc00', fontSize: '12px', fontFamily: 'monospace' }}>{gamifProfile.xp} XP</span>
+                {/* Streak */}
+                {gamifProfile.streak_days > 0 && (
+                  <span style={{ color: '#ff6633', fontSize: '12px', fontWeight: 'bold' }}>🔥 {gamifProfile.streak_days}d</span>
+                )}
+                {/* Solved count */}
+                <span style={{ color: '#888', fontSize: '11px' }}>✓ {gamifProfile.total_solved}/{gamifProfile.total_attempted}</span>
+                {/* Recent badges (show up to 3) */}
+                <div style={{ display: 'flex', gap: '2px' }}>
+                  {gamifProfile.badges.slice(-3).map(b => (
+                    <span key={b.id} title={`${b.name}: ${b.desc}`} style={{ fontSize: '14px', cursor: 'default' }}>{b.icon}</span>
+                  ))}
+                </div>
+                <span style={{ color: '#555', fontSize: '10px' }}>{showGamifPanel ? '▲' : '▼'}</span>
+              </div>
+
+              {/* Expanded gamification panel */}
+              {showGamifPanel && (
+                <div style={{ marginTop: '8px', padding: '14px', borderRadius: '10px', backgroundColor: 'rgba(255,204,0,0.03)', border: '1px solid rgba(255,204,0,0.15)' }}>
+                  {/* Stats grid */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '8px', marginBottom: '14px' }}>
+                    <div style={{ padding: '10px', borderRadius: '8px', backgroundColor: 'rgba(255,204,0,0.08)', textAlign: 'center' }}>
+                      <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#ffcc00' }}>{gamifProfile.level}</div>
+                      <div style={{ fontSize: '10px', color: '#888' }}>Level</div>
+                    </div>
+                    <div style={{ padding: '10px', borderRadius: '8px', backgroundColor: 'rgba(0,204,136,0.08)', textAlign: 'center' }}>
+                      <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#00cc88' }}>{gamifProfile.xp}</div>
+                      <div style={{ fontSize: '10px', color: '#888' }}>Total XP</div>
+                    </div>
+                    <div style={{ padding: '10px', borderRadius: '8px', backgroundColor: 'rgba(255,102,51,0.08)', textAlign: 'center' }}>
+                      <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#ff6633' }}>{gamifProfile.streak_days}</div>
+                      <div style={{ fontSize: '10px', color: '#888' }}>Day Streak</div>
+                    </div>
+                    <div style={{ padding: '10px', borderRadius: '8px', backgroundColor: 'rgba(85,51,255,0.08)', textAlign: 'center' }}>
+                      <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#b388ff' }}>{gamifProfile.total_solved}</div>
+                      <div style={{ fontSize: '10px', color: '#888' }}>Solved</div>
+                    </div>
+                  </div>
+
+                  {/* Badge gallery */}
+                  <div style={{ marginBottom: '12px' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#ccc', marginBottom: '8px' }}>Badges</div>
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      {gamifProfile.all_badges.map(b => {
+                        const earned = gamifProfile.badges.some(eb => eb.id === b.id);
+                        return (
+                          <div key={b.id} title={`${b.name}: ${b.desc}`}
+                            style={{
+                              width: '44px', height: '44px', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              borderRadius: '8px', fontSize: '20px',
+                              backgroundColor: earned ? 'rgba(255,204,0,0.12)' : 'rgba(255,255,255,0.03)',
+                              border: earned ? '1px solid rgba(255,204,0,0.4)' : '1px solid rgba(255,255,255,0.06)',
+                              opacity: earned ? 1 : 0.35, filter: earned ? 'none' : 'grayscale(1)',
+                              transition: 'all 0.2s',
+                            }}>
+                            {b.icon}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Topic streaks */}
+                  {Object.keys(gamifProfile.topic_streaks).length > 0 && (
+                    <div style={{ marginBottom: '12px' }}>
+                      <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#ccc', marginBottom: '6px' }}>Topic Streaks</div>
+                      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                        {Object.entries(gamifProfile.topic_streaks)
+                          .filter(([, v]) => v > 0)
+                          .sort(([, a], [, b]) => b - a)
+                          .slice(0, 8)
+                          .map(([topic, streak]) => (
+                            <span key={topic} style={{
+                              padding: '3px 8px', borderRadius: '10px', fontSize: '11px',
+                              backgroundColor: streak >= 3 ? 'rgba(255,204,0,0.12)' : 'rgba(255,255,255,0.05)',
+                              border: `1px solid ${streak >= 3 ? 'rgba(255,204,0,0.3)' : 'rgba(255,255,255,0.1)'}`,
+                              color: streak >= 3 ? '#ffcc00' : '#888',
+                            }}>
+                              {topic} ×{streak}
+                            </span>
+                          ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Reset button */}
+                  <button onClick={async () => {
+                    if (!confirm('Reset all gamification progress? This cannot be undone.')) return;
+                    try {
+                      await fetch('http://localhost:8000/gamification/reset', { method: 'POST' });
+                      fetchGamifProfile();
+                    } catch {}
+                  }}
+                    style={{ padding: '4px 12px', borderRadius: '6px', border: '1px solid #ff444444', backgroundColor: 'transparent', color: '#ff4444', cursor: 'pointer', fontSize: '11px' }}>
+                    Reset Progress
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Problem Bank Browser ────────────────────────────────────────── */}
+          {showProblemBank && (
+            <div style={{ marginBottom: '16px', padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(255,153,0,0.04)', border: '1px solid rgba(255,153,0,0.2)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                <span style={{ fontSize: '14px', fontWeight: 'bold', color: '#ff9900' }}>📦 Problem Bank</span>
+                <button onClick={() => setShowProblemBank(false)} style={{ background: 'none', border: '1px solid #ff990044', borderRadius: '6px', color: '#888', cursor: 'pointer', padding: '4px 10px', fontSize: '11px' }}>Close</button>
+              </div>
+              {problemBankStats && (
+                <div style={{ marginBottom: '12px', fontSize: '12px', color: '#888' }}>
+                  {problemBankStats.total_problems} verified problems
+                  {problemBankStats.categories.length > 0 && (<span> · Categories: {problemBankStats.categories.join(', ')}</span>)}
+                </div>
+              )}
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                <select value={pbCategory} onChange={e => setPbCategory(e.target.value)}
+                  style={{ padding: '6px 10px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }}>
+                  <option value="general">General</option>
+                  {problemBankStats?.categories.map(c => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+                <select value={pbDifficulty} onChange={e => setPbDifficulty(e.target.value)}
+                  style={{ padding: '6px 10px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }}>
+                  <option value="easy">Easy</option>
+                  <option value="medium">Medium</option>
+                  <option value="hard">Hard</option>
+                </select>
+                <button onClick={async () => {
+                  setTutorLoading(true);
+                  try {
+                    const r = await fetch('http://localhost:8000/problem-bank/get', {
+                      method: 'POST', headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ category: pbCategory, difficulty: pbDifficulty }),
+                    });
+                    const d = await r.json();
+                    if (d.status === 'ok' && d.problem) {
+                      const p = d.problem;
+                      setTutorTopic(p.topic);
+                      setTutorDifficulty(p.difficulty);
+                      setTutorStyle(p.style || 'solve');
+                      setTutorProblem({
+                        session_id: p.id,
+                        style: p.style || 'solve',
+                        question: p.question,
+                        language: tutorLanguage,
+                        options: p.options || [],
+                        test_cases: p.test_cases || [],
+                      });
+                      setTutorFeedback(null); setTutorHint(null); setTutorAnswer(''); setTutorCode('');
+                      setShowProblemBank(false);
+                    }
+                  } catch {}
+                  setTutorLoading(false);
+                }}
+                  disabled={tutorLoading}
+                  style={{ padding: '6px 14px', borderRadius: '6px', border: 'none', backgroundColor: '#ff9900', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '12px' }}>
+                  Get Problem
+                </button>
+                <button onClick={async () => {
+                  try {
+                    await fetch('http://localhost:8000/problem-bank/ingest', { method: 'POST' });
+                    const r = await fetch('http://localhost:8000/problem-bank/stats');
+                    const d = await r.json();
+                    if (d.status === 'ok') { const { status, ...stats } = d; setProblemBankStats(stats as ProblemBankStats); }
+                  } catch {}
+                }}
+                  style={{ padding: '6px 14px', borderRadius: '6px', border: '1px solid #ff990044', backgroundColor: 'transparent', color: '#ff9900', cursor: 'pointer', fontSize: '11px' }}>
+                  Ingest from RAG
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* ── Curriculum Browser ──────────────────────────────────────────── */}
           {showCurriculum && (
@@ -2467,10 +2759,24 @@ return (
                       <text x={CX - R - 14} y={CY + 4} fill="#888" fontSize={11}>-1</text>
                       <text x={CX + 2} y={CY - R - 4} fill="#888" fontSize={11}>1</text>
                       <text x={CX + 2} y={CY + R + 14} fill="#888" fontSize={11}>-1</text>
-                      {/* Coordinate label */}
-                      <text x={px + 8} y={py - 8} fill="#00cc88" fontSize={11} fontFamily="monospace">
-                        ({cosVal.toFixed(3)}, {sinVal.toFixed(3)})
-                      </text>
+                      {/* Coordinate label — clamped to stay inside SVG */}
+                      {(() => {
+                        // Position label adaptively based on angle quadrant
+                        const labelW = 130, labelH = 14;
+                        let lx = px + 10, ly = py - 10;
+                        // Flip label to the left when point is on the right edge
+                        if (px > W - labelW - 10) lx = px - labelW - 4;
+                        // Flip label below when point is near top edge
+                        if (py < labelH + 10) ly = py + 18;
+                        // Clamp to SVG bounds
+                        lx = Math.max(4, Math.min(lx, W - labelW - 4));
+                        ly = Math.max(14, Math.min(ly, H - 4));
+                        return (
+                          <text x={lx} y={ly} fill="#00cc88" fontSize={11} fontFamily="monospace">
+                            ({cosVal.toFixed(3)}, {sinVal.toFixed(3)})
+                          </text>
+                        );
+                      })()}
                     </svg>
                     <div style={{ display: 'flex', gap: '16px', marginTop: '8px', fontSize: '12px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
                       <span style={{ color: '#ff9900' }}>cos(θ) = {cosVal.toFixed(4)}</span>
@@ -2654,23 +2960,33 @@ return (
                 const eig2 = disc >= 0 ? (trace - Math.sqrt(disc)) / 2 : null;
                 return (
                   <div>
-                    <div style={{ display: 'flex', gap: '12px', marginBottom: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
-                      <span style={{ color: '#b388ff', fontSize: '12px' }}>Matrix:</span>
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px' }}>
-                        {[0, 1].map(r => [0, 1].map(c => (
-                          <input key={`${r}${c}`} type="number" step={0.1} value={m[r][c]}
-                            onChange={e => { const n = m.map(row => [...row]); n[r][c] = +e.target.value; setVizMatrix(n); }}
-                            style={{ width: '52px', padding: '3px 6px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace', textAlign: 'center' }} />
-                        )))}
+                    {/* Matrix input row */}
+                    <div style={{ display: 'flex', gap: '16px', marginBottom: '10px', alignItems: 'center' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span style={{ color: '#b388ff', fontSize: '12px', fontWeight: 600 }}>M =</span>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', padding: '4px 6px', borderLeft: '2px solid #b388ff', borderRight: '2px solid #b388ff', borderRadius: '2px' }}>
+                          {[0, 1].map(r => (
+                            <div key={r} style={{ display: 'flex', gap: '4px' }}>
+                              {[0, 1].map(c => (
+                                <input key={`${r}${c}`} type="number" step={0.1} value={m[r][c]}
+                                  onChange={e => { const n = m.map(row => [...row]); n[r][c] = +e.target.value; setVizMatrix(n); }}
+                                  style={{ width: '60px', padding: '4px 6px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '13px', fontFamily: 'monospace', textAlign: 'center' }} />
+                              ))}
+                            </div>
+                          ))}
+                        </div>
                       </div>
-                      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                        {[{ label: 'I', m: [[1,0],[0,1]] }, { label: 'Rot 45°', m: [[0.707,-0.707],[0.707,0.707]] }, { label: 'Shear', m: [[1,1],[0,1]] }, { label: 'Scale 2x', m: [[2,0],[0,2]] }, { label: 'Reflect Y', m: [[-1,0],[0,1]] }].map(p => (
-                          <button key={p.label} onClick={() => setVizMatrix(p.m)}
-                            style={{ padding: '3px 8px', borderRadius: '4px', border: '1px solid #444', background: 'transparent', color: '#aaa', cursor: 'pointer', fontSize: '10px' }}>
-                            {p.label}
-                          </button>
-                        ))}
-                      </div>
+                    </div>
+                    {/* Preset buttons */}
+                    <div style={{ display: 'flex', gap: '6px', marginBottom: '10px', flexWrap: 'wrap' }}>
+                      {[{ label: 'Identity', m: [[1,0],[0,1]] }, { label: 'Rot 45°', m: [[0.707,-0.707],[0.707,0.707]] }, { label: 'Rot 90°', m: [[0,-1],[1,0]] }, { label: 'Shear', m: [[1,1],[0,1]] }, { label: 'Scale 2×', m: [[2,0],[0,2]] }, { label: 'Reflect Y', m: [[-1,0],[0,1]] }, { label: 'Reflect X', m: [[1,0],[0,-1]] }, { label: 'Squeeze', m: [[2,0],[0,0.5]] }].map(p => (
+                        <button key={p.label} onClick={() => setVizMatrix(p.m)}
+                          style={{ padding: '4px 10px', borderRadius: '4px', border: '1px solid #444', background: 'transparent', color: '#b0b0b0', cursor: 'pointer', fontSize: '11px', transition: 'border-color 0.2s' }}
+                          onMouseEnter={e => (e.currentTarget.style.borderColor = '#b388ff')}
+                          onMouseLeave={e => (e.currentTarget.style.borderColor = '#444')}>
+                          {p.label}
+                        </button>
+                      ))}
                     </div>
                     <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
                       {/* Axes */}
@@ -2700,12 +3016,15 @@ return (
                       {origPts.map((p, i) => <circle key={`o${i}`} cx={CX + p.x * SCALE} cy={CY - p.y * SCALE} r={3} fill="#00cc88" />)}
                       {transPts.map((p, i) => <circle key={`t${i}`} cx={CX + p.x * SCALE} cy={CY - p.y * SCALE} r={3} fill="#ff8800" />)}
                     </svg>
-                    <div style={{ display: 'flex', gap: '14px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
-                      <span style={{ color: '#b388ff' }}>det = {det.toFixed(3)}</span>
-                      <span style={{ color: '#ff9900' }}>trace = {trace.toFixed(3)}</span>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '6px 14px', marginTop: '8px', fontSize: '11px', fontFamily: 'monospace', padding: '8px', backgroundColor: '#111', borderRadius: '6px', border: '1px solid #222' }}>
+                      <span style={{ color: '#b388ff' }}>det(M) = {det.toFixed(3)}</span>
+                      <span style={{ color: '#ff9900' }}>tr(M) = {trace.toFixed(3)}</span>
                       {eig1 !== null && <span style={{ color: '#ff4444' }}>λ₁ = {eig1.toFixed(3)}</span>}
                       {eig2 !== null && <span style={{ color: '#ffcc00' }}>λ₂ = {eig2.toFixed(3)}</span>}
-                      {disc < 0 && <span style={{ color: '#888' }}>λ = {(trace/2).toFixed(2)} ± {(Math.sqrt(-disc)/2).toFixed(2)}i (complex)</span>}
+                      {disc < 0 && <span style={{ color: '#888' }}>λ = {(trace/2).toFixed(2)} ± {(Math.sqrt(-disc)/2).toFixed(2)}i</span>}
+                      <span style={{ color: det > 0 ? '#00cc88' : det < 0 ? '#ff6666' : '#888' }}>
+                        {det > 0 ? 'Preserves orientation' : det < 0 ? 'Flips orientation' : 'Singular (det=0)'}
+                      </span>
                     </div>
                   </div>
                 );
@@ -2713,44 +3032,91 @@ return (
 
               {/* Normal distribution visualization */}
               {mathVizType === 'normal' && (() => {
-                const W = 440, H = 260;
+                const W = 460, H = 280;
                 const mu = vizNormMean, sigma = vizNormStd;
-                const xMin = mu - 4 * Math.max(sigma, 0.5), xMax = mu + 4 * Math.max(sigma, 0.5);
-                const pdf = (x: number) => {
-                  const s = Math.max(sigma, 0.01);
-                  return (1 / (s * Math.sqrt(2 * Math.PI))) * Math.exp(-0.5 * ((x - mu) / s) ** 2);
+                const mu2 = vizNormMean2, sigma2 = vizNormStd2;
+                const sigN = vizNormSigmaShow;
+                // Use wider range when comparing two curves
+                const allMeans = vizNormCompare ? [mu, mu2] : [mu];
+                const allSigmas = vizNormCompare ? [sigma, sigma2] : [sigma];
+                const globalMin = Math.min(...allMeans) - 4 * Math.max(...allSigmas, 0.5);
+                const globalMax = Math.max(...allMeans) + 4 * Math.max(...allSigmas, 0.5);
+                const xMin = globalMin, xMax = globalMax;
+                const makePdf = (m: number, s: number) => (x: number) => {
+                  const ss = Math.max(s, 0.01);
+                  return (1 / (ss * Math.sqrt(2 * Math.PI))) * Math.exp(-0.5 * ((x - m) / ss) ** 2);
                 };
-                const steps = 120;
-                const pts: string[] = [];
+                const pdf = makePdf(mu, sigma);
+                const pdf2 = makePdf(mu2, sigma2);
+                const steps = 140;
                 let yMax = 0;
                 const allPts: {x: number; y: number}[] = [];
+                const allPts2: {x: number; y: number}[] = [];
                 for (let i = 0; i <= steps; i++) {
                   const x = xMin + (xMax - xMin) * i / steps;
                   const y = pdf(x);
                   allPts.push({ x, y });
                   if (y > yMax) yMax = y;
+                  if (vizNormCompare) {
+                    const y2 = pdf2(x);
+                    allPts2.push({ x, y: y2 });
+                    if (y2 > yMax) yMax = y2;
+                  }
                 }
                 yMax *= 1.1;
                 const PAD = 35;
                 const toSvgX = (x: number) => PAD + (x - xMin) / (xMax - xMin) * (W - 2 * PAD);
                 const toSvgY = (y: number) => (H - PAD) - (y / yMax) * (H - 2 * PAD);
-                allPts.forEach(p => pts.push(`${toSvgX(p.x)},${toSvgY(p.y)}`));
-                // Area fill path
+                const pts1Str = allPts.map(p => `${toSvgX(p.x)},${toSvgY(p.y)}`).join(' ');
+                const pts2Str = vizNormCompare ? allPts2.map(p => `${toSvgX(p.x)},${toSvgY(p.y)}`).join(' ') : '';
                 const fillPath = `M${toSvgX(xMin)},${toSvgY(0)} ` + allPts.map(p => `L${toSvgX(p.x)},${toSvgY(p.y)}`).join(' ') + ` L${toSvgX(xMax)},${toSvgY(0)} Z`;
-                // σ markers
                 const sigmaLines = [-3, -2, -1, 0, 1, 2, 3].map(n => mu + n * sigma);
+                // Sigma region area percentages
+                const sigmaAreaPct: Record<number, string> = { 1: '68.27', 2: '95.45', 3: '99.73' };
                 return (
                   <div>
-                    <div style={{ display: 'flex', gap: '12px', marginBottom: '8px', fontSize: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+                    {/* Controls row 1: μ and σ sliders */}
+                    <div style={{ display: 'flex', gap: '12px', marginBottom: '6px', fontSize: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
                       <label style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#00cc88' }}>
                         μ: <input type="range" min={-5} max={5} step={0.1} value={mu} onChange={e => setVizNormMean(+e.target.value)} />
                         <span style={{ fontFamily: 'monospace', minWidth: '36px' }}>{mu.toFixed(1)}</span>
                       </label>
                       <label style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#ff9900' }}>
-                        σ: <input type="range" min={0.2} max={3} step={0.1} value={sigma} onChange={e => setVizNormStd(+e.target.value)} />
+                        σ: <input type="range" min={0.1} max={4} step={0.1} value={sigma} onChange={e => setVizNormStd(+e.target.value)} />
                         <span style={{ fontFamily: 'monospace', minWidth: '36px' }}>{sigma.toFixed(1)}</span>
                       </label>
                     </div>
+                    {/* Controls row 2: σ region selector, area toggle, compare toggle */}
+                    <div style={{ display: 'flex', gap: '10px', marginBottom: '6px', fontSize: '11px', flexWrap: 'wrap', alignItems: 'center' }}>
+                      <span style={{ color: '#b388ff' }}>Show region:</span>
+                      {[1, 2, 3].map(n => (
+                        <button key={n} onClick={() => setVizNormSigmaShow(n)}
+                          style={{ padding: '2px 8px', borderRadius: '4px', border: `1px solid ${sigN === n ? '#b388ff' : '#444'}`, background: sigN === n ? 'rgba(179,136,255,0.15)' : 'transparent', color: sigN === n ? '#b388ff' : '#888', cursor: 'pointer', fontSize: '11px' }}>
+                          ±{n}σ ({sigmaAreaPct[n]}%)
+                        </button>
+                      ))}
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '3px', color: '#888', cursor: 'pointer', marginLeft: '4px' }}>
+                        <input type="checkbox" checked={vizNormShowArea} onChange={e => setVizNormShowArea(e.target.checked)} style={{ accentColor: '#00cc88' }} />
+                        Fill
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '3px', color: '#888', cursor: 'pointer' }}>
+                        <input type="checkbox" checked={vizNormCompare} onChange={e => setVizNormCompare(e.target.checked)} style={{ accentColor: '#22aaff' }} />
+                        Compare
+                      </label>
+                    </div>
+                    {/* Comparison curve controls */}
+                    {vizNormCompare && (
+                      <div style={{ display: 'flex', gap: '12px', marginBottom: '6px', fontSize: '11px', flexWrap: 'wrap', alignItems: 'center', paddingLeft: '8px', borderLeft: '2px solid #22aaff' }}>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#22aaff' }}>
+                          μ₂: <input type="range" min={-5} max={5} step={0.1} value={mu2} onChange={e => setVizNormMean2(+e.target.value)} />
+                          <span style={{ fontFamily: 'monospace', minWidth: '36px' }}>{mu2.toFixed(1)}</span>
+                        </label>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#22aaff' }}>
+                          σ₂: <input type="range" min={0.1} max={4} step={0.1} value={sigma2} onChange={e => setVizNormStd2(+e.target.value)} />
+                          <span style={{ fontFamily: 'monospace', minWidth: '36px' }}>{sigma2.toFixed(1)}</span>
+                        </label>
+                      </div>
+                    )}
                     <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
                       {/* x-axis */}
                       <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke="#555" strokeWidth={1} />
@@ -2763,27 +3129,34 @@ return (
                           </text>
                         </g>
                       ))}
-                      {/* Fill */}
-                      <path d={fillPath} fill="rgba(0,204,136,0.12)" />
-                      {/* 1σ shaded region */}
+                      {/* Full curve fill */}
+                      {vizNormShowArea && <path d={fillPath} fill="rgba(0,204,136,0.08)" />}
+                      {/* Nσ shaded region */}
                       {(() => {
-                        const lo = mu - sigma, hi = mu + sigma;
+                        const lo = mu - sigN * sigma, hi = mu + sigN * sigma;
                         const sigPts = allPts.filter(p => p.x >= lo && p.x <= hi);
                         if (sigPts.length < 2) return null;
                         const d = `M${toSvgX(lo)},${toSvgY(0)} ` + sigPts.map(p => `L${toSvgX(p.x)},${toSvgY(p.y)}`).join(' ') + ` L${toSvgX(hi)},${toSvgY(0)} Z`;
-                        return <path d={d} fill="rgba(0,204,136,0.2)" />;
+                        return <path d={d} fill="rgba(179,136,255,0.18)" />;
                       })()}
-                      {/* Curve */}
-                      <polyline points={pts.join(' ')} fill="none" stroke="#00cc88" strokeWidth={2} />
-                      {/* Peak marker */}
+                      {/* Primary curve */}
+                      <polyline points={pts1Str} fill="none" stroke="#00cc88" strokeWidth={2} />
+                      {/* Comparison curve */}
+                      {vizNormCompare && <polyline points={pts2Str} fill="none" stroke="#22aaff" strokeWidth={2} strokeDasharray="6,3" />}
+                      {/* Peak markers */}
                       <circle cx={toSvgX(mu)} cy={toSvgY(pdf(mu))} r={3} fill="#00cc88" />
+                      {vizNormCompare && <circle cx={toSvgX(mu2)} cy={toSvgY(pdf2(mu2))} r={3} fill="#22aaff" />}
+                      {/* σ region boundary lines */}
+                      <line x1={toSvgX(mu - sigN * sigma)} y1={PAD} x2={toSvgX(mu - sigN * sigma)} y2={H - PAD} stroke="#b388ff" strokeWidth={1} strokeOpacity={0.5} strokeDasharray="4,2" />
+                      <line x1={toSvgX(mu + sigN * sigma)} y1={PAD} x2={toSvgX(mu + sigN * sigma)} y2={H - PAD} stroke="#b388ff" strokeWidth={1} strokeOpacity={0.5} strokeDasharray="4,2" />
                     </svg>
-                    <div style={{ display: 'flex', gap: '14px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '4px 14px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', padding: '6px 8px', backgroundColor: '#111', borderRadius: '6px', border: '1px solid #222' }}>
                       <span style={{ color: '#00cc88' }}>μ = {mu.toFixed(2)}</span>
                       <span style={{ color: '#ff9900' }}>σ = {sigma.toFixed(2)}</span>
                       <span style={{ color: '#b388ff' }}>σ² = {(sigma * sigma).toFixed(3)}</span>
-                      <span style={{ color: '#888' }}>P(μ±1σ) ≈ 68.27%</span>
-                      <span style={{ color: '#888' }}>P(μ±2σ) ≈ 95.45%</span>
+                      <span style={{ color: '#b388ff' }}>P(±{sigN}σ) ≈ {sigmaAreaPct[sigN]}%</span>
+                      <span style={{ color: '#888' }}>Peak = {pdf(mu).toFixed(4)}</span>
+                      {vizNormCompare && <span style={{ color: '#22aaff' }}>μ₂={mu2.toFixed(2)}, σ₂={sigma2.toFixed(2)}</span>}
                     </div>
                   </div>
                 );
@@ -3563,7 +3936,7 @@ return (
         {activeMode === 'agent' && (
           <button
             type="button"
-            onClick={() => setUseMultiAgent(p => !p)}
+            onClick={() => { setUseMultiAgent(p => !p); if (!useMultiAgent) setUseTwoMode(false); }}
             disabled={mode !== 'idle'}
             title="Multi-agent: Planner → Code Agent → Critic with retries"
             style={{
@@ -3576,6 +3949,25 @@ return (
             }}
           >
             🔗{useMultiAgent ? ' ✓' : ''}
+          </button>
+        )}
+        {/* Two-Mode agent toggle — auto-routes between Do-It and Explain */}
+        {activeMode === 'agent' && (
+          <button
+            type="button"
+            onClick={() => { setUseTwoMode(p => !p); if (!useTwoMode) setUseMultiAgent(false); }}
+            disabled={mode !== 'idle'}
+            title="Two-mode: auto-classifies difficulty → Do-It (easy) or Explain (hard)"
+            style={{
+              padding: '10px 10px', borderRadius: '12px', border: '2px solid',
+              borderColor: useTwoMode ? '#22aaff' : '#555',
+              backgroundColor: useTwoMode ? 'rgba(34,170,255,0.15)' : '#111',
+              color: useTwoMode ? '#22aaff' : '#aaa',
+              fontSize: '11px', cursor: 'pointer', whiteSpace: 'nowrap',
+              transition: 'all 0.3s',
+            }}
+          >
+            🎯{useTwoMode ? ' ✓' : ''}
           </button>
         )}
         {/* Voice input button */}

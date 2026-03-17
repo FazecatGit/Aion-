@@ -11,6 +11,7 @@ Provides the low-level machinery that CodeAgent relies on:
 """
 
 import re
+import ast
 import logging
 import traceback
 from print_logger import get_logger
@@ -321,11 +322,90 @@ def reindent_block(replace_lines: list[str], file_indent: int, llm_base_indent: 
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# AST-BASED PYTHON HELPERS (fallback to regex for non-Python)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _try_parse_ast(source: str):
+    """Try to parse Python source into an AST. Returns None on failure."""
+    try:
+        return ast.parse(source)
+    except SyntaxError:
+        return None
+
+
+def _ast_function_ranges(source: str) -> list[dict]:
+    """Use AST to extract all top-level function/class definitions with line ranges.
+
+    Returns list of {name, start, end, type} where start/end are 0-based line indices.
+    """
+    tree = _try_parse_ast(source)
+    if tree is None:
+        return []
+    lines = source.split("\n")
+    results = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            start = node.lineno - 1  # AST is 1-based
+            end = node.end_lineno  # end_lineno is inclusive, we want exclusive
+            # Include decorators
+            if node.decorator_list:
+                start = node.decorator_list[0].lineno - 1
+            results.append({
+                "name": node.name,
+                "start": start,
+                "end": end,
+                "type": "class" if isinstance(node, ast.ClassDef) else "function",
+            })
+    return results
+
+
+def _ast_locate_function(source: str, func_name: str) -> Optional[int]:
+    """Use AST to find the line index of a function definition by name."""
+    for info in _ast_function_ranges(source):
+        if info["name"] == func_name:
+            return info["start"]
+    return None
+
+
+def _ast_find_function_range(source: str, start_hint: int) -> Optional[tuple[int, int]]:
+    """Use AST to find the range of the function containing start_hint."""
+    ranges = _ast_function_ranges(source)
+    # Find the function whose range contains start_hint
+    for info in ranges:
+        if info["start"] <= start_hint < info["end"]:
+            return info["start"], info["end"]
+    # If start_hint is exactly at a function start
+    for info in ranges:
+        if info["start"] == start_hint:
+            return info["start"], info["end"]
+    return None
+
+
+def _ast_count_top_level_functions(source: str) -> Optional[int]:
+    """Use AST to count top-level function/class definitions."""
+    tree = _try_parse_ast(source)
+    if tree is None:
+        return None
+    return sum(1 for node in ast.iter_child_nodes(tree)
+               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FUNCTION EXTRACTION & CALL-SITE EXPANSION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _find_function_range(lines: list[str], start_hint: int) -> tuple[int, int]:
-    """Walk from *start_hint* to find the (start, end) of the enclosing function."""
+    """Walk from *start_hint* to find the (start, end) of the enclosing function.
+
+    Tries AST-based detection first for Python files, falls back to regex.
+    """
+    # AST fast path for Python
+    source = "\n".join(lines)
+    ast_result = _ast_find_function_range(source, start_hint)
+    if ast_result is not None:
+        return ast_result
+
+    # Regex fallback for non-Python or unparseable files
     start_idx = start_hint
     while start_idx > 0:
         if FUNC_PATTERN.match(lines[start_idx]) or _C_FUNC_PATTERN.match(lines[start_idx]):
@@ -531,7 +611,17 @@ def extract_function(source: str, instruction: str, hint_blocks=None) -> tuple[s
 
 
 def _locate_function_definition(lines: list[str], func_name: str) -> Optional[int]:
-    """Find the line index of a function *definition* by name."""
+    """Find the line index of a function *definition* by name.
+
+    Tries AST-based lookup first for Python, falls back to regex.
+    """
+    # AST fast path
+    source = "\n".join(lines)
+    ast_result = _ast_locate_function(source, func_name)
+    if ast_result is not None:
+        return ast_result
+
+    # Regex fallback for non-Python or unparseable files
     # Python/Go style
     for i, l in enumerate(lines):
         if re.match(rf"\s*(def|func)\s+{re.escape(func_name)}\b", l, re.I):
@@ -759,7 +849,18 @@ def whole_function_replace(source: str, func_text: str, start_idx: int, end_idx:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def count_top_level_functions(file_lines: list[str], ext: str = "") -> int:
-    """Count top-level function definitions (excludes class declarations in C-family)."""
+    """Count top-level function definitions (excludes class declarations in C-family).
+
+    Tries AST-based counting first for Python, falls back to regex.
+    """
+    # AST fast path for Python
+    if ext.lower() in (".py", "") or ext.lower() not in _C_FAMILY_EXTS:
+        source = "\n".join(file_lines)
+        ast_count = _ast_count_top_level_functions(source)
+        if ast_count is not None:
+            return ast_count
+
+    # Regex fallback
     is_c_family = ext.lower() in _C_FAMILY_EXTS
     count = 0
 

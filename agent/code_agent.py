@@ -815,13 +815,29 @@ class CodeAgent:
                 rewritten = self._strip_file_level_declarations(rewritten, ext)
 
                 if rewritten.strip():
-                    # Language guard: reject if LLM generated the wrong language
+                    # Language guard: hard-fail if LLM generated the wrong language
                     if not source_matches_ext(rewritten, ext):
+                        lang_name = LANG_NAMES.get(ext, ext)
                         logger.warning(
                             "Whole-function rewrite rejected — LLM generated wrong language "
-                            "(expected %s). Keeping original.", ext
+                            "(expected %s). Retrying with explicit language constraint.", ext
                         )
-                    else:
+                        # Structured retry: explicitly demand the correct language
+                        retry_prompt = (
+                            f"YOUR PREVIOUS RESPONSE WAS IN THE WRONG LANGUAGE.\n"
+                            f"You MUST respond ONLY in {lang_name} ({ext}). "
+                            f"Do NOT use any other programming language.\n\n"
+                            f"{rewrite_prompt}"
+                        )
+                        rewritten = llm.invoke(retry_prompt).strip()
+                        rewritten = strip_markdown(rewritten) if "```" in rewritten else rewritten
+                        rewritten = self._strip_file_level_declarations(rewritten, ext)
+                        if not rewritten.strip() or not source_matches_ext(rewritten, ext):
+                            logger.error(
+                                "Language retry failed — still wrong language for %s. Keeping original.", ext
+                            )
+                            rewritten = None  # force skip to keep original
+                    if rewritten and rewritten.strip():
                         # Safety check: reject if content is destroyed (rewritten loses >30% of lines on large files)
                         original_span_lines = file_lines[func_start:func_end]
                         rewritten_lines = rewritten.strip().split('\n')
@@ -1250,7 +1266,7 @@ class CodeAgent:
         for r in test_results:
             if not r["passed"]:
                 got = r["actual"] if r["actual"] is not None else f"ERROR: {r.get('error', 'unknown')}"
-                failures_block += f"  input={r['input']}  →  expected={r['expected']},  got={got}\n"
+                failures_block += f"  input={r['input']}  ->  expected={r['expected']},  got={got}\n"
 
         failed_block = ""
         if failed_approaches:
@@ -1280,8 +1296,16 @@ class CodeAgent:
 
         try:
             # Use higher temperature + expanded context for creative divergence
-            from brain.config import LLM_NUM_CTX_HARD, LLM_NUM_PREDICT_HARD
+            from brain.config import LLM_NUM_CTX_HARD, LLM_NUM_PREDICT_HARD, FALLBACK_LLM_MODEL
+            
+            # Route to stronger model if available and we've failed multiple approaches
+            use_fallback = FALLBACK_LLM_MODEL and len(failed_approaches) >= 1
+            model_override = FALLBACK_LLM_MODEL if use_fallback else None
+            if use_fallback:
+                logger.info("[STRATEGY_PIVOT] Escalating to stronger model: %s", FALLBACK_LLM_MODEL)
+            
             pivot_llm = make_llm(
+                model=model_override,
                 temperature=0.3,
                 num_ctx=LLM_NUM_CTX_HARD,
                 num_predict=LLM_NUM_PREDICT_HARD,
@@ -1429,7 +1453,7 @@ class CodeAgent:
                         first_fail = failures[0]
                         for tc in failures[:3]:
                             trace_context += (
-                                f"  input={tc['input']}  →  expected={tc['expected']}"
+                                f"  input={tc['input']}  ->  expected={tc['expected']}"
                                 f",  got={tc.get('actual', tc.get('error', 'CRASH'))}\n"
                             )
 

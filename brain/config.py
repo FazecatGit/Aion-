@@ -22,6 +22,11 @@ LLM_MODEL = os.getenv("RAG_LLM_MODEL", "qwen3")  # qwen3 for general/code reason
 MATH_LLM_MODEL = os.getenv("RAG_MATH_LLM_MODEL", "qwen3")  # Dedicated math model for tutor; empty = fall back to LLM_MODEL
 LLM_TEMPERATURE = float(os.getenv("RAG_LLM_TEMPERATURE", "0"))
 
+# Fallback stronger model — used after 1 failed attempt on hard problems.
+# Set to a frontier model name available via Ollama (e.g. "qwen3:32b", "deepseek-coder-v2", "codellama:34b")
+# or leave empty to disable model escalation.
+FALLBACK_LLM_MODEL = os.getenv("RAG_FALLBACK_LLM_MODEL", "")
+
 # LLM context / generation limits (adjust based on model VRAM)
 LLM_NUM_CTX = int(os.getenv("RAG_LLM_NUM_CTX", "16384"))          # context window tokens
 LLM_NUM_PREDICT = int(os.getenv("RAG_LLM_NUM_PREDICT", "8192"))   # max output tokens

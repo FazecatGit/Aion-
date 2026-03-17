@@ -117,7 +117,7 @@ def _generate_harness(source: str, ext: str, test_inputs: List[str], expected_ou
     once per test input and prints only the return value per line."""
     lang = LANG_FENCE.get(ext, ext.lstrip("."))
     cases_block = "\n".join(
-        f"  Test {i + 1}: input={inp}  →  expected output={exp}"
+        f"  Test {i + 1}: input={inp}  ->  expected output={exp}"
         for i, (inp, exp) in enumerate(zip(test_inputs, expected_outputs))
     )
 
@@ -439,7 +439,7 @@ def build_test_failure_note(
     failure_lines = ""
     for i, r in enumerate(failures):
         got = r["actual"] if r["actual"] is not None else f"ERROR: {r.get('error', 'unknown')}"
-        failure_lines += f"  Test {i + 1}: input={r['input']}  →  expected={r['expected']},  got={got}\n"
+        failure_lines += f"  Test {i + 1}: input={r['input']}  ->  expected={r['expected']},  got={got}\n"
 
     # Detect if all failures are crashes (no actual output) — different debugging approach needed
     all_crashes = all(r.get("actual") is None for r in failures)
@@ -810,7 +810,7 @@ def format_step_verification_for_prompt(verification: Dict) -> str:
         line = f"  Step {s['step']}{desc}: {s['values']}"
         if s.get("expected"):
             line += f"  | Expected: {s['expected']}"
-        line += f"  → {status}"
+        line += f"  -> {status}"
         parts.append(line)
 
     if verification.get("actual_result"):

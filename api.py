@@ -544,31 +544,34 @@ async def agent_edit(req: AgentEditRequest):
 
     def _run_edit():
         _cancel_event.clear()
-        # Build cross-file context from additional context files
-        augmented_instruction = req.instruction
-        if req.context_files:
-            context_block = "\n\nRELATED FILES (read-only context):\n"
-            for cf in req.context_files[:10]:
-                cf_path = Path(cf)
-                if cf_path.exists() and cf_path.is_file():
-                    try:
-                        content = cf_path.read_text(encoding="utf-8", errors="replace")[:3000]
-                        context_block += f"\n--- {cf} ---\n{content}\n"
-                    except Exception:
-                        pass
-            augmented_instruction += context_block
+        from agent.agent_metrics import MetricsCollector, persist_summary
+        with MetricsCollector("edit_code") as mc:
+            # Build cross-file context from additional context files
+            augmented_instruction = req.instruction
+            if req.context_files:
+                context_block = "\n\nRELATED FILES (read-only context):\n"
+                for cf in req.context_files[:10]:
+                    cf_path = Path(cf)
+                    if cf_path.exists() and cf_path.is_file():
+                        try:
+                            content = cf_path.read_text(encoding="utf-8", errors="replace")[:3000]
+                            context_block += f"\n--- {cf} ---\n{content}\n"
+                        except Exception:
+                            pass
+                augmented_instruction += context_block
 
-        agent = CodeAgent(repo_path=".")
-        result = agent.edit_code(
-            path=resolved_path,
-            instruction=augmented_instruction,
-            dry_run=True,
-            use_rag=True,
-            rerank_method="auto",
-            task_mode=req.task_mode,
-            session_id=req.session_id,
-        )
-        return result
+            agent = CodeAgent(repo_path=".")
+            result = agent.edit_code(
+                path=resolved_path,
+                instruction=augmented_instruction,
+                dry_run=True,
+                use_rag=True,
+                rerank_method="auto",
+                task_mode=req.task_mode,
+                session_id=req.session_id,
+            )
+            persist_summary(mc.summary())
+            return result
 
     try:
         result = await asyncio.to_thread(_run_edit)
@@ -709,15 +712,19 @@ async def agent_apply(req: AgentApplyRequest):
 
         agent = CodeAgent(repo_path=".")
         def _apply_edit():
-            return agent.edit_code(
-                path=resolved_path,
-                instruction=req.instruction,
-                dry_run=False,
-                use_rag=True,
-                rerank_method="cross_encoder",  # always use best quality when actually writing
-                task_mode=req.task_mode,
-                session_id=req.session_id,
-            )
+            from agent.agent_metrics import MetricsCollector, persist_summary
+            with MetricsCollector("apply_edit") as mc:
+                result = agent.edit_code(
+                    path=resolved_path,
+                    instruction=req.instruction,
+                    dry_run=False,
+                    use_rag=True,
+                    rerank_method="cross_encoder",  # always use best quality when actually writing
+                    task_mode=req.task_mode,
+                    session_id=req.session_id,
+                )
+                persist_summary(mc.summary())
+                return result
         result = await asyncio.to_thread(_apply_edit)
         return {
             "status": "success",
@@ -764,17 +771,21 @@ async def agent_edit_with_chunks(req: AgentEditWithChunksRequest):
 
         def _run_chunks():
             _cancel_event.clear()
-            agent = CodeAgent(repo_path=".")
-            return agent.edit_code(
-                path=resolved_path,
-                instruction=req.instruction,
-                dry_run=True,
-                use_rag=True,
-                rerank_method="auto",
-                max_chunks=max_chunks,
-                task_mode=req.task_mode,
-                search_method=req.search_method
-            )
+            from agent.agent_metrics import MetricsCollector, persist_summary
+            with MetricsCollector("edit_with_chunks") as mc:
+                agent = CodeAgent(repo_path=".")
+                result = agent.edit_code(
+                    path=resolved_path,
+                    instruction=req.instruction,
+                    dry_run=True,
+                    use_rag=True,
+                    rerank_method="auto",
+                    max_chunks=max_chunks,
+                    task_mode=req.task_mode,
+                    search_method=req.search_method
+                )
+                persist_summary(mc.summary())
+                return result
         result = await asyncio.to_thread(_run_chunks)
 
         if _cancel_event.is_set():
@@ -844,16 +855,20 @@ async def agent_orchestrate(req: OrchestrateRequest):
     try:
         def _run_orchestrate():
             _cancel_event.clear()
-            return run_multi_agent(
-                instruction=req.instruction,
-                file_path=resolved_path,
-                task_mode=req.task_mode,
-                session_id=req.session_id,
-                max_attempts=max(1, min(req.max_attempts, 5)),
-                include_related=req.include_related,
-                extra_context_files=req.context_files,
-                test_cases=req.test_cases if req.test_cases else None,
-            )
+            from agent.agent_metrics import MetricsCollector, persist_summary
+            with MetricsCollector("orchestrate") as mc:
+                result = run_multi_agent(
+                    instruction=req.instruction,
+                    file_path=resolved_path,
+                    task_mode=req.task_mode,
+                    session_id=req.session_id,
+                    max_attempts=max(1, min(req.max_attempts, 5)),
+                    include_related=req.include_related,
+                    extra_context_files=req.context_files,
+                    test_cases=req.test_cases if req.test_cases else None,
+                )
+                persist_summary(mc.summary())
+                return result
         result = await asyncio.to_thread(_run_orchestrate)
 
         if _cancel_event.is_set():
@@ -990,15 +1005,19 @@ async def fix_with_tests_endpoint(req: FixWithTestsRequest):
     try:
         def _run_fix():
             _cancel_event.clear()
-            agent = CodeAgent(repo_path=".")
-            return agent.fix_with_tests(
-                path=resolved_path,
-                instruction=req.instruction,
-                test_cases=req.test_cases,
-                max_retries=max(1, min(req.max_retries, 5)),
-                task_mode=req.task_mode,
-                session_id=req.session_id,
-            )
+            from agent.agent_metrics import MetricsCollector, persist_summary
+            with MetricsCollector("fix_with_tests") as mc:
+                agent = CodeAgent(repo_path=".")
+                result = agent.fix_with_tests(
+                    path=resolved_path,
+                    instruction=req.instruction,
+                    test_cases=req.test_cases,
+                    max_retries=max(1, min(req.max_retries, 5)),
+                    task_mode=req.task_mode,
+                    session_id=req.session_id,
+                )
+                persist_summary(mc.summary())
+                return result
         result = await asyncio.to_thread(_run_fix)
 
         # Restore original file on disk — user must approve via frontend
@@ -1342,7 +1361,7 @@ class TutorHintRequest(BaseModel):
 @app.post("/tutor/start")
 async def tutor_start(req: TutorStartRequest):
     """Generate a new tutor problem. Auto-detects math topics and routes to math tutor."""
-    from agent.tutor import generate_problem, generate_math_problem, is_math_topic
+    from tutor.tutor import generate_problem, generate_math_problem, is_math_topic
     _is_math = is_math_topic(req.topic)
     _api_log.info("[API] /tutor/start — topic=%s, math=%s, style=%s", req.topic, _is_math, req.style)
     def _gen():
@@ -1359,7 +1378,7 @@ async def tutor_start(req: TutorStartRequest):
 async def tutor_check(req: TutorAnswerRequest):
     """Check the user's answer (MCQ letter, free text, or math answer)."""
     _api_log.info("[API] /tutor/check — session=%s", req.session_id)
-    from agent.tutor import check_answer, check_math_answer, _tutor_sessions
+    from tutor.tutor import check_answer, check_math_answer, _tutor_sessions
     state = _tutor_sessions.get(req.session_id)
     def _check():
         if state and state.get("is_math"):
@@ -1372,7 +1391,7 @@ async def tutor_check(req: TutorAnswerRequest):
 @app.post("/tutor/run")
 async def tutor_run(req: TutorCodeRequest):
     """Run user code against the problem's test cases."""
-    from agent.tutor import run_tutor_code
+    from tutor.tutor import run_tutor_code
     result = run_tutor_code(req.session_id, req.code)
     return {"status": "ok", **result}
 
@@ -1380,7 +1399,7 @@ async def tutor_run(req: TutorCodeRequest):
 @app.post("/tutor/hint")
 async def tutor_hint(req: TutorHintRequest):
     """Get the next progressive hint."""
-    from agent.tutor import get_hint
+    from tutor.tutor import get_hint
     result = await asyncio.to_thread(get_hint, req.session_id)
     return {"status": "ok", **result}
 
@@ -1388,7 +1407,7 @@ async def tutor_hint(req: TutorHintRequest):
 @app.get("/tutor/learnings")
 async def tutor_learnings(topic: str = "", language: str = "", limit: int = 5):
     """Get recent code agent learnings for use in tutor mode."""
-    from agent.tutor import get_agent_learnings
+    from tutor.tutor import get_agent_learnings
     learnings = get_agent_learnings(topic=topic, language=language, limit=limit)
     return {"status": "ok", "learnings": learnings}
 
@@ -1418,7 +1437,7 @@ class MatrixRequest(BaseModel):
 async def math_start(req: MathStartRequest):
     """Generate a new math practice problem with lesson and step-by-step solution."""
     _api_log.info("[API] /math/start — topic=%s, difficulty=%s, style=%s", req.topic, req.difficulty, req.style)
-    from agent.tutor import generate_math_problem
+    from tutor.tutor import generate_math_problem
     result = await asyncio.to_thread(generate_math_problem, topic=req.topic, difficulty=req.difficulty, style=req.style)
     _api_log.info("[API] /math/start — done ✓")
     return {"status": "ok", **result}
@@ -1428,7 +1447,7 @@ async def math_start(req: MathStartRequest):
 async def math_check(req: MathAnswerRequest):
     """Check a math answer (supports equivalent forms via LLM evaluation)."""
     _api_log.info("[API] /math/check — session=%s", req.session_id)
-    from agent.tutor import check_math_answer
+    from tutor.tutor import check_math_answer
     result = await asyncio.to_thread(check_math_answer, req.session_id, req.answer)
     _api_log.info("[API] /math/check — done ✓")
     return {"status": "ok", **result}
@@ -1438,7 +1457,7 @@ async def math_check(req: MathAnswerRequest):
 async def math_hint(req: TutorHintRequest):
     """Get the next progressive hint for a math problem."""
     _api_log.info("[API] /math/hint — session=%s", req.session_id)
-    from agent.tutor import get_hint
+    from tutor.tutor import get_hint
     result = await asyncio.to_thread(get_hint, req.session_id)
     _api_log.info("[API] /math/hint — done ✓")
     return {"status": "ok", **result}
@@ -1448,7 +1467,7 @@ async def math_hint(req: TutorHintRequest):
 async def math_steps(session_id: str):
     """Get the full step-by-step solution (available after solving or 3 attempts)."""
     _api_log.info("[API] /math/steps — session=%s", session_id)
-    from agent.tutor import get_math_step_by_step
+    from tutor.tutor import get_math_step_by_step
     result = get_math_step_by_step(session_id)
     _api_log.info("[API] /math/steps — done ✓")
     return {"status": "ok", **result}
@@ -1458,7 +1477,7 @@ async def math_steps(session_id: str):
 async def math_evaluate(req: MathEvalRequest):
     """Evaluate a math expression at given points for interactive graphing."""
     _api_log.info("[API] /math/evaluate — expr=%s", req.expression[:40])
-    from agent.tutor import evaluate_math_expression
+    from tutor.tutor import evaluate_math_expression
     result = evaluate_math_expression(
         expression=req.expression,
         variable=req.variable,
@@ -1471,7 +1490,7 @@ async def math_evaluate(req: MathEvalRequest):
 @app.post("/math/matrix")
 async def math_matrix(req: MatrixRequest):
     """Solve a matrix operation with step-by-step solution."""
-    from agent.tutor import solve_matrix_problem
+    from tutor.tutor import solve_matrix_problem
     result = solve_matrix_problem(operation=req.operation, matrices=req.matrices)
     return {"status": "ok", **result}
 
@@ -1481,14 +1500,14 @@ async def math_matrix(req: MatrixRequest):
 @app.get("/math/curriculum")
 async def math_curriculum():
     """Get the full curriculum tree with progress."""
-    from agent.tutor import get_curriculum
+    from tutor.tutor import get_curriculum
     return {"status": "ok", "curriculum": get_curriculum()}
 
 
 @app.get("/math/curriculum/{subject_id}/{chapter_id}")
 async def math_chapter(subject_id: str, chapter_id: str):
     """Get topics for a specific chapter."""
-    from agent.tutor import get_chapter_topics
+    from tutor.tutor import get_chapter_topics
     result = get_chapter_topics(subject_id, chapter_id)
     return {"status": "ok", **result}
 
@@ -1500,7 +1519,7 @@ class ChapterProgressRequest(BaseModel):
 @app.post("/math/curriculum/progress")
 async def math_progress(req: ChapterProgressRequest):
     """Mark a chapter as completed."""
-    from agent.tutor import mark_chapter_complete
+    from tutor.tutor import mark_chapter_complete
     result = mark_chapter_complete(req.subject_id, req.chapter_id)
     return result
 
@@ -1510,14 +1529,14 @@ async def math_progress(req: ChapterProgressRequest):
 @app.get("/cs/curriculum")
 async def cs_curriculum():
     """Get the full CS curriculum tree with progress."""
-    from agent.tutor import get_cs_curriculum
+    from tutor.tutor import get_cs_curriculum
     return {"status": "ok", "curriculum": get_cs_curriculum()}
 
 
 @app.get("/cs/curriculum/{subject_id}/{chapter_id}")
 async def cs_chapter(subject_id: str, chapter_id: str):
     """Get topics for a specific CS chapter."""
-    from agent.tutor import get_cs_chapter_topics
+    from tutor.tutor import get_cs_chapter_topics
     result = get_cs_chapter_topics(subject_id, chapter_id)
     return {"status": "ok", **result}
 
@@ -1529,6 +1548,111 @@ class CSChapterProgressRequest(BaseModel):
 @app.post("/cs/curriculum/progress")
 async def cs_progress(req: CSChapterProgressRequest):
     """Mark a CS chapter as completed."""
-    from agent.tutor import mark_cs_chapter_complete
+    from tutor.tutor import mark_cs_chapter_complete
     result = mark_cs_chapter_complete(req.subject_id, req.chapter_id)
     return result
+
+
+# ── Gamification endpoints ────────────────────────────────────────────────
+
+@app.get("/gamification/profile")
+async def gamification_profile():
+    """Get the user's XP, level, badges, streak, and stats."""
+    from tutor.gamification import get_profile
+    return {"status": "ok", **get_profile()}
+
+
+@app.post("/gamification/reset")
+async def gamification_reset():
+    """Reset the gamification profile (fresh start)."""
+    from tutor.gamification import reset_profile
+    reset_profile()
+    return {"status": "ok", "message": "Profile reset"}
+
+
+# ── Agent metrics endpoints ──────────────────────────────────────────────
+
+@app.get("/agent/metrics")
+async def agent_metrics():
+    """Get recent agent operation metrics and aggregate stats."""
+    from agent.agent_metrics import load_history, aggregate_stats
+    history = load_history(last_n=50)
+    return {
+        "status": "ok",
+        "recent": history,
+        "aggregate": aggregate_stats(history),
+    }
+
+
+# ── Visualization modules endpoints ──────────────────────────────────────
+
+@app.get("/visualizations")
+async def visualizations_list():
+    """Get all available interactive math visualization modules."""
+    from tutor.math_visualizations import get_visualization_modules
+    return {"status": "ok", "modules": get_visualization_modules()}
+
+
+@app.get("/visualizations/{module_id}")
+async def visualization_detail(module_id: str):
+    """Get details for a specific visualization module."""
+    from tutor.math_visualizations import get_module
+    mod = get_module(module_id)
+    if not mod:
+        return {"status": "error", "message": f"Module '{module_id}' not found"}
+    return {"status": "ok", "module": mod}
+
+
+# ── Problem bank endpoints ───────────────────────────────────────────────
+
+@app.get("/problem-bank/stats")
+async def problem_bank_stats():
+    """Get stats about the verified problem bank."""
+    from tutor.problem_bank import get_bank_stats
+    return {"status": "ok", **get_bank_stats()}
+
+
+@app.post("/problem-bank/ingest")
+async def problem_bank_ingest():
+    """Ingest verified problems from RAG documents into the problem bank."""
+    from tutor.problem_bank import ingest_problems_from_rag
+    result = await asyncio.to_thread(ingest_problems_from_rag)
+    return {"status": "ok", **result}
+
+
+class ProblemBankGetRequest(BaseModel):
+    category: str = "general"
+    difficulty: str = "medium"
+
+@app.post("/problem-bank/get")
+async def problem_bank_get(req: ProblemBankGetRequest):
+    """Get a verified problem from the bank."""
+    from tutor.problem_bank import get_problem
+    problem = get_problem(category=req.category, difficulty=req.difficulty)
+    if not problem:
+        return {"status": "error", "message": "No problems available for that category/difficulty"}
+    return {"status": "ok", "problem": problem}
+
+
+# ── Two-mode agent endpoint ─────────────────────────────────────────────
+
+class TwoModeRequest(BaseModel):
+    instruction: str
+    source_code: str = ""
+    file_path: str = "solution.py"
+    test_cases: list = []
+
+@app.post("/agent/two-mode")
+async def agent_two_mode(req: TwoModeRequest):
+    """Run the two-mode code agent (auto-routes between Do-It and Explain)."""
+    _api_log.info("[API] /agent/two-mode — instruction=%s", req.instruction[:60])
+    from agent.multi_agent_graph import run_two_mode_agent
+    result = await asyncio.to_thread(
+        run_two_mode_agent,
+        instruction=req.instruction,
+        source=req.source_code,
+        ext=os.path.splitext(req.file_path)[1] or ".py",
+        test_cases=req.test_cases,
+    )
+    _api_log.info("[API] /agent/two-mode — done, mode=%s", result.get("mode"))
+    return {"status": "ok", **result}

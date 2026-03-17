@@ -3,6 +3,7 @@ faiss_index/
 .venv/
 __pycache__/
 node_modules/
+*.bak
 
 /plans
 rag-search-engine/
@@ -19,3 +20,5 @@ tests_for_code_agent/
 vscode-extension/node_modules/
 
 vscode-extension/.vscode-test/
+
+tests/
