@@ -151,6 +151,10 @@ function App() {
   const [vizVectors, setVizVectors] = useState<{x: number; y: number; label: string; color: string}[]>([
     { x: 3, y: 2, label: 'a', color: '#00cc88' }, { x: -1, y: 4, label: 'b', color: '#22aaff' }
   ]);
+  // 3D vector mode
+  const [vizVector3D, setVizVector3D] = useState(false);
+  const [vizVec3A, setVizVec3A] = useState<[number, number, number]>([3, 2, 1]);
+  const [vizVec3B, setVizVec3B] = useState<[number, number, number]>([-1, 4, 2]);
   // Circle: center + radius
   const [vizCircle, setVizCircle] = useState({ cx: 0, cy: 0, r: 5 });
   // Triangle: three vertices
@@ -169,6 +173,11 @@ function App() {
   const [currTab, setCurrTab] = useState<'math' | 'cs'>('math');
   const [currExpandedSubject, setCurrExpandedSubject] = useState<string | null>(null);
   const [currExpandedChapter, setCurrExpandedChapter] = useState<string | null>(null);
+
+  // ── Curriculum generation state ─────────────────────────────────────────────
+  const [currGenStatus, setCurrGenStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [currGenProgress, setCurrGenProgress] = useState({ step: 0, total: 0, message: '' });
+  const currGenPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ── Matrix viz state ───────────────────────────────────────────────────────
   const [vizMatrix, setVizMatrix] = useState<number[][]>([[1, 0], [0, 1]]);
@@ -193,6 +202,10 @@ function App() {
   const [showToolsPanel, setShowToolsPanel] = useState(false);
   const [toolsOutput, setToolsOutput] = useState<string | null>(null);
   const [toolsLoading, setToolsLoading] = useState(false);
+
+  // ── TTS state ──────────────────────────────────────────────────────────────
+  const [ttsLoading, setTtsLoading] = useState(false);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // ── Process / backend log panel ────────────────────────────────────────────
   type ProcessLog = { ts: number; level: string; logger: string; message: string };
@@ -1864,7 +1877,7 @@ return (
       {activeMode === 'tutor' && (
         <div style={{
           position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
-          zIndex: 35, width: '94%', maxWidth: '1400px', maxHeight: '92vh', overflowY: 'auto',
+          zIndex: 35, width: '96%', maxWidth: '98vw', maxHeight: '92vh', overflowY: 'auto',
           padding: '28px', borderRadius: '20px',
           backgroundColor: 'rgba(0, 20, 15, 0.94)', backdropFilter: 'blur(25px)',
           border: '1px solid rgba(0,204,136,0.3)', boxShadow: '0 12px 40px rgba(0,0,0,0.6)',
@@ -1948,19 +1961,7 @@ return (
               style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#b388ff', fontWeight: 'bold', cursor: tutorLoading ? 'not-allowed' : 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
               Learnings
             </button>
-            <button onClick={async () => {
-              setShowProblemBank(v => !v);
-              if (!problemBankStats) {
-                try {
-                  const r = await fetch('http://localhost:8000/problem-bank/stats');
-                  const d = await r.json();
-                  if (d.status === 'ok') { const { status, ...stats } = d; setProblemBankStats(stats as ProblemBankStats); }
-                } catch {}
-              }
-            }} disabled={tutorLoading}
-              style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #ff990066', backgroundColor: showProblemBank ? 'rgba(255,153,0,0.15)' : 'transparent', color: '#ff9900', fontWeight: 'bold', cursor: tutorLoading ? 'not-allowed' : 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
-              Problem Bank
-            </button>
+
           </div>
 
           {/* ── Gamification Status Bar ─────────────────────────────────────── */}
@@ -2216,15 +2217,89 @@ return (
                                   <span style={{ fontSize: '10px', color: '#666' }}>{ch.topics.length} topics</span>
                                 </button>
                                 {currExpandedChapter === ch.id && (
-                                  <div style={{ padding: '4px 0 4px 18px', display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
-                                    {ch.topics.map(t => (
-                                      <button key={t} onClick={() => { setTutorTopic(t); setIsMathMode(currTab === 'math'); setShowCurriculum(false); }}
-                                        style={{ padding: '4px 10px', borderRadius: '14px', border: `1px solid rgba(${accentRgb},0.3)`, background: `rgba(${accentRgb},0.06)`, color: currTab === 'cs' ? '#c5b0ff' : '#a0e8d0', cursor: 'pointer', fontSize: '11px', transition: 'all 0.15s' }}
-                                        onMouseEnter={e => { (e.target as HTMLElement).style.backgroundColor = `rgba(${accentRgb},0.2)`; }}
-                                        onMouseLeave={e => { (e.target as HTMLElement).style.backgroundColor = `rgba(${accentRgb},0.06)`; }}>
-                                        {t}
+                                  <div style={{ padding: '4px 0 4px 18px' }}>
+                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '8px' }}>
+                                      {ch.topics.map(t => (
+                                        <button key={t} onClick={() => { setTutorTopic(t); setIsMathMode(currTab === 'math'); setShowCurriculum(false); }}
+                                          style={{ padding: '4px 10px', borderRadius: '14px', border: `1px solid rgba(${accentRgb},0.3)`, background: `rgba(${accentRgb},0.06)`, color: currTab === 'cs' ? '#c5b0ff' : '#a0e8d0', cursor: 'pointer', fontSize: '11px', transition: 'all 0.15s' }}
+                                          onMouseEnter={e => { (e.target as HTMLElement).style.backgroundColor = `rgba(${accentRgb},0.2)`; }}
+                                          onMouseLeave={e => { (e.target as HTMLElement).style.backgroundColor = `rgba(${accentRgb},0.06)`; }}>
+                                          {t}
+                                        </button>
+                                      ))}
+                                    </div>
+                                    {/* Generate entire chapter */}
+                                    <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                                      <button
+                                        onClick={async () => {
+                                          setCurrGenStatus('running');
+                                          setCurrGenProgress({ step: 0, total: 0, message: 'Starting...' });
+                                          try {
+                                            const res = await fetch('http://localhost:8000/curriculum/generate', {
+                                              method: 'POST',
+                                              headers: { 'Content-Type': 'application/json' },
+                                              body: JSON.stringify({ subject_id: subjId, chapter_id: ch.id, is_math: currTab === 'math', language: tutorLanguage }),
+                                            });
+                                            const d = await res.json();
+                                            if (d.status === 'ok' && d.cached) {
+                                              setCurrGenStatus('done');
+                                              setCurrGenProgress({ step: 0, total: 0, message: `Loaded ${d.problems?.length ?? 0} cached problems` });
+                                              return;
+                                            }
+                                            if (d.status === 'started' || d.status === 'already_running') {
+                                              // Poll for progress
+                                              if (currGenPollRef.current) clearInterval(currGenPollRef.current);
+                                              currGenPollRef.current = setInterval(async () => {
+                                                try {
+                                                  const sr = await fetch('http://localhost:8000/curriculum/generate/status');
+                                                  const sd = await sr.json();
+                                                  setCurrGenProgress({ step: sd.step ?? 0, total: sd.total ?? 0, message: sd.message ?? '' });
+                                                  if (sd.status === 'done' || sd.status === 'error') {
+                                                    setCurrGenStatus(sd.status);
+                                                    if (currGenPollRef.current) clearInterval(currGenPollRef.current);
+                                                  }
+                                                } catch {}
+                                              }, 1500);
+                                            }
+                                          } catch (err) {
+                                            setCurrGenStatus('error');
+                                            setCurrGenProgress({ step: 0, total: 0, message: String(err) });
+                                          }
+                                        }}
+                                        disabled={currGenStatus === 'running'}
+                                        style={{
+                                          padding: '5px 12px', borderRadius: '6px', border: 'none',
+                                          backgroundColor: currGenStatus === 'running' ? '#555' : accentColor,
+                                          color: currGenStatus === 'running' ? '#888' : '#000',
+                                          fontWeight: 'bold', cursor: currGenStatus === 'running' ? 'wait' : 'pointer',
+                                          fontSize: '11px',
+                                        }}
+                                      >
+                                        {currGenStatus === 'running' ? '⏳ Generating...' : '📝 Generate Chapter'}
                                       </button>
-                                    ))}
+                                      {currGenStatus === 'running' && currGenProgress.total > 0 && (
+                                        <div style={{ flex: 1, minWidth: '120px' }}>
+                                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: '#888', marginBottom: '2px' }}>
+                                            <span>{currGenProgress.message}</span>
+                                            <span>{currGenProgress.step}/{currGenProgress.total}</span>
+                                          </div>
+                                          <div style={{ height: '4px', borderRadius: '2px', backgroundColor: '#222', overflow: 'hidden' }}>
+                                            <div style={{
+                                              height: '100%', borderRadius: '2px',
+                                              backgroundColor: accentColor,
+                                              width: `${Math.round((currGenProgress.step / currGenProgress.total) * 100)}%`,
+                                              transition: 'width 0.3s',
+                                            }} />
+                                          </div>
+                                        </div>
+                                      )}
+                                      {currGenStatus === 'done' && (
+                                        <span style={{ color: '#00cc88', fontSize: '11px' }}>✓ {currGenProgress.message}</span>
+                                      )}
+                                      {currGenStatus === 'error' && (
+                                        <span style={{ color: '#ff4444', fontSize: '11px' }}>✗ {currGenProgress.message}</span>
+                                      )}
+                                    </div>
                                   </div>
                                 )}
                               </div>
@@ -2713,12 +2788,23 @@ return (
           {/* ── Math Visualization Tools ───────────────────────────────── */}
           {isMathMode && showMathViz && (
             <div style={{ marginTop: '16px', padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(179,136,255,0.04)', border: '1px solid rgba(179,136,255,0.2)' }}>
-              <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#b388ff', marginBottom: '10px' }}>🔧 Math Visualization Tools</div>
-              <div style={{ display: 'flex', gap: '6px', marginBottom: '12px', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                <div style={{ fontSize: '14px', fontWeight: 'bold', color: '#b388ff' }}>🔧 Math Visualization Tools</div>
+                <button onClick={() => setShowMathViz(false)} style={{ background: 'none', border: '1px solid #b388ff44', borderRadius: '6px', color: '#888', cursor: 'pointer', padding: '4px 10px', fontSize: '11px' }}>Close</button>
+              </div>
+              {/* Tab bar */}
+              <div style={{ display: 'flex', gap: '0px', marginBottom: '16px', borderBottom: '2px solid #222', overflowX: 'auto' }}>
                 {(['unitcircle', 'vector', 'triangle', 'circle', 'matrix', 'normal', 'bezier'] as MathVizType[]).map(t => (
                   <button key={t} onClick={() => setMathVizType(mathVizType === t ? null : t)}
-                    style={{ padding: '6px 14px', borderRadius: '6px', border: mathVizType === t ? '1px solid #b388ff' : '1px solid #444', backgroundColor: mathVizType === t ? 'rgba(179,136,255,0.2)' : 'transparent', color: mathVizType === t ? '#b388ff' : '#aaa', cursor: 'pointer', fontSize: '12px' }}>
-                    {t === 'unitcircle' ? '🔵 Unit Circle' : t === 'vector' ? '➡️ Vectors' : t === 'triangle' ? '📐 Triangle' : t === 'circle' ? '⭕ Circle' : t === 'matrix' ? '🔢 Matrix Transform' : t === 'normal' ? '📊 Normal Dist' : '〰️ Bezier Curve'}
+                    style={{
+                      padding: '8px 16px', border: 'none', borderBottom: mathVizType === t ? '2px solid #b388ff' : '2px solid transparent',
+                      backgroundColor: 'transparent', color: mathVizType === t ? '#b388ff' : '#777',
+                      cursor: 'pointer', fontSize: '12px', fontWeight: mathVizType === t ? 'bold' : 'normal',
+                      whiteSpace: 'nowrap', transition: 'all 0.2s', marginBottom: '-2px',
+                    }}
+                    onMouseEnter={e => { if (mathVizType !== t) (e.target as HTMLElement).style.color = '#b388ff'; }}
+                    onMouseLeave={e => { if (mathVizType !== t) (e.target as HTMLElement).style.color = '#777'; }}>
+                    {t === 'unitcircle' ? '🔵 Unit Circle' : t === 'vector' ? '➡️ Vectors' : t === 'triangle' ? '📐 Triangle' : t === 'circle' ? '⭕ Circle' : t === 'matrix' ? '🔢 Matrix' : t === 'normal' ? '📊 Normal' : '〰️ Bezier'}
                   </button>
                 ))}
               </div>
@@ -2791,113 +2877,225 @@ return (
               {/* Vector visualization */}
               {mathVizType === 'vector' && (() => {
                 const W = 400, H = 360, CX = W / 2, CY = H / 2, SCALE = 25;
-                const vA = vizVectors[0], vB = vizVectors[1];
-                const sumX = vA.x + vB.x, sumY = vA.y + vB.y;
-                const mag = (v: {x: number; y: number}) => Math.sqrt(v.x * v.x + v.y * v.y);
-                const dot = vA.x * vB.x + vA.y * vB.y;
-                const angleBetween = Math.acos(Math.min(1, Math.max(-1, dot / (mag(vA) * mag(vB) || 1)))) * 180 / Math.PI;
+                const is3D = vizVector3D;
+
+                if (!is3D) {
+                  // ── 2D mode (original) ──
+                  const vA = vizVectors[0], vB = vizVectors[1];
+                  const sumX = vA.x + vB.x, sumY = vA.y + vB.y;
+                  const mag = (v: {x: number; y: number}) => Math.sqrt(v.x * v.x + v.y * v.y);
+                  const dot = vA.x * vB.x + vA.y * vB.y;
+                  const angleBetween = Math.acos(Math.min(1, Math.max(-1, dot / (mag(vA) * mag(vB) || 1)))) * 180 / Math.PI;
+                  return (
+                    <div>
+                      <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', alignItems: 'center' }}>
+                        <button onClick={() => setVizVector3D(false)} style={{ padding: '4px 10px', borderRadius: '4px', border: '1px solid #00cc88', backgroundColor: 'rgba(0,204,136,0.2)', color: '#00cc88', fontSize: '11px', cursor: 'pointer' }}>2D</button>
+                        <button onClick={() => setVizVector3D(true)} style={{ padding: '4px 10px', borderRadius: '4px', border: '1px solid #555', backgroundColor: 'transparent', color: '#888', fontSize: '11px', cursor: 'pointer' }}>3D</button>
+                      </div>
+                      <div style={{ display: 'flex', gap: '12px', marginBottom: '8px', fontSize: '12px', flexWrap: 'wrap' }}>
+                        <span style={{ color: '#00cc88' }}>a⃗ = ({vA.x}, {vA.y})</span>
+                        <span style={{ color: '#22aaff' }}>b⃗ = ({vB.x}, {vB.y})</span>
+                        <span style={{ color: '#ff9900' }}>a⃗+b⃗ = ({sumX}, {sumY})</span>
+                      </div>
+                      <div style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
+                        {[{ label: 'ax', idx: 0, key: 'x' as const }, { label: 'ay', idx: 0, key: 'y' as const },
+                          { label: 'bx', idx: 1, key: 'x' as const }, { label: 'by', idx: 1, key: 'y' as const }].map(({ label, idx, key }) => (
+                          <label key={label} style={{ display: 'flex', alignItems: 'center', gap: '4px', color: idx === 0 ? '#00cc88' : '#22aaff', fontSize: '11px' }}>
+                            {label}:
+                            <input type="number" value={vizVectors[idx][key]}
+                              onChange={e => { const next = [...vizVectors]; next[idx] = { ...next[idx], [key]: +e.target.value }; setVizVectors(next); }}
+                              style={{ width: '50px', padding: '3px 6px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace' }} />
+                          </label>
+                        ))}
+                      </div>
+                      <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                        <line x1={0} y1={CY} x2={W} y2={CY} stroke="#333" strokeWidth={1} />
+                        <line x1={CX} y1={0} x2={CX} y2={H} stroke="#333" strokeWidth={1} />
+                        <line x1={CX} y1={CY} x2={CX + vA.x * SCALE} y2={CY - vA.y * SCALE} stroke="#00cc88" strokeWidth={2} markerEnd="url(#arrowG)" />
+                        <line x1={CX} y1={CY} x2={CX + vB.x * SCALE} y2={CY - vB.y * SCALE} stroke="#22aaff" strokeWidth={2} markerEnd="url(#arrowB)" />
+                        <line x1={CX} y1={CY} x2={CX + sumX * SCALE} y2={CY - sumY * SCALE} stroke="#ff9900" strokeWidth={2} strokeDasharray="5,3" markerEnd="url(#arrowO)" />
+                        <line x1={CX + vA.x * SCALE} y1={CY - vA.y * SCALE} x2={CX + sumX * SCALE} y2={CY - sumY * SCALE} stroke="#444" strokeWidth={1} strokeDasharray="3,3" />
+                        <line x1={CX + vB.x * SCALE} y1={CY - vB.y * SCALE} x2={CX + sumX * SCALE} y2={CY - sumY * SCALE} stroke="#444" strokeWidth={1} strokeDasharray="3,3" />
+                        <defs>
+                          <marker id="arrowG" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#00cc88" /></marker>
+                          <marker id="arrowB" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#22aaff" /></marker>
+                          <marker id="arrowO" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ff9900" /></marker>
+                        </defs>
+                        <text x={CX + vA.x * SCALE / 2 - 10} y={CY - vA.y * SCALE / 2 - 6} fill="#00cc88" fontSize={12} fontWeight="bold">a⃗</text>
+                        <text x={CX + vB.x * SCALE / 2 + 6} y={CY - vB.y * SCALE / 2 - 6} fill="#22aaff" fontSize={12} fontWeight="bold">b⃗</text>
+                      </svg>
+                      <div style={{ display: 'flex', gap: '14px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
+                        <span style={{ color: '#00cc88' }}>|a⃗| = {mag(vA).toFixed(3)}</span>
+                        <span style={{ color: '#22aaff' }}>|b⃗| = {mag(vB).toFixed(3)}</span>
+                        <span style={{ color: '#ff9900' }}>|a⃗+b⃗| = {mag({ x: sumX, y: sumY }).toFixed(3)}</span>
+                        <span style={{ color: '#ff6666' }}>a⃗·b⃗ = {dot}</span>
+                        <span style={{ color: '#b388ff' }}>θ = {angleBetween.toFixed(1)}°</span>
+                      </div>
+                    </div>
+                  );
+                }
+
+                // ── 3D mode ──
+                const a = vizVec3A, b = vizVec3B;
+                const mag3 = (v: number[]) => Math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2);
+                const dot3 = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+                const cross = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+                const sum3 = [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+                const angle3 = Math.acos(Math.min(1, Math.max(-1, dot3 / (mag3(a) * mag3(b) || 1)))) * 180 / Math.PI;
+                // Isometric projection: x' = (x - z) * cos30, y' = y + (x + z) * sin30
+                const cos30 = Math.cos(Math.PI / 6), sin30 = 0.5;
+                const proj = (v: number[]) => ({ px: CX + ((v[0] - v[2]) * cos30) * SCALE, py: CY - (v[1] + (v[0] + v[2]) * sin30) * SCALE * 0.7 });
+                const pA = proj(a), pB = proj(b), pS = proj(sum3), pC = proj(cross);
                 return (
                   <div>
-                    <div style={{ display: 'flex', gap: '12px', marginBottom: '8px', fontSize: '12px', flexWrap: 'wrap' }}>
-                      <span style={{ color: '#00cc88' }}>a⃗ = ({vA.x}, {vA.y})</span>
-                      <span style={{ color: '#22aaff' }}>b⃗ = ({vB.x}, {vB.y})</span>
-                      <span style={{ color: '#ff9900' }}>a⃗+b⃗ = ({sumX}, {sumY})</span>
+                    <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', alignItems: 'center' }}>
+                      <button onClick={() => setVizVector3D(false)} style={{ padding: '4px 10px', borderRadius: '4px', border: '1px solid #555', backgroundColor: 'transparent', color: '#888', fontSize: '11px', cursor: 'pointer' }}>2D</button>
+                      <button onClick={() => setVizVector3D(true)} style={{ padding: '4px 10px', borderRadius: '4px', border: '1px solid #22aaff', backgroundColor: 'rgba(34,170,255,0.2)', color: '#22aaff', fontSize: '11px', cursor: 'pointer' }}>3D</button>
                     </div>
                     <div style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
-                      {[{ label: 'ax', idx: 0, key: 'x' as const }, { label: 'ay', idx: 0, key: 'y' as const },
-                        { label: 'bx', idx: 1, key: 'x' as const }, { label: 'by', idx: 1, key: 'y' as const }].map(({ label, idx, key }) => (
-                        <label key={label} style={{ display: 'flex', alignItems: 'center', gap: '4px', color: idx === 0 ? '#00cc88' : '#22aaff', fontSize: '11px' }}>
-                          {label}:
-                          <input type="number" value={vizVectors[idx][key]}
-                            onChange={e => { const next = [...vizVectors]; next[idx] = { ...next[idx], [key]: +e.target.value }; setVizVectors(next); }}
-                            style={{ width: '50px', padding: '3px 6px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace' }} />
+                      {['x', 'y', 'z'].map((c, ci) => (
+                        <label key={`a${c}`} style={{ display: 'flex', alignItems: 'center', gap: '3px', color: '#00cc88', fontSize: '11px' }}>
+                          a{c}:
+                          <input type="number" value={a[ci]}
+                            onChange={e => { const n: [number, number, number] = [...a]; n[ci] = +e.target.value; setVizVec3A(n); }}
+                            style={{ width: '45px', padding: '3px 5px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '11px', fontFamily: 'monospace' }} />
+                        </label>
+                      ))}
+                      {['x', 'y', 'z'].map((c, ci) => (
+                        <label key={`b${c}`} style={{ display: 'flex', alignItems: 'center', gap: '3px', color: '#22aaff', fontSize: '11px' }}>
+                          b{c}:
+                          <input type="number" value={b[ci]}
+                            onChange={e => { const n: [number, number, number] = [...b]; n[ci] = +e.target.value; setVizVec3B(n); }}
+                            style={{ width: '45px', padding: '3px 5px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '11px', fontFamily: 'monospace' }} />
                         </label>
                       ))}
                     </div>
                     <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
-                      {/* Grid */}
-                      <line x1={0} y1={CY} x2={W} y2={CY} stroke="#333" strokeWidth={1} />
-                      <line x1={CX} y1={0} x2={CX} y2={H} stroke="#333" strokeWidth={1} />
-                      {/* Vector a */}
-                      <line x1={CX} y1={CY} x2={CX + vA.x * SCALE} y2={CY - vA.y * SCALE} stroke="#00cc88" strokeWidth={2} markerEnd="url(#arrowG)" />
-                      {/* Vector b */}
-                      <line x1={CX} y1={CY} x2={CX + vB.x * SCALE} y2={CY - vB.y * SCALE} stroke="#22aaff" strokeWidth={2} markerEnd="url(#arrowB)" />
-                      {/* Sum vector */}
-                      <line x1={CX} y1={CY} x2={CX + sumX * SCALE} y2={CY - sumY * SCALE} stroke="#ff9900" strokeWidth={2} strokeDasharray="5,3" markerEnd="url(#arrowO)" />
-                      {/* Parallelogram */}
-                      <line x1={CX + vA.x * SCALE} y1={CY - vA.y * SCALE} x2={CX + sumX * SCALE} y2={CY - sumY * SCALE} stroke="#444" strokeWidth={1} strokeDasharray="3,3" />
-                      <line x1={CX + vB.x * SCALE} y1={CY - vB.y * SCALE} x2={CX + sumX * SCALE} y2={CY - sumY * SCALE} stroke="#444" strokeWidth={1} strokeDasharray="3,3" />
-                      {/* Arrow markers */}
+                      {/* 3D axis lines (isometric) */}
+                      {(() => {
+                        const axLen = 5;
+                        const xEnd = proj([axLen, 0, 0]), yEnd = proj([0, axLen, 0]), zEnd = proj([0, 0, axLen]);
+                        return (<>
+                          <line x1={CX} y1={CY} x2={xEnd.px} y2={xEnd.py} stroke="#ff444488" strokeWidth={1} strokeDasharray="4,3" />
+                          <text x={xEnd.px + 4} y={xEnd.py} fill="#ff4444" fontSize={10}>X</text>
+                          <line x1={CX} y1={CY} x2={yEnd.px} y2={yEnd.py} stroke="#44ff4488" strokeWidth={1} strokeDasharray="4,3" />
+                          <text x={yEnd.px + 4} y={yEnd.py} fill="#44ff44" fontSize={10}>Y</text>
+                          <line x1={CX} y1={CY} x2={zEnd.px} y2={zEnd.py} stroke="#4444ff88" strokeWidth={1} strokeDasharray="4,3" />
+                          <text x={zEnd.px + 4} y={zEnd.py} fill="#4488ff" fontSize={10}>Z</text>
+                        </>);
+                      })()}
                       <defs>
-                        <marker id="arrowG" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#00cc88" /></marker>
-                        <marker id="arrowB" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#22aaff" /></marker>
-                        <marker id="arrowO" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ff9900" /></marker>
+                        <marker id="arrowG3" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#00cc88" /></marker>
+                        <marker id="arrowB3" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#22aaff" /></marker>
+                        <marker id="arrowO3" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ff9900" /></marker>
+                        <marker id="arrowP3" markerWidth={8} markerHeight={6} refX={8} refY={3} orient="auto"><path d="M0,0 L8,3 L0,6" fill="#ff66ff" /></marker>
                       </defs>
-                      {/* Labels */}
-                      <text x={CX + vA.x * SCALE / 2 - 10} y={CY - vA.y * SCALE / 2 - 6} fill="#00cc88" fontSize={12} fontWeight="bold">a⃗</text>
-                      <text x={CX + vB.x * SCALE / 2 + 6} y={CY - vB.y * SCALE / 2 - 6} fill="#22aaff" fontSize={12} fontWeight="bold">b⃗</text>
+                      {/* Vector a */}
+                      <line x1={CX} y1={CY} x2={pA.px} y2={pA.py} stroke="#00cc88" strokeWidth={2} markerEnd="url(#arrowG3)" />
+                      <text x={pA.px + 6} y={pA.py - 6} fill="#00cc88" fontSize={12} fontWeight="bold">a⃗</text>
+                      {/* Vector b */}
+                      <line x1={CX} y1={CY} x2={pB.px} y2={pB.py} stroke="#22aaff" strokeWidth={2} markerEnd="url(#arrowB3)" />
+                      <text x={pB.px + 6} y={pB.py - 6} fill="#22aaff" fontSize={12} fontWeight="bold">b⃗</text>
+                      {/* Sum vector */}
+                      <line x1={CX} y1={CY} x2={pS.px} y2={pS.py} stroke="#ff9900" strokeWidth={2} strokeDasharray="5,3" markerEnd="url(#arrowO3)" />
+                      {/* Cross product vector */}
+                      <line x1={CX} y1={CY} x2={pC.px} y2={pC.py} stroke="#ff66ff" strokeWidth={2} markerEnd="url(#arrowP3)" />
+                      <text x={pC.px + 6} y={pC.py - 6} fill="#ff66ff" fontSize={11} fontWeight="bold">a⃗×b⃗</text>
                     </svg>
-                    <div style={{ display: 'flex', gap: '14px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
-                      <span style={{ color: '#00cc88' }}>|a⃗| = {mag(vA).toFixed(3)}</span>
-                      <span style={{ color: '#22aaff' }}>|b⃗| = {mag(vB).toFixed(3)}</span>
-                      <span style={{ color: '#ff9900' }}>|a⃗+b⃗| = {mag({ x: sumX, y: sumY }).toFixed(3)}</span>
-                      <span style={{ color: '#ff6666' }}>a⃗·b⃗ = {dot}</span>
-                      <span style={{ color: '#b388ff' }}>θ = {angleBetween.toFixed(1)}°</span>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '4px 12px', marginTop: '8px', fontSize: '11px', fontFamily: 'monospace', padding: '8px', backgroundColor: '#111', borderRadius: '6px', border: '1px solid #222' }}>
+                      <span style={{ color: '#00cc88' }}>|a⃗| = {mag3(a).toFixed(3)}</span>
+                      <span style={{ color: '#22aaff' }}>|b⃗| = {mag3(b).toFixed(3)}</span>
+                      <span style={{ color: '#ff6666' }}>a⃗·b⃗ = {dot3.toFixed(3)}</span>
+                      <span style={{ color: '#b388ff' }}>θ = {angle3.toFixed(1)}°</span>
+                      <span style={{ color: '#ff66ff' }}>a⃗×b⃗ = ({cross[0]}, {cross[1]}, {cross[2]})</span>
+                      <span style={{ color: '#ff66ff' }}>|a⃗×b⃗| = {mag3(cross).toFixed(3)}</span>
+                      <span style={{ color: '#ff9900' }}>a⃗+b⃗ = ({sum3[0]}, {sum3[1]}, {sum3[2]})</span>
                     </div>
                   </div>
                 );
               })()}
 
-              {/* Triangle visualization */}
+              {/* Triangle visualization — right triangle with SOH CAH TOA */}
               {mathVizType === 'triangle' && (() => {
-                const W = 400, H = 360, PAD = 40, pts = vizTriangle;
-                const maxCoord = Math.max(...pts.map(p => Math.max(Math.abs(p.x), Math.abs(p.y))), 1);
-                const scale = (Math.min(W, H) - 2 * PAD) / (2 * maxCoord);
-                const tx = (x: number) => W / 2 + x * scale;
-                const ty = (y: number) => H / 2 - y * scale;
-                const dist = (a: {x: number; y: number}, b: {x: number; y: number}) => Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2);
-                const sideA = dist(pts[1], pts[2]), sideB = dist(pts[0], pts[2]), sideC = dist(pts[0], pts[1]);
-                const s = (sideA + sideB + sideC) / 2;
-                const area = Math.sqrt(Math.max(0, s * (s - sideA) * (s - sideB) * (s - sideC)));
-                // Angles via law of cosines
-                const angleAt = (opp: number, a: number, b: number) => Math.acos(Math.min(1, Math.max(-1, (a * a + b * b - opp * opp) / (2 * a * b || 1)))) * 180 / Math.PI;
-                const angA = angleAt(sideA, sideB, sideC), angB = angleAt(sideB, sideA, sideC), angC = angleAt(sideC, sideA, sideB);
+                const W = 440, H = 360, PAD = 60;
+                // Right triangle: angle θ at bottom-left, right angle at bottom-right
+                const angleTheta = Math.max(5, Math.min(85, vizAngle)); // reuse vizAngle for θ
+                const rad = angleTheta * Math.PI / 180;
+                const baseLen = 6; // adjacent
+                const opp = baseLen * Math.tan(rad);
+                const hyp = baseLen / Math.cos(rad);
+                const maxDim = Math.max(baseLen, opp);
+                const scale = (Math.min(W, H) - 2 * PAD) / maxDim;
+                // Vertices: A=bottom-left (θ), B=bottom-right (90°), C=top-right
+                const Ax = PAD, Ay = H - PAD;
+                const Bx = PAD + baseLen * scale, By = H - PAD;
+                const Cx = Bx, Cy = H - PAD - opp * scale;
+                // Right angle indicator
+                const sq = 12;
                 return (
                   <div>
-                    <div style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexWrap: 'wrap' }}>
-                      {['A', 'B', 'C'].map((label, i) => (
-                        <span key={label} style={{ display: 'flex', alignItems: 'center', gap: '3px', fontSize: '11px' }}>
-                          <span style={{ color: '#b388ff' }}>{label}(</span>
-                          <input type="number" value={pts[i].x} onChange={e => { const n = [...pts]; n[i] = { ...n[i], x: +e.target.value }; setVizTriangle(n); }}
-                            style={{ width: '40px', padding: '2px 4px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '11px', fontFamily: 'monospace' }} />
-                          <span style={{ color: '#888' }}>,</span>
-                          <input type="number" value={pts[i].y} onChange={e => { const n = [...pts]; n[i] = { ...n[i], y: +e.target.value }; setVizTriangle(n); }}
-                            style={{ width: '40px', padding: '2px 4px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '11px', fontFamily: 'monospace' }} />
-                          <span style={{ color: '#b388ff' }}>)</span>
-                        </span>
-                      ))}
+                    <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '10px' }}>
+                      <span style={{ color: '#b388ff', fontSize: '12px' }}>θ =</span>
+                      <input type="range" min={5} max={85} value={vizAngle} onChange={e => setVizAngle(+e.target.value)} style={{ flex: 1 }} />
+                      <span style={{ color: '#fff', fontFamily: 'monospace', fontSize: '13px', minWidth: '40px' }}>{vizAngle}°</span>
                     </div>
                     <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
-                      <line x1={0} y1={H / 2} x2={W} y2={H / 2} stroke="#222" strokeWidth={1} />
-                      <line x1={W / 2} y1={0} x2={W / 2} y2={H} stroke="#222" strokeWidth={1} />
-                      <polygon points={pts.map(p => `${tx(p.x)},${ty(p.y)}`).join(' ')} fill="rgba(179,136,255,0.08)" stroke="#b388ff" strokeWidth={2} />
-                      {pts.map((p, i) => (
-                        <g key={i}>
-                          <circle cx={tx(p.x)} cy={ty(p.y)} r={4} fill="#b388ff" />
-                          <text x={tx(p.x) + 8} y={ty(p.y) - 8} fill="#b388ff" fontSize={12} fontWeight="bold">{['A', 'B', 'C'][i]}</text>
-                        </g>
-                      ))}
+                      {/* Triangle fill */}
+                      <polygon points={`${Ax},${Ay} ${Bx},${By} ${Cx},${Cy}`} fill="rgba(179,136,255,0.06)" stroke="#b388ff" strokeWidth={2} />
+                      {/* Right angle square at B */}
+                      <polyline points={`${Bx - sq},${By} ${Bx - sq},${By - sq} ${Bx},${By - sq}`} fill="none" stroke="#888" strokeWidth={1.5} />
+                      {/* θ arc at A */}
+                      {(() => {
+                        const arcR = 28;
+                        const ex = Ax + arcR * Math.cos(-rad);
+                        const ey = Ay + arcR * Math.sin(-rad);
+                        return <path d={`M ${Ax + arcR},${Ay} A ${arcR} ${arcR} 0 0 0 ${ex} ${ey}`} fill="none" stroke="#ffcc00" strokeWidth={1.5} />;
+                      })()}
+                      <text x={Ax + 34} y={Ay - 10} fill="#ffcc00" fontSize={13} fontWeight="bold" fontFamily="monospace">θ</text>
                       {/* Side labels */}
-                      <text x={(tx(pts[1].x) + tx(pts[2].x)) / 2 + 6} y={(ty(pts[1].y) + ty(pts[2].y)) / 2 - 6} fill="#ff9900" fontSize={10} fontFamily="monospace">a={sideA.toFixed(2)}</text>
-                      <text x={(tx(pts[0].x) + tx(pts[2].x)) / 2 - 30} y={(ty(pts[0].y) + ty(pts[2].y)) / 2 + 14} fill="#22aaff" fontSize={10} fontFamily="monospace">b={sideB.toFixed(2)}</text>
-                      <text x={(tx(pts[0].x) + tx(pts[1].x)) / 2 + 6} y={(ty(pts[0].y) + ty(pts[1].y)) / 2 + 14} fill="#00cc88" fontSize={10} fontFamily="monospace">c={sideC.toFixed(2)}</text>
+                      {/* Adjacent (bottom) */}
+                      <text x={(Ax + Bx) / 2 - 20} y={Ay + 20} fill="#00cc88" fontSize={12} fontWeight="bold" fontFamily="monospace">Adjacent</text>
+                      <text x={(Ax + Bx) / 2 - 10} y={Ay + 34} fill="#00cc88" fontSize={10} fontFamily="monospace">{baseLen.toFixed(2)}</text>
+                      {/* Opposite (right side) */}
+                      <text x={Bx + 10} y={(By + Cy) / 2 + 4} fill="#ff6666" fontSize={12} fontWeight="bold" fontFamily="monospace">Opposite</text>
+                      <text x={Bx + 10} y={(By + Cy) / 2 + 18} fill="#ff6666" fontSize={10} fontFamily="monospace">{opp.toFixed(2)}</text>
+                      {/* Hypotenuse (diagonal) */}
+                      {(() => {
+                        const mx = (Ax + Cx) / 2, my = (Ay + Cy) / 2;
+                        const ang = Math.atan2(Cy - Ay, Cx - Ax) * 180 / Math.PI;
+                        return <text x={mx - 30} y={my - 10} fill="#22aaff" fontSize={12} fontWeight="bold" fontFamily="monospace" transform={`rotate(${ang} ${mx - 30} ${my - 10})`}>Hypotenuse {hyp.toFixed(2)}</text>;
+                      })()}
+                      {/* Vertex labels */}
+                      <text x={Ax - 14} y={Ay + 6} fill="#b388ff" fontSize={11} fontWeight="bold">A</text>
+                      <text x={Bx + 6} y={By + 6} fill="#b388ff" fontSize={11} fontWeight="bold">B</text>
+                      <text x={Cx + 6} y={Cy - 6} fill="#b388ff" fontSize={11} fontWeight="bold">C</text>
                     </svg>
-                    <div style={{ display: 'flex', gap: '12px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
-                      <span style={{ color: '#ff9900' }}>∠A = {angA.toFixed(1)}°</span>
-                      <span style={{ color: '#22aaff' }}>∠B = {angB.toFixed(1)}°</span>
-                      <span style={{ color: '#00cc88' }}>∠C = {angC.toFixed(1)}°</span>
-                      <span style={{ color: '#b388ff' }}>Area = {area.toFixed(3)}</span>
-                      <span style={{ color: '#888' }}>Perimeter = {(sideA + sideB + sideC).toFixed(3)}</span>
+                    {/* SOH CAH TOA readout */}
+                    <div style={{
+                      display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '8px', marginTop: '10px',
+                      padding: '12px', borderRadius: '8px', backgroundColor: '#111', border: '1px solid #222',
+                    }}>
+                      <div style={{ textAlign: 'center' }}>
+                        <div style={{ color: '#ffcc00', fontWeight: 'bold', fontSize: '13px', marginBottom: '4px' }}>SOH</div>
+                        <div style={{ color: '#ff6666', fontSize: '11px', fontFamily: 'monospace' }}>sin(θ) = Opp / Hyp</div>
+                        <div style={{ color: '#fff', fontSize: '13px', fontFamily: 'monospace', marginTop: '2px' }}>{Math.sin(rad).toFixed(4)}</div>
+                      </div>
+                      <div style={{ textAlign: 'center' }}>
+                        <div style={{ color: '#ffcc00', fontWeight: 'bold', fontSize: '13px', marginBottom: '4px' }}>CAH</div>
+                        <div style={{ color: '#00cc88', fontSize: '11px', fontFamily: 'monospace' }}>cos(θ) = Adj / Hyp</div>
+                        <div style={{ color: '#fff', fontSize: '13px', fontFamily: 'monospace', marginTop: '2px' }}>{Math.cos(rad).toFixed(4)}</div>
+                      </div>
+                      <div style={{ textAlign: 'center' }}>
+                        <div style={{ color: '#ffcc00', fontWeight: 'bold', fontSize: '13px', marginBottom: '4px' }}>TOA</div>
+                        <div style={{ color: '#b388ff', fontSize: '11px', fontFamily: 'monospace' }}>tan(θ) = Opp / Adj</div>
+                        <div style={{ color: '#fff', fontSize: '13px', fontFamily: 'monospace', marginTop: '2px' }}>{Math.tan(rad).toFixed(4)}</div>
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '12px', marginTop: '8px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#00cc88' }}>Adjacent = {baseLen.toFixed(2)}</span>
+                      <span style={{ color: '#ff6666' }}>Opposite = {opp.toFixed(2)}</span>
+                      <span style={{ color: '#22aaff' }}>Hypotenuse = {hyp.toFixed(2)}</span>
+                      <span style={{ color: '#ffcc00' }}>θ = {angleTheta}°</span>
                     </div>
                   </div>
                 );
@@ -3270,8 +3468,8 @@ return (
             left: '50%',
             transform: 'translate(-50%, -50%)',
             zIndex: 30,
-            width: '80%',
-            maxWidth: '960px',
+            width: '90%',
+            maxWidth: activeMode === 'agent' ? '1100px' : '960px',
             maxHeight: '70vh',
             overflowY: 'auto',
             display: 'flex',
@@ -3870,8 +4068,8 @@ return (
           bottom: '20px',
           left: '50%',
           transform: 'translateX(-50%)',
-          width: '80%',
-          maxWidth: '740px',
+          width: '88%',
+          maxWidth: activeMode === 'agent' ? '900px' : '740px',
           display: 'flex',
           flexDirection: 'column',
           gap: '6px',
@@ -3932,43 +4130,35 @@ return (
             Show Details
           </button>
         )}
-        {/* Multi-Agent toggle — right next to the Agent/Query button */}
+        {/* Agent mode dropdown — replaces separate Multi-Agent / Two-Mode toggles */}
         {activeMode === 'agent' && (
-          <button
-            type="button"
-            onClick={() => { setUseMultiAgent(p => !p); if (!useMultiAgent) setUseTwoMode(false); }}
+          <select
+            value={useMultiAgent ? 'multi' : useTwoMode ? 'twomode' : 'single'}
+            onChange={e => {
+              const v = e.target.value;
+              setUseMultiAgent(v === 'multi');
+              setUseTwoMode(v === 'twomode');
+            }}
             disabled={mode !== 'idle'}
-            title="Multi-agent: Planner → Code Agent → Critic with retries"
+            title="Agent orchestration mode"
             style={{
-              padding: '10px 10px', borderRadius: '12px', border: '2px solid',
-              borderColor: useMultiAgent ? '#ff00ff' : '#555',
-              backgroundColor: useMultiAgent ? 'rgba(255,0,255,0.15)' : '#111',
-              color: useMultiAgent ? '#ff00ff' : '#aaa',
-              fontSize: '11px', cursor: 'pointer', whiteSpace: 'nowrap',
+              padding: '8px 10px', borderRadius: '10px',
+              border: '2px solid',
+              borderColor: useMultiAgent ? '#ff00ff' : useTwoMode ? '#22aaff' : '#555',
+              backgroundColor: useMultiAgent ? 'rgba(255,0,255,0.12)' : useTwoMode ? 'rgba(34,170,255,0.12)' : '#111',
+              color: useMultiAgent ? '#ff00ff' : useTwoMode ? '#22aaff' : '#aaa',
+              fontSize: '11px', cursor: 'pointer',
               transition: 'all 0.3s',
+              appearance: 'none', WebkitAppearance: 'none',
+              backgroundImage: 'url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 width=%278%27 height=%275%27%3E%3Cpath d=%27M0 0l4 5 4-5z%27 fill=%27%23888%27/%3E%3C/svg%3E")',
+              backgroundRepeat: 'no-repeat', backgroundPosition: 'right 8px center',
+              paddingRight: '24px',
             }}
           >
-            🔗{useMultiAgent ? ' ✓' : ''}
-          </button>
-        )}
-        {/* Two-Mode agent toggle — auto-routes between Do-It and Explain */}
-        {activeMode === 'agent' && (
-          <button
-            type="button"
-            onClick={() => { setUseTwoMode(p => !p); if (!useTwoMode) setUseMultiAgent(false); }}
-            disabled={mode !== 'idle'}
-            title="Two-mode: auto-classifies difficulty → Do-It (easy) or Explain (hard)"
-            style={{
-              padding: '10px 10px', borderRadius: '12px', border: '2px solid',
-              borderColor: useTwoMode ? '#22aaff' : '#555',
-              backgroundColor: useTwoMode ? 'rgba(34,170,255,0.15)' : '#111',
-              color: useTwoMode ? '#22aaff' : '#aaa',
-              fontSize: '11px', cursor: 'pointer', whiteSpace: 'nowrap',
-              transition: 'all 0.3s',
-            }}
-          >
-            🎯{useTwoMode ? ' ✓' : ''}
-          </button>
+            <option value="single">⚡ Single Agent</option>
+            <option value="multi">🔗 Multi-Agent</option>
+            <option value="twomode">🎯 Two-Mode</option>
+          </select>
         )}
         {/* Voice input button */}
         <button
@@ -3996,6 +4186,48 @@ return (
           }}
         >
           {voiceLoading ? '⏳' : isRecording ? '⏹' : '🎤'}
+        </button>
+
+        {/* TTS — read last AI message aloud */}
+        <button
+          type="button"
+          onClick={async () => {
+            // Find the last AI message
+            const lastAi = [...messages].reverse().find(m => m.role === 'ai');
+            if (!lastAi) return;
+            setTtsLoading(true);
+            try {
+              const res = await fetch('http://localhost:8000/voice/tts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: lastAi.text.slice(0, 2000) }),
+              });
+              if (res.ok && res.headers.get('content-type')?.includes('audio')) {
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                if (ttsAudioRef.current) { ttsAudioRef.current.pause(); URL.revokeObjectURL(ttsAudioRef.current.src); }
+                const audio = new Audio(url);
+                ttsAudioRef.current = audio;
+                audio.play();
+              }
+            } catch { /* TTS unavailable */ }
+            setTtsLoading(false);
+          }}
+          disabled={ttsLoading || messages.filter(m => m.role === 'ai').length === 0}
+          title="Read last AI response aloud (Kokoro TTS)"
+          style={{
+            padding: '10px 12px',
+            borderRadius: '12px',
+            border: '2px solid',
+            borderColor: ttsLoading ? '#ff9900' : '#444',
+            backgroundColor: ttsLoading ? 'rgba(255,153,0,0.15)' : '#111',
+            color: ttsLoading ? '#ff9900' : '#888',
+            cursor: ttsLoading ? 'wait' : 'pointer',
+            fontSize: '16px',
+            transition: 'all 0.15s',
+          }}
+        >
+          {ttsLoading ? '⏳' : '🔊'}
         </button>
 
         {/* Process log toggle — next to mic */}
@@ -4117,21 +4349,27 @@ return (
           </div>
         )}
 
-        <input
-          type="text"
+        <textarea
           value={input}
-          onChange={e => setInput(e.target.value)}
+          onChange={e => { setInput(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 150) + 'px'; }}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (input.trim() && mode === 'idle') { (e.target as HTMLTextAreaElement).form?.requestSubmit(); } } }}
           placeholder={pendingImageBlob ? 'Ask about the captured image...' : activeMode === 'agent' ? 'Describe code changes...' : 'Ask Aion...'}
           disabled={mode !== 'idle'}
+          rows={1}
           style={{
             flex: 1,
             padding: '12px 18px',
-            borderRadius: '999px',
+            borderRadius: '18px',
             border: '1px solid #333',
             backgroundColor: '#111',
             color: '#fff',
             fontSize: '14px',
             outline: 'none',
+            resize: 'none',
+            overflow: 'hidden',
+            lineHeight: '1.4',
+            fontFamily: 'inherit',
+            maxHeight: '150px',
           }}
         />
         <button

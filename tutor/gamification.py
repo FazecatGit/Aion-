@@ -117,14 +117,32 @@ _load_state()
 
 
 def _level_for_xp(xp: int) -> int:
-    """Compute level from total XP. Each level requires more XP than the last."""
+    """Compute level from total XP.
+
+    XP reduction brackets — the higher your level, the more XP per level:
+      Levels  1-30:  base scaling  (×1.10 growth per level  → ~10 % harder each level)
+      Levels 31-60:  moderate      (×1.15 growth per level  → ~15 %)
+      Levels 61-90:  steep         (×1.20 growth per level  → ~20 %)
+      Levels 91+:    very steep    (×1.25 growth per level  → ~25 %)
+
+    Difficulty multiplier: problems tagged hard grant full XP, easy problems
+    have a soft cap at higher levels (handled in award_xp).
+    """
     level = 1
     threshold = 100
     remaining = xp
     while remaining >= threshold:
         remaining -= threshold
         level += 1
-        threshold = int(threshold * 1.3)
+        if level <= 30:
+            growth = 1.10
+        elif level <= 60:
+            growth = 1.15
+        elif level <= 90:
+            growth = 1.20
+        else:
+            growth = 1.25
+        threshold = int(threshold * growth)
     return level
 
 
@@ -136,12 +154,22 @@ def _xp_for_next_level(xp: int) -> dict:
     while remaining >= threshold:
         remaining -= threshold
         level += 1
-        threshold = int(threshold * 1.3)
+        if level <= 30:
+            growth = 1.10
+        elif level <= 60:
+            growth = 1.15
+        elif level <= 90:
+            growth = 1.20
+        else:
+            growth = 1.25
+        threshold = int(threshold * growth)
     return {
         "level": level,
         "current_xp_in_level": remaining,
         "xp_needed_for_next": threshold,
         "progress_pct": round(remaining / threshold * 100, 1),
+        "bracket": "1-30" if level <= 30 else "31-60" if level <= 60 else "61-90" if level <= 90 else "91+",
+        "growth_rate": "10%" if level <= 30 else "15%" if level <= 60 else "20%" if level <= 90 else "25%",
     }
 
 

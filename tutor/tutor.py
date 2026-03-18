@@ -6,6 +6,7 @@ provides progressive hints, and runs user code against test cases.
 """
 
 import json
+import os
 import re
 import uuid
 import random
@@ -794,6 +795,7 @@ def _sanitize_problem(problem: dict, style: str) -> dict:
         raw_opts = problem.get("options", [])
         if isinstance(raw_opts, list):
             cleaned_opts = []
+            seen_texts = set()
             for i, opt in enumerate(raw_opts):
                 if isinstance(opt, dict):
                     # LLM returned {label: ..., text: ...} instead of a string
@@ -804,7 +806,23 @@ def _sanitize_problem(problem: dict, style: str) -> dict:
                     cleaned_opts.append(opt)
                 else:
                     cleaned_opts.append(str(opt))
-            problem["options"] = cleaned_opts
+            # Deduplicate options: strip label prefix before comparing content
+            deduped = []
+            for opt in cleaned_opts:
+                # Extract content after label (e.g. "A) ..." → "...")
+                content = re.sub(r'^[A-Za-z]\)\s*', '', opt).strip()
+                if content not in seen_texts:
+                    seen_texts.add(content)
+                    deduped.append(opt)
+            # Re-label if duplicates were removed so letters stay sequential
+            if len(deduped) < len(cleaned_opts):
+                relabeled = []
+                for i, opt in enumerate(deduped):
+                    content = re.sub(r'^[A-Za-z]\)\s*', '', opt).strip()
+                    relabeled.append(f"{chr(65 + i)}) {content}")
+                problem["options"] = relabeled
+            else:
+                problem["options"] = cleaned_opts
 
     # Clean hints
     hints = problem.get("hints", [])
@@ -2102,3 +2120,143 @@ def solve_matrix_problem(operation: str, matrices: list) -> dict:
 
     except Exception as e:
         return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CURRICULUM GENERATION — Generate a full chapter at once, persist to JSON
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_GENERATED_CURRICULUM_DIR = os.path.join(os.path.dirname(__file__), "..", "cache", "generated_curriculum")
+
+
+def _curriculum_path(subject_id: str, chapter_id: str) -> str:
+    return os.path.join(_GENERATED_CURRICULUM_DIR, f"{subject_id}__{chapter_id}.json")
+
+
+def get_generated_chapter(subject_id: str, chapter_id: str) -> dict | None:
+    """Load a previously generated chapter from disk."""
+    path = _curriculum_path(subject_id, chapter_id)
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def generate_full_chapter(
+    subject_id: str,
+    chapter_id: str,
+    is_math: bool = True,
+    language: str = "python",
+    progress_callback=None,
+) -> dict:
+    """Generate an entire chapter's worth of problems in one go, then persist.
+
+    Each topic in the chapter gets 3 problems: easy, medium, hard.
+    Problem styles rotate through mcq, short answer, and code/solve.
+
+    Args:
+        progress_callback: optional callable(step, total, message) for progress bar
+    Returns:
+        dict with keys: subject_id, chapter_id, chapter_name, topics,
+                        total_problems, problems (list of dicts)
+    """
+    curriculum = MATH_CURRICULUM if is_math else CS_CURRICULUM
+    subj = curriculum.get(subject_id)
+    if not subj:
+        return {"error": f"Subject '{subject_id}' not found"}
+
+    chapter = None
+    for ch in subj["chapters"]:
+        if ch["id"] == chapter_id:
+            chapter = ch
+            break
+    if not chapter:
+        return {"error": f"Chapter '{chapter_id}' not found"}
+
+    # Check if already generated
+    existing = get_generated_chapter(subject_id, chapter_id)
+    if existing:
+        logger.info("[CURRICULUM] Chapter already generated: %s / %s (%d problems)",
+                     subject_id, chapter_id, len(existing.get("problems", [])))
+        return existing
+
+    topics = chapter["topics"]
+    difficulties = ["easy", "medium", "hard"]
+    if is_math:
+        styles_rotation = ["mcq", "solve", "mcq"]
+    else:
+        styles_rotation = ["mcq", "free_text", "code"]
+
+    all_problems = []
+    total_steps = len(topics) * len(difficulties)
+    step = 0
+
+    logger.info("[CURRICULUM] Generating chapter '%s' — %d topics × %d difficulties = %d problems",
+                chapter["name"], len(topics), len(difficulties), total_steps)
+
+    for topic_idx, topic in enumerate(topics):
+        rag_context = _fetch_rag_context(topic) if is_math else ""
+
+        for diff_idx, diff in enumerate(difficulties):
+            step += 1
+            style = styles_rotation[diff_idx]
+            msg = f"Generating {diff} {style} for '{topic}' ({step}/{total_steps})"
+            logger.info("[CURRICULUM] %s", msg)
+            if progress_callback:
+                progress_callback(step, total_steps, msg)
+
+            try:
+                if is_math:
+                    problem_data = generate_math_problem(
+                        topic=topic, difficulty=diff, style=style,
+                    )
+                else:
+                    problem_data = generate_problem(
+                        topic=topic, difficulty=diff, language=language,
+                        style=style,
+                    )
+                # Add metadata
+                problem_data["topic"] = topic
+                problem_data["difficulty"] = diff
+                problem_data["style"] = style
+                problem_data["order"] = step
+                all_problems.append(problem_data)
+            except Exception as e:
+                logger.warning("[CURRICULUM] Failed to generate %s %s for '%s': %s", diff, style, topic, e)
+                all_problems.append({
+                    "topic": topic, "difficulty": diff, "style": style,
+                    "order": step, "error": str(e),
+                    "question": f"(Failed to generate problem about {topic})",
+                })
+
+    result = {
+        "subject_id": subject_id,
+        "chapter_id": chapter_id,
+        "chapter_name": chapter["name"],
+        "subject_name": subj["name"],
+        "is_math": is_math,
+        "language": language,
+        "topics": topics,
+        "total_problems": len(all_problems),
+        "problems": all_problems,
+        "generated_at": datetime.now().isoformat(),
+    }
+
+    # Persist to JSON
+    os.makedirs(_GENERATED_CURRICULUM_DIR, exist_ok=True)
+    with open(_curriculum_path(subject_id, chapter_id), "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    logger.info("[CURRICULUM] Chapter persisted to disk: %s", _curriculum_path(subject_id, chapter_id))
+
+    return result
+
+
+def get_chapter_problem(subject_id: str, chapter_id: str, problem_index: int) -> dict:
+    """Get a specific problem from a generated chapter by index."""
+    chapter_data = get_generated_chapter(subject_id, chapter_id)
+    if not chapter_data:
+        return {"error": "Chapter not generated yet. Generate it first."}
+    problems = chapter_data.get("problems", [])
+    if problem_index < 0 or problem_index >= len(problems):
+        return {"error": f"Problem index {problem_index} out of range (0-{len(problems)-1})"}
+    return problems[problem_index]

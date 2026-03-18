@@ -1647,12 +1647,187 @@ async def agent_two_mode(req: TwoModeRequest):
     """Run the two-mode code agent (auto-routes between Do-It and Explain)."""
     _api_log.info("[API] /agent/two-mode — instruction=%s", req.instruction[:60])
     from agent.multi_agent_graph import run_two_mode_agent
+
+    # Resolve file_path the same way other agent endpoints do
+    resolved_path = req.file_path
+    if not Path(resolved_path).exists():
+        candidate = Path(resolved_path)
+        if not candidate.is_absolute():
+            matches = list(Path(".").rglob(candidate.name))
+            if matches:
+                resolved_path = str(matches[0].resolve())
+
     result = await asyncio.to_thread(
         run_two_mode_agent,
         instruction=req.instruction,
-        source=req.source_code,
-        ext=os.path.splitext(req.file_path)[1] or ".py",
-        test_cases=req.test_cases,
+        file_path=resolved_path,
+        test_cases=req.test_cases if req.test_cases else None,
     )
     _api_log.info("[API] /agent/two-mode — done, mode=%s", result.get("mode"))
     return {"status": "ok", **result}
+
+
+# ── Curriculum generation endpoints (full chapter at once) ───────────────
+
+_curriculum_gen_state: dict = {"status": "idle", "step": 0, "total": 0, "message": ""}
+
+class GenerateChapterRequest(BaseModel):
+    subject_id: str
+    chapter_id: str
+    is_math: bool = True
+    language: str = "python"
+
+@app.post("/curriculum/generate")
+async def curriculum_generate(req: GenerateChapterRequest):
+    """Generate an entire chapter of problems (persist to JSON). Long-running — poll status."""
+    from tutor.tutor import get_generated_chapter
+    global _curriculum_gen_state
+
+    # Return cached if already exists
+    existing = get_generated_chapter(req.subject_id, req.chapter_id)
+    if existing:
+        return {"status": "ok", "cached": True, **existing}
+
+    if _curriculum_gen_state["status"] == "running":
+        return {"status": "already_running"}
+
+    _curriculum_gen_state = {"status": "running", "step": 0, "total": 0, "message": "Starting..."}
+
+    def _progress(step, total, message):
+        _curriculum_gen_state["step"] = step
+        _curriculum_gen_state["total"] = total
+        _curriculum_gen_state["message"] = message
+
+    async def _run():
+        global _curriculum_gen_state
+        try:
+            from tutor.tutor import generate_full_chapter
+            result = await asyncio.to_thread(
+                generate_full_chapter,
+                subject_id=req.subject_id,
+                chapter_id=req.chapter_id,
+                is_math=req.is_math,
+                language=req.language,
+                progress_callback=_progress,
+            )
+            _curriculum_gen_state = {"status": "done", "step": 0, "total": 0, "message": "Complete", "result": result}
+        except Exception as e:
+            _curriculum_gen_state = {"status": "error", "step": 0, "total": 0, "message": str(e)}
+
+    asyncio.create_task(_run())
+    return {"status": "started"}
+
+@app.get("/curriculum/generate/status")
+async def curriculum_generate_status():
+    """Poll for progress of chapter generation."""
+    return _curriculum_gen_state
+
+@app.get("/curriculum/chapter/{subject_id}/{chapter_id}")
+async def curriculum_get_chapter(subject_id: str, chapter_id: str):
+    """Get a generated chapter's problems."""
+    from tutor.tutor import get_generated_chapter
+    data = get_generated_chapter(subject_id, chapter_id)
+    if not data:
+        return {"status": "not_generated"}
+    return {"status": "ok", **data}
+
+@app.get("/curriculum/chapter/{subject_id}/{chapter_id}/{problem_index}")
+async def curriculum_get_problem(subject_id: str, chapter_id: str, problem_index: int):
+    """Get a specific problem from a generated chapter."""
+    from tutor.tutor import get_chapter_problem
+    result = get_chapter_problem(subject_id, chapter_id, problem_index)
+    if "error" in result:
+        return {"status": "error", **result}
+    return {"status": "ok", "problem": result}
+
+
+# ── TTS Kokoro endpoint ────────────────────────────────────────────────
+
+class TTSKokoroRequest(BaseModel):
+    text: str
+    voice: str = "af_heart"
+
+@app.post("/voice/tts")
+async def voice_tts_kokoro(req: TTSKokoroRequest):
+    """Text-to-speech using Kokoro TTS. Returns WAV audio file."""
+    _api_log.info("[API] /voice/tts — text=%d chars, voice=%s", len(req.text), req.voice)
+
+    def _generate():
+        try:
+            from kokoro import KPipeline
+        except ImportError:
+            return None, "Kokoro TTS not installed. Run: pip install kokoro"
+
+        pipeline = KPipeline(lang_code='a')
+        audio_segments = []
+        for _, _, audio in pipeline(req.text, voice=req.voice):
+            audio_segments.append(audio)
+
+        if not audio_segments:
+            return None, "No audio generated"
+
+        import numpy as np
+        import soundfile as sf
+        import tempfile
+
+        full_audio = np.concatenate(audio_segments)
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        sf.write(tmp.name, full_audio, 24000)
+        return tmp.name, None
+
+    try:
+        wav_path, error = await asyncio.to_thread(_generate)
+        if error:
+            return {"status": "error", "error": error}
+
+        from starlette.responses import FileResponse
+        return FileResponse(wav_path, media_type="audio/wav", filename="tts_output.wav")
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ── Image generation endpoint ────────────────────────────────────────────
+
+class ImageGenRequest(BaseModel):
+    prompt: str
+    width: int = 512
+    height: int = 512
+
+@app.post("/generate/image")
+async def generate_image(req: ImageGenRequest):
+    """Generate an image from a text prompt using the Ollama vision model."""
+    _api_log.info("[API] /generate/image — prompt=%s", req.prompt[:60])
+
+    def _generate():
+        import httpx
+        # Use Ollama's generate endpoint with an image-capable model
+        resp = httpx.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llava",
+                "prompt": f"Generate a detailed description suitable for creating an image of: {req.prompt}",
+                "stream": False,
+            },
+            timeout=60.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("response", ""), None
+        return None, f"Ollama returned status {resp.status_code}"
+
+    try:
+        description, error = await asyncio.to_thread(_generate)
+        if error:
+            return {"status": "error", "error": error}
+        return {"status": "ok", "description": description, "prompt": req.prompt}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ── Math visualization compute endpoint ──────────────────────────────────
+
+@app.get("/visualizations/modules")
+async def visualization_modules_list():
+    """Get all visualization modules grouped by category (for frontend tabs)."""
+    from tutor.math_visualizations import get_visualization_modules
+    return {"status": "ok", "categories": get_visualization_modules()}
