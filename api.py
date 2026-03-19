@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 import logging
 import json
 import os
@@ -24,7 +25,8 @@ from brain.ingest import _reingest_log
 from brain.augmented_generation_query import query_brain_comprehensive, session_chat_history
 from brain.chat_session_store import ChatSessionStore
 from brain.pdf_utils import load_pdfs
-from brain.config import DATA_DIR
+from brain.config import DATA_DIR, OUTPUT_DIR
+
 
 warnings.filterwarnings("ignore")
 
@@ -1746,33 +1748,36 @@ async def curriculum_get_problem(subject_id: str, chapter_id: str, problem_index
 class TTSKokoroRequest(BaseModel):
     text: str
     voice: str = "af_heart"
+    speed: float = 1.0
+
 
 @app.post("/voice/tts")
 async def voice_tts_kokoro(req: TTSKokoroRequest):
-    """Text-to-speech using Kokoro TTS. Returns WAV audio file."""
+    """Text-to-speech using Kokoro ONNX. Returns WAV audio file."""
     _api_log.info("[API] /voice/tts — text=%d chars, voice=%s", len(req.text), req.voice)
 
     def _generate():
         try:
-            from kokoro import KPipeline
+            from kokoro_onnx import Kokoro
+            import soundfile as sf
+            import numpy as np
+            import tempfile
         except ImportError:
-            return None, "Kokoro TTS not installed. Run: pip install kokoro"
+            return None, "kokoro-onnx not installed. Run: pip install kokoro-onnx"
 
-        pipeline = KPipeline(lang_code='a')
-        audio_segments = []
-        for _, _, audio in pipeline(req.text, voice=req.voice):
-            audio_segments.append(audio)
+        kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+        samples, sample_rate = kokoro.create(
+            req.text,
+            voice=req.voice,
+            speed=req.speed,
+            lang="en-us"
+        )
 
-        if not audio_segments:
+        if samples is None or len(samples) == 0:
             return None, "No audio generated"
 
-        import numpy as np
-        import soundfile as sf
-        import tempfile
-
-        full_audio = np.concatenate(audio_segments)
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        sf.write(tmp.name, full_audio, 24000)
+        sf.write(tmp.name, samples, sample_rate)
         return tmp.name, None
 
     try:
@@ -1786,42 +1791,89 @@ async def voice_tts_kokoro(req: TTSKokoroRequest):
         return {"status": "error", "error": str(e)}
 
 
+
 # ── Image generation endpoint ────────────────────────────────────────────
+
+from diffusers import StableDiffusionXLPipeline
+import torch
+
+MODEL_PATH = "C:/Users/Pog Pete/Desktop/projects/Aion/models/illustriousXL_v01.safetensors"
+assert Path(MODEL_PATH).exists(), f"Model not found at: {MODEL_PATH}"
+
+_sd_pipe = None
+
+def _get_sd_pipe():
+    global _sd_pipe
+    if _sd_pipe is None:
+        _sd_pipe = StableDiffusionXLPipeline.from_single_file(
+            MODEL_PATH,
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+        ).to("cuda")
+        _sd_pipe.enable_attention_slicing()
+    return _sd_pipe
+
 
 class ImageGenRequest(BaseModel):
     prompt: str
-    width: int = 512
-    height: int = 512
+    width: int = 1024
+    height: int = 1024
+
 
 @app.post("/generate/image")
 async def generate_image(req: ImageGenRequest):
-    """Generate an image from a text prompt using the Ollama vision model."""
     _api_log.info("[API] /generate/image — prompt=%s", req.prompt[:60])
 
-    def _generate():
-        import httpx
-        # Use Ollama's generate endpoint with an image-capable model
-        resp = httpx.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llava",
-                "prompt": f"Generate a detailed description suitable for creating an image of: {req.prompt}",
-                "stream": False,
-            },
-            timeout=60.0,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("response", ""), None
-        return None, f"Ollama returned status {resp.status_code}"
+    # def _expand_prompt(raw: str) -> str:
+    #     # Ask Ollama to expand the prompt
+    #     import httpx
+    #     resp = httpx.post("http://localhost:11434/api/generate", json={
+    #         "model": "qwen3",
+    #         "prompt": f"Expand this image generation prompt into a detailed, descriptive prompt for Stable Diffusion XL. Return only the prompt, no explanation: '{raw}'",
+    #         "stream": False,
+    #     }, timeout=30.0)
+    #     if resp.status_code == 200:
+    #         return resp.json().get("response", raw).strip()
+    #     return raw
 
-    try:
-        description, error = await asyncio.to_thread(_generate)
-        if error:
-            return {"status": "error", "error": error}
-        return {"status": "ok", "description": description, "prompt": req.prompt}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    def _generate():
+        try:
+            output_dir_path = Path(OUTPUT_DIR)
+            output_dir_path.mkdir(parents=True, exist_ok=True)
+
+            pipe = _get_sd_pipe()
+
+            # Pony requires these prefix tags
+            full_prompt = f"rating_explicit, amazing quality, sexy,{req.prompt}"
+            full_negative = "score_4, score_3, score_2, score_1, " + \
+                            "blurry, low quality, deformed, bad anatomy, watermark, bad hands, text, error, cropped, worst quality,bad quality,worst quality,worst detail,sketch,censored, artist os.name,signature, watermark,patreon username, patreon logo,pov, doorway, door, tattoo"
+
+            image = pipe(
+                full_prompt,
+                width=req.width,
+                height=req.height,
+                num_inference_steps=35,
+                guidance_scale=8.0,
+                negative_prompt=full_negative,
+            ).images[0]
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = str(output_dir_path / f"{timestamp}_{req.prompt[:20].replace(' ', '_')}.png")
+            image.save(filename)
+            _api_log.info("[IMAGE GEN] Saved to: %s", filename)
+            return filename, None
+        except Exception as e:
+            _api_log.error("[IMAGE GEN] Error: %s", str(e))
+            return None, str(e)
+
+
+    img_path, error = await asyncio.to_thread(_generate)
+    if error:
+        return {"status": "error", "error": error}
+
+    from starlette.responses import FileResponse
+    return FileResponse(img_path, media_type="image/png", filename="generated.png")
+
 
 
 # ── Math visualization compute endpoint ──────────────────────────────────
@@ -1831,3 +1883,28 @@ async def visualization_modules_list():
     """Get all visualization modules grouped by category (for frontend tabs)."""
     from tutor.math_visualizations import get_visualization_modules
     return {"status": "ok", "categories": get_visualization_modules()}
+
+
+class QuadraticRequest(BaseModel):
+    a: float = 1
+    b: float = 0
+    c: float = -4
+
+@app.post("/math/quadratic")
+async def math_quadratic(req: QuadraticRequest):
+    """Compute quadratic formula: roots, vertex, parabola points, steps."""
+    from tutor.math_visualizations import compute_quadratic
+    result = compute_quadratic(a=req.a, b=req.b, c=req.c)
+    return {"status": "ok", **result}
+
+
+class ScientificCalcRequest(BaseModel):
+    expression: str
+
+@app.post("/math/scientific")
+async def math_scientific(req: ScientificCalcRequest):
+    """Evaluate a scientific expression (trig, integrals, derivatives, etc.)."""
+    _api_log.info("[API] /math/scientific — expr=%s", req.expression[:60])
+    from tutor.math_visualizations import compute_scientific
+    result = await asyncio.to_thread(compute_scientific, req.expression)
+    return {"status": "ok", **result}

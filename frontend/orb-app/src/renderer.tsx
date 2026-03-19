@@ -19,6 +19,7 @@ function App() {
   const [agentTaskMode, setAgentTaskMode] = useState<'auto' | 'fix' | 'solve'>('auto');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [lastUserQuery, setLastUserQuery] = useState<string | null>(null);
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [pendingAgentEdit, setPendingAgentEdit] = useState<{ instruction: string; output: string; filePath: string; newSource?: string; contextEdits?: { path: string; diff: string; new_source: string; explanation?: string }[] } | null>(null);
   const computeSize = () => {
@@ -145,7 +146,7 @@ function App() {
 
   // ── Math Visualization Tools ───────────────────────────────────────────────
   const [showMathViz, setShowMathViz] = useState(false);
-  type MathVizType = 'vector' | 'circle' | 'triangle' | 'unitcircle' | 'matrix' | 'normal' | 'bezier' | null;
+  type MathVizType = 'vector' | 'circle' | 'triangle' | 'unitcircle' | 'matrix' | 'normal' | 'bezier' | 'quadratic' | 'calculator' | 'derivative' | 'riemann' | 'taylor' | 'fourier' | 'parametric' | 'regression' | 'montecarlo' | null;
   const [mathVizType, setMathVizType] = useState<MathVizType>(null);
   // Vector: {x, y} endpoints
   const [vizVectors, setVizVectors] = useState<{x: number; y: number; label: string; color: string}[]>([
@@ -203,9 +204,61 @@ function App() {
   const [toolsOutput, setToolsOutput] = useState<string | null>(null);
   const [toolsLoading, setToolsLoading] = useState(false);
 
+  // ── Quadratic viz state ────────────────────────────────────────────────────
+  const [vizQuadA, setVizQuadA] = useState(1);
+  const [vizQuadB, setVizQuadB] = useState(0);
+  const [vizQuadC, setVizQuadC] = useState(-4);
+  const [vizQuadResult, setVizQuadResult] = useState<any>(null);
+
+  // ── Scientific calculator state ────────────────────────────────────────────
+  const [calcExpr, setCalcExpr] = useState('');
+  const [calcResult, setCalcResult] = useState<any>(null);
+  const [calcLoading, setCalcLoading] = useState(false);
+  const [calcHistory, setCalcHistory] = useState<{expr: string; result: string}[]>([]);
+
+  // ── Derivative animator state ──────────────────────────────────────────────
+  const [vizDerivExpr, setVizDerivExpr] = useState('x^2');
+  const [vizDerivX, setVizDerivX] = useState(1);
+
+  // ── Riemann sum state ──────────────────────────────────────────────────────
+  const [vizRiemannExpr, setVizRiemannExpr] = useState('x^2');
+  const [vizRiemannN, setVizRiemannN] = useState(10);
+  const [vizRiemannA, setVizRiemannA] = useState(0);
+  const [vizRiemannB, setVizRiemannB] = useState(2);
+  const [vizRiemannMethod, setVizRiemannMethod] = useState<'left' | 'right' | 'midpoint'>('left');
+
+  // ── Taylor series state ────────────────────────────────────────────────────
+  const [vizTaylorFn, setVizTaylorFn] = useState<'sin' | 'cos' | 'exp'>('sin');
+  const [vizTaylorN, setVizTaylorN] = useState(3);
+
+  // ── Fourier series state ───────────────────────────────────────────────────
+  const [vizFourierWave, setVizFourierWave] = useState<'square' | 'sawtooth' | 'triangle'>('square');
+  const [vizFourierN, setVizFourierN] = useState(5);
+
+  // ── Parametric curves state ────────────────────────────────────────────────
+  const [vizParamXExpr, setVizParamXExpr] = useState('cos(t)');
+  const [vizParamYExpr, setVizParamYExpr] = useState('sin(t)');
+  const [vizParamT, setVizParamT] = useState(3.14);
+
+  // ── Regression state ───────────────────────────────────────────────────────
+  const [vizRegPoints, setVizRegPoints] = useState<{x: number; y: number}[]>([
+    {x:1,y:2},{x:2,y:4},{x:3,y:5},{x:4,y:4},{x:5,y:5}
+  ]);
+  const [vizRegShowResiduals, setVizRegShowResiduals] = useState(true);
+
+  // ── Monte Carlo Pi state ───────────────────────────────────────────────────
+  const [vizMonteN, setVizMonteN] = useState(500);
+  const [vizMontePoints, setVizMontePoints] = useState<{x: number; y: number; inside: boolean}[]>([]);
+
   // ── TTS state ──────────────────────────────────────────────────────────────
   const [ttsLoading, setTtsLoading] = useState(false);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // ── Image generation state ─────────────────────────────────────────────────
+  const [imageGenLoading, setImageGenLoading] = useState(false);
+  const [imageGenPrompt, setImageGenPrompt] = useState('');
+  const [imageGenResult, setImageGenResult] = useState<string | null>(null);
+  const [showImageGenDialog, setShowImageGenDialog] = useState(false);
 
   // ── Process / backend log panel ────────────────────────────────────────────
   type ProcessLog = { ts: number; level: string; logger: string; message: string };
@@ -1192,6 +1245,45 @@ const handleRagChunkRetry = async (chunks: number) => {
   setMode('idle');
 };
 
+const handleImageGenerate = async () => {
+  if (!imageGenPrompt.trim() || imageGenLoading) return;
+  setImageGenLoading(true);
+  setImageGenResult(null);
+
+  try {
+    const res = await fetch('http://localhost:8000/generate/image', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: imageGenPrompt.trim() }),
+    });
+
+    if (!res.ok) {
+      const errData = await res.json();
+      setImageGenResult(`Error: ${errData.error || 'Generation failed'}`);
+      return;
+    }
+
+    const contentType = res.headers.get('content-type') ?? '';
+    if (contentType.includes('image')) {
+      // Response is an image blob
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      setImageGenResult(url);
+    } else {
+      // Response is JSON (description)
+      const data = await res.json();
+      if (data.status === 'ok') {
+        setImageGenResult(data.description);
+      } else {
+        setImageGenResult(`Error: ${data.error || 'Generation failed'}`);
+      }
+    }
+  } catch (err: any) {
+    setImageGenResult(`Error: ${err.message}`);
+  } finally {
+    setImageGenLoading(false);
+  }
+};
 
 return (
   <div
@@ -2793,18 +2885,35 @@ return (
                 <button onClick={() => setShowMathViz(false)} style={{ background: 'none', border: '1px solid #b388ff44', borderRadius: '6px', color: '#888', cursor: 'pointer', padding: '4px 10px', fontSize: '11px' }}>Close</button>
               </div>
               {/* Tab bar */}
-              <div style={{ display: 'flex', gap: '0px', marginBottom: '16px', borderBottom: '2px solid #222', overflowX: 'auto' }}>
-                {(['unitcircle', 'vector', 'triangle', 'circle', 'matrix', 'normal', 'bezier'] as MathVizType[]).map(t => (
-                  <button key={t} onClick={() => setMathVizType(mathVizType === t ? null : t)}
+              <div style={{ display: 'flex', gap: '0px', marginBottom: '16px', borderBottom: '2px solid #222', overflowX: 'auto', flexWrap: 'wrap' }}>
+                {([
+                  { key: 'unitcircle', label: '🔵 Unit Circle' },
+                  { key: 'vector', label: '➡️ Vectors' },
+                  { key: 'triangle', label: '📐 Triangle' },
+                  { key: 'circle', label: '⭕ Circle' },
+                  { key: 'matrix', label: '🔢 Matrix Transform' },
+                  { key: 'normal', label: '📊 Normal Dist' },
+                  { key: 'bezier', label: '〰️ Bezier' },
+                  { key: 'quadratic', label: '📈 Quadratic' },
+                  { key: 'derivative', label: '∫ Derivative' },
+                  { key: 'riemann', label: '∫ Riemann' },
+                  { key: 'taylor', label: '∫ Taylor' },
+                  { key: 'fourier', label: '∫ Fourier' },
+                  { key: 'parametric', label: '∫ Parametric' },
+                  { key: 'regression', label: '🎲 Regression' },
+                  { key: 'montecarlo', label: '🎲 Monte Carlo π' },
+                  { key: 'calculator', label: '🔬 Calculator' },
+                ] as {key: MathVizType; label: string}[]).map(t => (
+                  <button key={t.key} onClick={() => setMathVizType(mathVizType === t.key ? null : t.key)}
                     style={{
-                      padding: '8px 16px', border: 'none', borderBottom: mathVizType === t ? '2px solid #b388ff' : '2px solid transparent',
-                      backgroundColor: 'transparent', color: mathVizType === t ? '#b388ff' : '#777',
-                      cursor: 'pointer', fontSize: '12px', fontWeight: mathVizType === t ? 'bold' : 'normal',
+                      padding: '7px 12px', border: 'none', borderBottom: mathVizType === t.key ? '2px solid #b388ff' : '2px solid transparent',
+                      backgroundColor: 'transparent', color: mathVizType === t.key ? '#b388ff' : '#777',
+                      cursor: 'pointer', fontSize: '11px', fontWeight: mathVizType === t.key ? 'bold' : 'normal',
                       whiteSpace: 'nowrap', transition: 'all 0.2s', marginBottom: '-2px',
                     }}
-                    onMouseEnter={e => { if (mathVizType !== t) (e.target as HTMLElement).style.color = '#b388ff'; }}
-                    onMouseLeave={e => { if (mathVizType !== t) (e.target as HTMLElement).style.color = '#777'; }}>
-                    {t === 'unitcircle' ? '🔵 Unit Circle' : t === 'vector' ? '➡️ Vectors' : t === 'triangle' ? '📐 Triangle' : t === 'circle' ? '⭕ Circle' : t === 'matrix' ? '🔢 Matrix' : t === 'normal' ? '📊 Normal' : '〰️ Bezier'}
+                    onMouseEnter={e => { if (mathVizType !== t.key) (e.target as HTMLElement).style.color = '#b388ff'; }}
+                    onMouseLeave={e => { if (mathVizType !== t.key) (e.target as HTMLElement).style.color = '#777'; }}>
+                    {t.label}
                   </button>
                 ))}
               </div>
@@ -3430,6 +3539,589 @@ return (
                     <div style={{ display: 'flex', gap: '14px', marginTop: '4px', fontSize: '11px', fontFamily: 'monospace', flexWrap: 'wrap' }}>
                       <span style={{ color: '#ff4444' }}>B(t) = ({currentPt.x.toFixed(1)}, {currentPt.y.toFixed(1)})</span>
                       <span style={{ color: '#888' }}>Cubic Bézier: B(t) = (1-t)³P₀ + 3(1-t)²tP₁ + 3(1-t)t²P₂ + t³P₃</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ── Quadratic Formula & Graph ─────────────────────────── */}
+              {mathVizType === 'quadratic' && (() => {
+                const a = vizQuadA, b = vizQuadB, c = vizQuadC;
+                const disc = b * b - 4 * a * c;
+                const vertexX = a !== 0 ? -b / (2 * a) : 0;
+                const vertexY = a !== 0 ? a * vertexX * vertexX + b * vertexX + c : c;
+                const roots: number[] = [];
+                if (a !== 0) {
+                  if (disc > 0) { roots.push((-b + Math.sqrt(disc)) / (2 * a), (-b - Math.sqrt(disc)) / (2 * a)); }
+                  else if (disc === 0) { roots.push(-b / (2 * a)); }
+                }
+                const W = 500, H = 380, PAD = 50;
+                const xSpan = Math.max(6, Math.abs(vertexX) + 5);
+                const xMin = vertexX - xSpan, xMax = vertexX + xSpan;
+                const pts: {x: number; y: number}[] = [];
+                for (let i = 0; i <= 200; i++) {
+                  const x = xMin + (xMax - xMin) * i / 200;
+                  const y = a * x * x + b * x + c;
+                  if (Math.abs(y) < 1e4) pts.push({ x, y });
+                }
+                const yVals = pts.map(p => p.y);
+                const yMin = Math.min(...yVals, 0) - 1, yMax = Math.max(...yVals, 0) + 1;
+                const yRange = yMax - yMin || 1, xRange = xMax - xMin || 1;
+                const sx = (x: number) => PAD + ((x - xMin) / xRange) * (W - 2 * PAD);
+                const sy = (y: number) => H - PAD - ((y - yMin) / yRange) * (H - 2 * PAD);
+                const toPath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ');
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '12px', marginBottom: '8px', fontSize: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#ff4444' }}>
+                        a: <input type="range" min={-5} max={5} step={0.1} value={a} onChange={e => setVizQuadA(+e.target.value)} style={{ width: '80px' }} />
+                        <span style={{ fontFamily: 'monospace', minWidth: '32px' }}>{a}</span>
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#00cc88' }}>
+                        b: <input type="range" min={-10} max={10} step={0.1} value={b} onChange={e => setVizQuadB(+e.target.value)} style={{ width: '80px' }} />
+                        <span style={{ fontFamily: 'monospace', minWidth: '32px' }}>{b}</span>
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#22aaff' }}>
+                        c: <input type="range" min={-10} max={10} step={0.1} value={c} onChange={e => setVizQuadC(+e.target.value)} style={{ width: '80px' }} />
+                        <span style={{ fontFamily: 'monospace', minWidth: '32px' }}>{c}</span>
+                      </label>
+                    </div>
+                    <div style={{ fontSize: '13px', fontFamily: 'monospace', color: '#b388ff', marginBottom: '6px' }}>
+                      f(x) = {a}x² {b >= 0 ? `+ ${b}` : `− ${Math.abs(b)}`}x {c >= 0 ? `+ ${c}` : `− ${Math.abs(c)}`}
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {/* Grid */}
+                      {Array.from({ length: 11 }, (_, i) => {
+                        const gx = PAD + (i / 10) * (W - 2 * PAD);
+                        const gy = PAD + (i / 10) * (H - 2 * PAD);
+                        return <g key={i}><line x1={gx} y1={PAD} x2={gx} y2={H - PAD} stroke="#1a1a1a" /><line x1={PAD} y1={gy} x2={W - PAD} y2={gy} stroke="#1a1a1a" /></g>;
+                      })}
+                      {/* Axes */}
+                      {sx(0) >= PAD && sx(0) <= W - PAD && <line x1={sx(0)} y1={PAD} x2={sx(0)} y2={H - PAD} stroke="#555" strokeWidth={1.5} />}
+                      {sy(0) >= PAD && sy(0) <= H - PAD && <line x1={PAD} y1={sy(0)} x2={W - PAD} y2={sy(0)} stroke="#555" strokeWidth={1.5} />}
+                      {/* Parabola */}
+                      <path d={toPath} fill="none" stroke="#00cc88" strokeWidth={2.5} />
+                      {/* Vertex */}
+                      <circle cx={sx(vertexX)} cy={sy(vertexY)} r={5} fill="#ff9900" />
+                      <text x={sx(vertexX) + 8} y={sy(vertexY) - 8} fill="#ff9900" fontSize={11} fontFamily="monospace">V({vertexX.toFixed(2)}, {vertexY.toFixed(2)})</text>
+                      {/* Axis of symmetry */}
+                      <line x1={sx(vertexX)} y1={PAD} x2={sx(vertexX)} y2={H - PAD} stroke="#ff990044" strokeWidth={1} strokeDasharray="5,4" />
+                      {/* Roots */}
+                      {roots.map((r, i) => (
+                        <g key={i}>
+                          <circle cx={sx(r)} cy={sy(0)} r={5} fill="#ff4444" />
+                          <text x={sx(r) + 6} y={sy(0) - 8} fill="#ff4444" fontSize={10} fontFamily="monospace">x{roots.length > 1 ? i + 1 : ''} = {r.toFixed(3)}</text>
+                        </g>
+                      ))}
+                      <text x={W - PAD + 5} y={sy(0) + 4} fill="#888" fontSize={11} fontWeight="bold">x</text>
+                      <text x={sx(0) - 14} y={PAD - 5} fill="#888" fontSize={11} fontWeight="bold">y</text>
+                    </svg>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '4px 14px', marginTop: '8px', fontSize: '11px', fontFamily: 'monospace', padding: '8px', backgroundColor: '#111', borderRadius: '6px', border: '1px solid #222' }}>
+                      <span style={{ color: '#ff9900' }}>Vertex: ({vertexX.toFixed(3)}, {vertexY.toFixed(3)})</span>
+                      <span style={{ color: '#b388ff' }}>Discriminant Δ = {disc.toFixed(3)}</span>
+                      <span style={{ color: disc > 0 ? '#00cc88' : disc === 0 ? '#ff9900' : '#ff4444' }}>
+                        {disc > 0 ? `2 real roots: ${roots.map(r => r.toFixed(3)).join(', ')}` : disc === 0 ? `1 repeated root: ${roots[0]?.toFixed(3)}` : `No real roots (Δ < 0)`}
+                      </span>
+                      {disc < 0 && <span style={{ color: '#888' }}>Complex: {(-b / (2 * a)).toFixed(3)} ± {(Math.sqrt(-disc) / (2 * a)).toFixed(3)}i</span>}
+                      <span style={{ color: '#888' }}>Direction: {a > 0 ? '↑ opens up' : a < 0 ? '↓ opens down' : '— linear'}</span>
+                      <span style={{ color: '#b388ff', gridColumn: '1 / -1' }}>Quadratic Formula: x = (−b ± √(b²−4ac)) / (2a)</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ── Scientific Calculator ──────────────────────────────── */}
+              {mathVizType === 'calculator' && (() => {
+                const symbols = [
+                  { sym: 'π', ins: 'pi' }, { sym: 'e', ins: 'E' }, { sym: 'i', ins: 'I' },
+                  { sym: 'sin', ins: 'sin(' }, { sym: 'cos', ins: 'cos(' }, { sym: 'tan', ins: 'tan(' },
+                  { sym: 'sin⁻¹', ins: 'asin(' }, { sym: 'cos⁻¹', ins: 'acos(' }, { sym: 'tan⁻¹', ins: 'atan(' },
+                  { sym: 'ln', ins: 'ln(' }, { sym: 'log', ins: 'log(' }, { sym: '√', ins: 'sqrt(' },
+                  { sym: '|x|', ins: 'Abs(' }, { sym: 'x²', ins: '**2' }, { sym: 'xⁿ', ins: '**' },
+                  { sym: 'n!', ins: 'factorial(' }, { sym: 'Σ', ins: 'Sum(' }, { sym: '∫', ins: 'integrate(' },
+                  { sym: 'd/dx', ins: 'diff(' }, { sym: '∞', ins: 'oo' }, { sym: '(', ins: '(' }, { sym: ')', ins: ')' },
+                ];
+                const handleCalc = async () => {
+                  if (!calcExpr.trim()) return;
+                  setCalcLoading(true);
+                  try {
+                    const res = await fetch('http://localhost:8000/math/scientific', {
+                      method: 'POST', headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ expression: calcExpr }),
+                    });
+                    const data = await res.json();
+                    setCalcResult(data);
+                    if (!data.error) {
+                      setCalcHistory(prev => [{ expr: calcExpr, result: data.result || data.error || '' }, ...prev].slice(0, 20));
+                    }
+                  } catch { setCalcResult({ error: 'Failed to connect to server' }); }
+                  setCalcLoading(false);
+                };
+                return (
+                  <div>
+                    <div style={{ fontSize: '13px', color: '#b388ff', fontWeight: 'bold', marginBottom: '8px' }}>🔬 Scientific Calculator</div>
+                    {/* Symbol buttons */}
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '10px' }}>
+                      {symbols.map(s => (
+                        <button key={s.sym} onClick={() => setCalcExpr(prev => prev + s.ins)}
+                          style={{ padding: '5px 10px', borderRadius: '4px', border: '1px solid #444', background: '#111', color: '#ddd', cursor: 'pointer', fontSize: '12px', fontFamily: 'monospace', minWidth: '36px', transition: 'border-color 0.2s' }}
+                          onMouseEnter={e => (e.currentTarget.style.borderColor = '#b388ff')}
+                          onMouseLeave={e => (e.currentTarget.style.borderColor = '#444')}>
+                          {s.sym}
+                        </button>
+                      ))}
+                    </div>
+                    {/* Expression input */}
+                    <div style={{ display: 'flex', gap: '6px', marginBottom: '8px' }}>
+                      <input value={calcExpr} onChange={e => setCalcExpr(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') handleCalc(); }}
+                        placeholder="e.g. integrate(sin(x), x) or diff(x**3, x) or Sum(1/n**2, (n, 1, oo))"
+                        style={{ flex: 1, padding: '8px 12px', borderRadius: '8px', border: '1px solid #444', backgroundColor: '#0a0a0a', color: '#fff', fontSize: '14px', fontFamily: 'monospace' }} />
+                      <button onClick={handleCalc} disabled={calcLoading}
+                        style={{ padding: '8px 18px', borderRadius: '8px', border: 'none', backgroundColor: '#b388ff', color: '#000', fontWeight: 'bold', cursor: calcLoading ? 'wait' : 'pointer', fontSize: '13px' }}>
+                        {calcLoading ? '...' : '='}
+                      </button>
+                      <button onClick={() => { setCalcExpr(''); setCalcResult(null); }}
+                        style={{ padding: '8px 12px', borderRadius: '8px', border: '1px solid #444', backgroundColor: 'transparent', color: '#888', cursor: 'pointer', fontSize: '13px' }}>
+                        C
+                      </button>
+                    </div>
+                    {/* Result */}
+                    {calcResult && (
+                      <div style={{ padding: '10px 14px', borderRadius: '8px', backgroundColor: calcResult.error ? 'rgba(255,68,68,0.08)' : 'rgba(0,204,136,0.08)', border: `1px solid ${calcResult.error ? 'rgba(255,68,68,0.2)' : 'rgba(0,204,136,0.2)'}`, marginBottom: '8px' }}>
+                        {calcResult.error
+                          ? <span style={{ color: '#ff6666', fontSize: '13px' }}>Error: {calcResult.error}</span>
+                          : <>
+                              <div style={{ fontSize: '18px', fontFamily: 'monospace', color: '#00cc88', fontWeight: 'bold' }}>{calcResult.result}</div>
+                              {calcResult.result_float != null && calcResult.result_float !== calcResult.result && (
+                                <div style={{ fontSize: '12px', color: '#888', marginTop: '4px' }}>≈ {typeof calcResult.result_float === 'number' ? calcResult.result_float.toPrecision(8) : calcResult.result_float}</div>
+                              )}
+                              {calcResult.latex && <div style={{ fontSize: '11px', color: '#666', marginTop: '4px', fontFamily: 'monospace' }}>LaTeX: {calcResult.latex}</div>}
+                            </>
+                        }
+                      </div>
+                    )}
+                    {/* History */}
+                    {calcHistory.length > 0 && (
+                      <div style={{ maxHeight: '140px', overflowY: 'auto', fontSize: '11px', fontFamily: 'monospace', color: '#888' }}>
+                        {calcHistory.map((h, i) => (
+                          <div key={i} style={{ padding: '3px 0', borderBottom: '1px solid #1a1a1a', cursor: 'pointer' }} onClick={() => setCalcExpr(h.expr)}>
+                            <span style={{ color: '#666' }}>{h.expr}</span> <span style={{ color: '#00cc88' }}>= {h.result}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* ── Derivative Animator ────────────────────────────────── */}
+              {mathVizType === 'derivative' && (() => {
+                const W = 500, H = 340, PAD = 45;
+                const xMin = -5, xMax = 5, steps = 200;
+                const safeParse = (expr: string, x: number): number => {
+                  try {
+                    const e = expr.replace(/\^/g, '**').replace(/sin/g, 'Math.sin').replace(/cos/g, 'Math.cos').replace(/tan/g, 'Math.tan').replace(/sqrt/g, 'Math.sqrt').replace(/abs/g, 'Math.abs').replace(/log/g, 'Math.log').replace(/exp/g, 'Math.exp').replace(/pi/g, 'Math.PI');
+                    return new Function('x', `"use strict"; return (${e})`)(x) as number;
+                  } catch { return NaN; }
+                };
+                const pts: {x: number; y: number}[] = [];
+                for (let i = 0; i <= steps; i++) {
+                  const x = xMin + (xMax - xMin) * i / steps;
+                  const y = safeParse(vizDerivExpr, x);
+                  if (isFinite(y) && Math.abs(y) < 500) pts.push({ x, y });
+                }
+                if (pts.length < 2) return <div style={{ color: '#666' }}>Cannot parse expression.</div>;
+                const yVals = pts.map(p => p.y);
+                const yMin = Math.min(...yVals) - 0.5, yMax = Math.max(...yVals) + 0.5;
+                const yRange = yMax - yMin || 1, xRange = xMax - xMin;
+                const sx = (x: number) => PAD + ((x - xMin) / xRange) * (W - 2 * PAD);
+                const sy = (y: number) => H - PAD - ((y - yMin) / yRange) * (H - 2 * PAD);
+                const toPath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ');
+                // Numerical derivative at vizDerivX
+                const h = 0.0001;
+                const fAtX = safeParse(vizDerivExpr, vizDerivX);
+                const slope = (safeParse(vizDerivExpr, vizDerivX + h) - safeParse(vizDerivExpr, vizDerivX - h)) / (2 * h);
+                // Tangent line endpoints
+                const tLen = 2;
+                const tx1 = vizDerivX - tLen, ty1 = fAtX - slope * tLen;
+                const tx2 = vizDerivX + tLen, ty2 = fAtX + slope * tLen;
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
+                      <span style={{ color: '#00cc88', fontSize: '12px' }}>f(x) =</span>
+                      <input value={vizDerivExpr} onChange={e => setVizDerivExpr(e.target.value)}
+                        placeholder="x^2, sin(x), x^3 - 3*x"
+                        style={{ flex: 1, padding: '6px 10px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', fontFamily: 'monospace' }} />
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' }}>
+                      <span style={{ color: '#b388ff', fontSize: '12px' }}>x =</span>
+                      <input type="range" min={-5} max={5} step={0.05} value={vizDerivX} onChange={e => setVizDerivX(+e.target.value)} style={{ flex: 1 }} />
+                      <span style={{ color: '#fff', fontFamily: 'monospace', fontSize: '13px', minWidth: '40px' }}>{vizDerivX.toFixed(2)}</span>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {sx(0) >= PAD && sx(0) <= W - PAD && <line x1={sx(0)} y1={PAD} x2={sx(0)} y2={H - PAD} stroke="#555" strokeWidth={1} />}
+                      {sy(0) >= PAD && sy(0) <= H - PAD && <line x1={PAD} y1={sy(0)} x2={W - PAD} y2={sy(0)} stroke="#555" strokeWidth={1} />}
+                      <path d={toPath} fill="none" stroke="#00cc88" strokeWidth={2} />
+                      {/* Tangent line */}
+                      <line x1={sx(tx1)} y1={sy(ty1)} x2={sx(tx2)} y2={sy(ty2)} stroke="#ff6666" strokeWidth={2} strokeDasharray="6,3" />
+                      <circle cx={sx(vizDerivX)} cy={sy(fAtX)} r={5} fill="#ff9900" />
+                      <text x={sx(vizDerivX) + 8} y={sy(fAtX) - 10} fill="#ff9900" fontSize={11} fontFamily="monospace">
+                        ({vizDerivX.toFixed(2)}, {fAtX.toFixed(2)})
+                      </text>
+                    </svg>
+                    <div style={{ display: 'flex', gap: '16px', marginTop: '6px', fontSize: '12px', fontFamily: 'monospace' }}>
+                      <span style={{ color: '#00cc88' }}>f({vizDerivX.toFixed(2)}) = {fAtX.toFixed(4)}</span>
+                      <span style={{ color: '#ff6666' }}>f'({vizDerivX.toFixed(2)}) = {isFinite(slope) ? slope.toFixed(4) : 'undefined'}</span>
+                      <span style={{ color: '#888' }}>Tangent: y = {slope.toFixed(3)}(x − {vizDerivX.toFixed(2)}) + {fAtX.toFixed(3)}</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ── Riemann Sum Builder ────────────────────────────────── */}
+              {mathVizType === 'riemann' && (() => {
+                const W = 500, H = 340, PAD = 45;
+                const a = vizRiemannA, b_bound = vizRiemannB, n = vizRiemannN;
+                const safeParse = (expr: string, x: number): number => {
+                  try {
+                    const e = expr.replace(/\^/g, '**').replace(/sin/g, 'Math.sin').replace(/cos/g, 'Math.cos').replace(/tan/g, 'Math.tan').replace(/sqrt/g, 'Math.sqrt').replace(/log/g, 'Math.log').replace(/exp/g, 'Math.exp').replace(/pi/g, 'Math.PI');
+                    return new Function('x', `"use strict"; return (${e})`)(x) as number;
+                  } catch { return NaN; }
+                };
+                const dx = (b_bound - a) / n;
+                const rects: {x: number; y: number; w: number; h: number}[] = [];
+                let areaSum = 0;
+                for (let i = 0; i < n; i++) {
+                  const x0 = a + i * dx;
+                  const sampleX = vizRiemannMethod === 'left' ? x0 : vizRiemannMethod === 'right' ? x0 + dx : x0 + dx / 2;
+                  const y = safeParse(vizRiemannExpr, sampleX);
+                  if (isFinite(y)) { rects.push({ x: x0, y, w: dx, h: y }); areaSum += y * dx; }
+                }
+                // Curve
+                const xMin = a - 0.5, xMax = b_bound + 0.5;
+                const curvePts: {x: number; y: number}[] = [];
+                for (let i = 0; i <= 200; i++) {
+                  const x = xMin + (xMax - xMin) * i / 200;
+                  const y = safeParse(vizRiemannExpr, x);
+                  if (isFinite(y) && Math.abs(y) < 500) curvePts.push({ x, y });
+                }
+                const allY = [...curvePts.map(p => p.y), ...rects.map(r => r.h), 0];
+                const yMin = Math.min(...allY) - 0.5, yMax = Math.max(...allY) + 0.5;
+                const yRange = yMax - yMin || 1, xRange = xMax - xMin || 1;
+                const sx = (x: number) => PAD + ((x - xMin) / xRange) * (W - 2 * PAD);
+                const sy = (y: number) => H - PAD - ((y - yMin) / yRange) * (H - 2 * PAD);
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#00cc88', fontSize: '12px' }}>f(x) =</span>
+                      <input value={vizRiemannExpr} onChange={e => setVizRiemannExpr(e.target.value)} style={{ width: '120px', padding: '4px 8px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace' }} />
+                      <span style={{ color: '#888', fontSize: '11px' }}>a=</span>
+                      <input type="number" value={a} onChange={e => setVizRiemannA(+e.target.value)} style={{ width: '50px', padding: '4px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace' }} />
+                      <span style={{ color: '#888', fontSize: '11px' }}>b=</span>
+                      <input type="number" value={b_bound} onChange={e => setVizRiemannB(+e.target.value)} style={{ width: '50px', padding: '4px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace' }} />
+                      {(['left', 'right', 'midpoint'] as const).map(m => (
+                        <button key={m} onClick={() => setVizRiemannMethod(m)} style={{ padding: '3px 8px', borderRadius: '4px', border: `1px solid ${vizRiemannMethod === m ? '#b388ff' : '#444'}`, background: vizRiemannMethod === m ? 'rgba(179,136,255,0.15)' : 'transparent', color: vizRiemannMethod === m ? '#b388ff' : '#888', cursor: 'pointer', fontSize: '10px' }}>{m}</button>
+                      ))}
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' }}>
+                      <span style={{ color: '#b388ff', fontSize: '12px' }}>n =</span>
+                      <input type="range" min={1} max={200} value={n} onChange={e => setVizRiemannN(+e.target.value)} style={{ flex: 1 }} />
+                      <span style={{ fontFamily: 'monospace', color: '#fff', fontSize: '13px', minWidth: '30px' }}>{n}</span>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {sx(0) >= PAD && sx(0) <= W - PAD && <line x1={sx(0)} y1={PAD} x2={sx(0)} y2={H - PAD} stroke="#555" strokeWidth={1} />}
+                      {sy(0) >= PAD && sy(0) <= H - PAD && <line x1={PAD} y1={sy(0)} x2={W - PAD} y2={sy(0)} stroke="#555" strokeWidth={1} />}
+                      {/* Rectangles */}
+                      {rects.map((r, i) => {
+                        const rx = sx(r.x), rw = sx(r.x + r.w) - sx(r.x);
+                        const ry = r.h >= 0 ? sy(r.h) : sy(0);
+                        const rh = Math.abs(sy(r.h) - sy(0));
+                        return <rect key={i} x={rx} y={ry} width={rw} height={rh} fill={r.h >= 0 ? 'rgba(0,204,136,0.2)' : 'rgba(255,68,68,0.2)'} stroke={r.h >= 0 ? '#00cc88' : '#ff4444'} strokeWidth={0.5} />;
+                      })}
+                      {/* Curve */}
+                      <polyline points={curvePts.map(p => `${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ')} fill="none" stroke="#ff9900" strokeWidth={2} />
+                    </svg>
+                    <div style={{ display: 'flex', gap: '16px', marginTop: '6px', fontSize: '12px', fontFamily: 'monospace' }}>
+                      <span style={{ color: '#00cc88' }}>Σ ≈ {areaSum.toFixed(6)}</span>
+                      <span style={{ color: '#888' }}>n = {n} rectangles, Δx = {dx.toFixed(4)}</span>
+                      <span style={{ color: '#b388ff' }}>∫₍{a}₎^{'{' + b_bound + '}'} f(x)dx</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ── Taylor Series Expansion ────────────────────────────── */}
+              {mathVizType === 'taylor' && (() => {
+                const W = 500, H = 340, PAD = 45;
+                const xMin = -6, xMax = 6, steps = 300;
+                const fnName = vizTaylorFn;
+                const nTerms = vizTaylorN;
+                const fnEval: Record<string, (x: number) => number> = {
+                  sin: Math.sin, cos: Math.cos, exp: Math.exp,
+                };
+                const fn = fnEval[fnName] || Math.sin;
+                // Taylor coefficients at center=0
+                const taylorCoeffs: Record<string, (n: number) => number> = {
+                  sin: (n: number) => { if (n % 2 === 0) return 0; const k = (n - 1) / 2; let f = 1; for (let i = 1; i <= n; i++) f *= i; return ((-1) ** k) / f; },
+                  cos: (n: number) => { if (n % 2 === 1) return 0; const k = n / 2; let f = 1; for (let i = 1; i <= n; i++) f *= i; return ((-1) ** k) / f; },
+                  exp: (n: number) => { let f = 1; for (let i = 1; i <= n; i++) f *= i; return 1 / f; },
+                };
+                const coeff = taylorCoeffs[fnName] || taylorCoeffs.sin;
+                const taylorEval = (x: number) => { let s = 0; for (let k = 0; k < nTerms; k++) { const idx = fnName === 'sin' ? 2 * k + 1 : fnName === 'cos' ? 2 * k : k; s += coeff(idx) * (x ** idx); } return s; };
+                const origPts: {x: number; y: number}[] = [], approxPts: {x: number; y: number}[] = [];
+                for (let i = 0; i <= steps; i++) {
+                  const x = xMin + (xMax - xMin) * i / steps;
+                  origPts.push({ x, y: fn(x) });
+                  const ty = taylorEval(x);
+                  if (isFinite(ty) && Math.abs(ty) < 20) approxPts.push({ x, y: ty });
+                }
+                const allY = [...origPts.map(p => p.y), ...approxPts.map(p => p.y)];
+                const yMin = Math.max(Math.min(...allY), -8) - 0.5, yMax = Math.min(Math.max(...allY), 8) + 0.5;
+                const yRange = yMax - yMin || 1, xRange = xMax - xMin;
+                const sx = (x: number) => PAD + ((x - xMin) / xRange) * (W - 2 * PAD);
+                const sy = (y: number) => H - PAD - ((y - yMin) / yRange) * (H - 2 * PAD);
+                const origPath = origPts.map((p, i) => `${i === 0 ? 'M' : 'L'}${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ');
+                const approxPath = approxPts.map((p, i) => `${i === 0 ? 'M' : 'L'}${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ');
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '10px', marginBottom: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#b388ff', fontSize: '12px' }}>Function:</span>
+                      {(['sin', 'cos', 'exp'] as const).map(f => (
+                        <button key={f} onClick={() => setVizTaylorFn(f)} style={{ padding: '3px 10px', borderRadius: '4px', border: `1px solid ${vizTaylorFn === f ? '#b388ff' : '#444'}`, background: vizTaylorFn === f ? 'rgba(179,136,255,0.15)' : 'transparent', color: vizTaylorFn === f ? '#b388ff' : '#888', cursor: 'pointer', fontSize: '12px' }}>{f}(x)</button>
+                      ))}
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' }}>
+                      <span style={{ color: '#ff9900', fontSize: '12px' }}>Terms:</span>
+                      <input type="range" min={1} max={15} value={nTerms} onChange={e => setVizTaylorN(+e.target.value)} style={{ flex: 1 }} />
+                      <span style={{ fontFamily: 'monospace', color: '#fff', fontSize: '13px', minWidth: '20px' }}>{nTerms}</span>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {sx(0) >= PAD && sx(0) <= W - PAD && <line x1={sx(0)} y1={PAD} x2={sx(0)} y2={H - PAD} stroke="#555" strokeWidth={1} />}
+                      {sy(0) >= PAD && sy(0) <= H - PAD && <line x1={PAD} y1={sy(0)} x2={W - PAD} y2={sy(0)} stroke="#555" strokeWidth={1} />}
+                      <path d={origPath} fill="none" stroke="#00cc88" strokeWidth={2} />
+                      <path d={approxPath} fill="none" stroke="#ff9900" strokeWidth={2} strokeDasharray="6,3" />
+                    </svg>
+                    <div style={{ display: 'flex', gap: '16px', marginTop: '6px', fontSize: '11px' }}>
+                      <span style={{ color: '#00cc88' }}>— {fnName}(x)</span>
+                      <span style={{ color: '#ff9900' }}>-- Taylor ({nTerms} terms)</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ── Fourier Series ─────────────────────────────────────── */}
+              {mathVizType === 'fourier' && (() => {
+                const W = 500, H = 300, PAD = 40;
+                const nHarm = vizFourierN;
+                const steps = 400;
+                const xMin = -Math.PI, xMax = 3 * Math.PI;
+                const fourierEval: Record<string, (x: number, n: number) => number> = {
+                  square: (x, n) => { let s = 0; for (let k = 1; k <= n; k++) s += Math.sin((2 * k - 1) * x) / (2 * k - 1); return (4 / Math.PI) * s; },
+                  sawtooth: (x, n) => { let s = 0; for (let k = 1; k <= n; k++) s += ((-1) ** (k + 1)) * Math.sin(k * x) / k; return (2 / Math.PI) * s; },
+                  triangle: (x, n) => { let s = 0; for (let k = 0; k < n; k++) { const m = 2 * k + 1; s += ((-1) ** k) * Math.sin(m * x) / (m * m); } return (8 / (Math.PI * Math.PI)) * s; },
+                };
+                const evalFn = fourierEval[vizFourierWave] || fourierEval.square;
+                const targetFn: Record<string, (x: number) => number> = {
+                  square: (x) => { const p = ((x % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI); return p < Math.PI ? 1 : -1; },
+                  sawtooth: (x) => { const p = ((x % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI); return (p / Math.PI) - 1; },
+                  triangle: (x) => { const p = ((x % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI); return p < Math.PI ? (2 * p / Math.PI - 1) : (3 - 2 * p / Math.PI); },
+                };
+                const target = targetFn[vizFourierWave] || targetFn.square;
+                const targPts: string[] = [], approxPts: string[] = [];
+                let yMin = -1.5, yMax = 1.5;
+                for (let i = 0; i <= steps; i++) {
+                  const x = xMin + (xMax - xMin) * i / steps;
+                  const ty = target(x), ay = evalFn(x, nHarm);
+                  if (Math.abs(ty) < 5) { targPts.push(`${x},${ty}`); } 
+                  if (Math.abs(ay) < 5) { approxPts.push(`${x},${ay}`); if (ay > yMax) yMax = ay; if (ay < yMin) yMin = ay; }
+                }
+                const xRange = xMax - xMin, yRange = yMax - yMin || 1;
+                const sx = (x: number) => PAD + ((x - xMin) / xRange) * (W - 2 * PAD);
+                const sy = (y: number) => H - PAD - ((y - yMin) / yRange) * (H - 2 * PAD);
+                const toSvg = (pts: string[]) => pts.map((p, i) => { const [x, y] = p.split(',').map(Number); return `${i === 0 ? 'M' : 'L'}${sx(x).toFixed(1)},${sy(y).toFixed(1)}`; }).join(' ');
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '10px', marginBottom: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#b388ff', fontSize: '12px' }}>Waveform:</span>
+                      {(['square', 'sawtooth', 'triangle'] as const).map(w => (
+                        <button key={w} onClick={() => setVizFourierWave(w)} style={{ padding: '3px 10px', borderRadius: '4px', border: `1px solid ${vizFourierWave === w ? '#b388ff' : '#444'}`, background: vizFourierWave === w ? 'rgba(179,136,255,0.15)' : 'transparent', color: vizFourierWave === w ? '#b388ff' : '#888', cursor: 'pointer', fontSize: '12px' }}>{w}</button>
+                      ))}
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' }}>
+                      <span style={{ color: '#ff9900', fontSize: '12px' }}>Harmonics:</span>
+                      <input type="range" min={1} max={50} value={nHarm} onChange={e => setVizFourierN(+e.target.value)} style={{ flex: 1 }} />
+                      <span style={{ fontFamily: 'monospace', color: '#fff', fontSize: '13px', minWidth: '24px' }}>{nHarm}</span>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {sy(0) >= PAD && sy(0) <= H - PAD && <line x1={PAD} y1={sy(0)} x2={W - PAD} y2={sy(0)} stroke="#555" strokeWidth={1} />}
+                      <path d={toSvg(targPts)} fill="none" stroke="#555" strokeWidth={1.5} strokeDasharray="4,3" />
+                      <path d={toSvg(approxPts)} fill="none" stroke="#00cc88" strokeWidth={2} />
+                    </svg>
+                    <div style={{ display: 'flex', gap: '16px', marginTop: '6px', fontSize: '11px' }}>
+                      <span style={{ color: '#555' }}>-- target ({vizFourierWave})</span>
+                      <span style={{ color: '#00cc88' }}>— Fourier ({nHarm} harmonics)</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ── Parametric Curves ──────────────────────────────────── */}
+              {mathVizType === 'parametric' && (() => {
+                const W = 400, H = 400, PAD = 40;
+                const safeParse = (expr: string, t: number): number => {
+                  try {
+                    const e = expr.replace(/\^/g, '**').replace(/sin/g, 'Math.sin').replace(/cos/g, 'Math.cos').replace(/tan/g, 'Math.tan').replace(/sqrt/g, 'Math.sqrt').replace(/pi/g, 'Math.PI');
+                    return new Function('t', `"use strict"; return (${e})`)(t) as number;
+                  } catch { return NaN; }
+                };
+                const pts: {x: number; y: number}[] = [];
+                for (let i = 0; i <= 300; i++) {
+                  const t = (2 * Math.PI) * i / 300;
+                  const px = safeParse(vizParamXExpr, t), py = safeParse(vizParamYExpr, t);
+                  if (isFinite(px) && isFinite(py) && Math.abs(px) < 100 && Math.abs(py) < 100) pts.push({ x: px, y: py });
+                }
+                const curPx = safeParse(vizParamXExpr, vizParamT), curPy = safeParse(vizParamYExpr, vizParamT);
+                if (pts.length < 2) return <div style={{ color: '#666' }}>Cannot parse parametric expressions.</div>;
+                const xVals = pts.map(p => p.x), yVals = pts.map(p => p.y);
+                const xMin = Math.min(...xVals) - 0.3, xMax = Math.max(...xVals) + 0.3;
+                const yMin = Math.min(...yVals) - 0.3, yMax = Math.max(...yVals) + 0.3;
+                const xRange = xMax - xMin || 1, yRange = yMax - yMin || 1;
+                const sx = (x: number) => PAD + ((x - xMin) / xRange) * (W - 2 * PAD);
+                const sy = (y: number) => H - PAD - ((y - yMin) / yRange) * (H - 2 * PAD);
+                const curvePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${sx(p.x).toFixed(1)},${sy(p.y).toFixed(1)}`).join(' ');
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '8px', marginBottom: '6px', flexWrap: 'wrap' }}>
+                      <span style={{ color: '#00cc88', fontSize: '12px' }}>x(t) =</span>
+                      <input value={vizParamXExpr} onChange={e => setVizParamXExpr(e.target.value)} style={{ width: '130px', padding: '4px 8px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace' }} />
+                      <span style={{ color: '#22aaff', fontSize: '12px' }}>y(t) =</span>
+                      <input value={vizParamYExpr} onChange={e => setVizParamYExpr(e.target.value)} style={{ width: '130px', padding: '4px 8px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px', fontFamily: 'monospace' }} />
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' }}>
+                      <span style={{ color: '#b388ff', fontSize: '12px' }}>t =</span>
+                      <input type="range" min={0} max={6.28} step={0.02} value={vizParamT} onChange={e => setVizParamT(+e.target.value)} style={{ flex: 1 }} />
+                      <span style={{ fontFamily: 'monospace', color: '#fff', fontSize: '13px', minWidth: '36px' }}>{vizParamT.toFixed(2)}</span>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {sx(0) >= PAD && sx(0) <= W - PAD && <line x1={sx(0)} y1={PAD} x2={sx(0)} y2={H - PAD} stroke="#333" strokeWidth={1} />}
+                      {sy(0) >= PAD && sy(0) <= H - PAD && <line x1={PAD} y1={sy(0)} x2={W - PAD} y2={sy(0)} stroke="#333" strokeWidth={1} />}
+                      <path d={curvePath} fill="none" stroke="#00cc88" strokeWidth={2} />
+                      {isFinite(curPx) && isFinite(curPy) && <circle cx={sx(curPx)} cy={sy(curPy)} r={5} fill="#ff4444" />}
+                    </svg>
+                    <div style={{ fontSize: '11px', fontFamily: 'monospace', color: '#ff4444', marginTop: '6px' }}>
+                      P(t={vizParamT.toFixed(2)}) = ({isFinite(curPx) ? curPx.toFixed(3) : '?'}, {isFinite(curPy) ? curPy.toFixed(3) : '?'})
+                    </div>
+                    <div style={{ fontSize: '10px', color: '#666', marginTop: '4px' }}>Try: x(t) = 2*cos(t), y(t) = sin(2*t) for a Lissajous figure</div>
+                  </div>
+                );
+              })()}
+
+              {/* ── Regression / Correlation ───────────────────────────── */}
+              {mathVizType === 'regression' && (() => {
+                const W = 440, H = 340, PAD = 45;
+                const points = vizRegPoints;
+                if (points.length < 2) return <div style={{ color: '#666' }}>Enter at least 2 points.</div>;
+                const n = points.length;
+                const sx_sum = points.reduce((s, p) => s + p.x, 0);
+                const sy_sum = points.reduce((s, p) => s + p.y, 0);
+                const sxy = points.reduce((s, p) => s + p.x * p.y, 0);
+                const sx2 = points.reduce((s, p) => s + p.x * p.x, 0);
+                const xMean = sx_sum / n, yMean = sy_sum / n;
+                const slope = (n * sxy - sx_sum * sy_sum) / (n * sx2 - sx_sum * sx_sum);
+                const intercept = yMean - slope * xMean;
+                // R²
+                const ssTot = points.reduce((s, p) => s + (p.y - yMean) ** 2, 0);
+                const ssRes = points.reduce((s, p) => s + (p.y - (slope * p.x + intercept)) ** 2, 0);
+                const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+                const xVals = points.map(p => p.x), yVals = points.map(p => p.y);
+                const xMin = Math.min(...xVals) - 1, xMax = Math.max(...xVals) + 1;
+                const yMin = Math.min(...yVals, slope * xMin + intercept, slope * xMax + intercept) - 1;
+                const yMax = Math.max(...yVals, slope * xMin + intercept, slope * xMax + intercept) + 1;
+                const xRange = xMax - xMin || 1, yRange = yMax - yMin || 1;
+                const toX = (x: number) => PAD + ((x - xMin) / xRange) * (W - 2 * PAD);
+                const toY = (y: number) => H - PAD - ((y - yMin) / yRange) * (H - 2 * PAD);
+                return (
+                  <div>
+                    {/* Point editor */}
+                    <div style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                      {points.map((p, i) => (
+                        <span key={i} style={{ display: 'flex', gap: '2px', fontSize: '10px', alignItems: 'center' }}>
+                          <span style={{ color: '#888' }}>(</span>
+                          <input type="number" value={p.x} onChange={e => { const n = [...points]; n[i] = { ...n[i], x: +e.target.value }; setVizRegPoints(n); }} style={{ width: '36px', padding: '2px', borderRadius: '3px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '10px', fontFamily: 'monospace' }} />
+                          <span style={{ color: '#888' }}>,</span>
+                          <input type="number" value={p.y} onChange={e => { const n = [...points]; n[i] = { ...n[i], y: +e.target.value }; setVizRegPoints(n); }} style={{ width: '36px', padding: '2px', borderRadius: '3px', border: '1px solid #444', backgroundColor: '#111', color: '#fff', fontSize: '10px', fontFamily: 'monospace' }} />
+                          <span style={{ color: '#888' }}>)</span>
+                          <button onClick={() => setVizRegPoints(points.filter((_, j) => j !== i))} style={{ background: 'none', border: 'none', color: '#ff4444', cursor: 'pointer', fontSize: '10px', padding: '0 2px' }}>×</button>
+                        </span>
+                      ))}
+                      <button onClick={() => setVizRegPoints([...points, { x: Math.round(Math.random() * 10), y: Math.round(Math.random() * 10) }])} style={{ padding: '2px 8px', borderRadius: '4px', border: '1px solid #444', background: 'transparent', color: '#00cc88', cursor: 'pointer', fontSize: '10px' }}>+ Add</button>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '3px', fontSize: '10px', color: '#888', cursor: 'pointer', marginLeft: '8px' }}>
+                        <input type="checkbox" checked={vizRegShowResiduals} onChange={e => setVizRegShowResiduals(e.target.checked)} style={{ accentColor: '#ff9900' }} /> Residuals
+                      </label>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {toX(0) >= PAD && toX(0) <= W - PAD && <line x1={toX(0)} y1={PAD} x2={toX(0)} y2={H - PAD} stroke="#333" />}
+                      {toY(0) >= PAD && toY(0) <= H - PAD && <line x1={PAD} y1={toY(0)} x2={W - PAD} y2={toY(0)} stroke="#333" />}
+                      {/* Best-fit line */}
+                      <line x1={toX(xMin)} y1={toY(slope * xMin + intercept)} x2={toX(xMax)} y2={toY(slope * xMax + intercept)} stroke="#ff9900" strokeWidth={2} />
+                      {/* Residuals */}
+                      {vizRegShowResiduals && points.map((p, i) => {
+                        const predicted = slope * p.x + intercept;
+                        return <line key={i} x1={toX(p.x)} y1={toY(p.y)} x2={toX(p.x)} y2={toY(predicted)} stroke="#ff444488" strokeWidth={1} strokeDasharray="3,2" />;
+                      })}
+                      {/* Points */}
+                      {points.map((p, i) => <circle key={i} cx={toX(p.x)} cy={toY(p.y)} r={5} fill="#22aaff" />)}
+                    </svg>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '4px 14px', marginTop: '6px', fontSize: '11px', fontFamily: 'monospace', padding: '6px 8px', backgroundColor: '#111', borderRadius: '6px', border: '1px solid #222' }}>
+                      <span style={{ color: '#ff9900' }}>y = {slope.toFixed(3)}x + {intercept.toFixed(3)}</span>
+                      <span style={{ color: '#22aaff' }}>R² = {r2.toFixed(4)}</span>
+                      <span style={{ color: '#888' }}>n = {n} points</span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ── Monte Carlo Pi Estimator ───────────────────────────── */}
+              {mathVizType === 'montecarlo' && (() => {
+                // Generate points on demand
+                if (vizMontePoints.length !== vizMonteN) {
+                  const pts: {x: number; y: number; inside: boolean}[] = [];
+                  for (let i = 0; i < vizMonteN; i++) {
+                    const x = Math.random() * 2 - 1, y = Math.random() * 2 - 1;
+                    pts.push({ x, y, inside: x * x + y * y <= 1 });
+                  }
+                  // Use setTimeout to avoid setState during render
+                  setTimeout(() => setVizMontePoints(pts), 0);
+                }
+                const pts = vizMontePoints;
+                const inside = pts.filter(p => p.inside).length;
+                const piEst = pts.length > 0 ? 4 * inside / pts.length : 0;
+                const W = 360, H = 360, CX = W / 2, CY = H / 2, R = 160;
+                const sx = (x: number) => CX + x * R;
+                const sy = (y: number) => CY - y * R;
+                return (
+                  <div>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '8px' }}>
+                      <span style={{ color: '#b388ff', fontSize: '12px' }}>Points:</span>
+                      <input type="range" min={10} max={5000} step={10} value={vizMonteN} onChange={e => { setVizMonteN(+e.target.value); setVizMontePoints([]); }} style={{ flex: 1 }} />
+                      <span style={{ fontFamily: 'monospace', color: '#fff', fontSize: '13px', minWidth: '40px' }}>{vizMonteN}</span>
+                      <button onClick={() => setVizMontePoints([])} style={{ padding: '4px 10px', borderRadius: '4px', border: '1px solid #444', background: 'transparent', color: '#00cc88', cursor: 'pointer', fontSize: '11px' }}>Re-roll</button>
+                    </div>
+                    <svg width={W} height={H} style={{ backgroundColor: '#0a0a0a', borderRadius: '8px', border: '1px solid #222' }}>
+                      {/* Square boundary */}
+                      <rect x={CX - R} y={CY - R} width={R * 2} height={R * 2} fill="none" stroke="#333" strokeWidth={1} />
+                      {/* Circle */}
+                      <circle cx={CX} cy={CY} r={R} fill="none" stroke="#555" strokeWidth={1.5} />
+                      {/* Points */}
+                      {pts.map((p, i) => <circle key={i} cx={sx(p.x)} cy={sy(p.y)} r={1.5} fill={p.inside ? '#00cc88' : '#ff4444'} opacity={0.7} />)}
+                    </svg>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: '4px 14px', marginTop: '6px', fontSize: '12px', fontFamily: 'monospace', padding: '8px', backgroundColor: '#111', borderRadius: '6px', border: '1px solid #222' }}>
+                      <span style={{ color: '#00cc88', fontWeight: 'bold', fontSize: '16px' }}>π ≈ {piEst.toFixed(6)}</span>
+                      <span style={{ color: '#888' }}>Actual: {Math.PI.toFixed(6)}</span>
+                      <span style={{ color: '#888' }}>Error: {Math.abs(piEst - Math.PI).toFixed(6)}</span>
+                      <span style={{ color: '#00cc88' }}>Inside: {inside}</span>
+                      <span style={{ color: '#ff4444' }}>Outside: {pts.length - inside}</span>
                     </div>
                   </div>
                 );
@@ -4191,28 +4883,60 @@ return (
         {/* TTS — read last AI message aloud */}
         <button
           type="button"
-          onClick={async () => {
-            // Find the last AI message
-            const lastAi = [...messages].reverse().find(m => m.role === 'ai');
-            if (!lastAi) return;
-            setTtsLoading(true);
-            try {
-              const res = await fetch('http://localhost:8000/voice/tts', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text: lastAi.text.slice(0, 2000) }),
-              });
-              if (res.ok && res.headers.get('content-type')?.includes('audio')) {
+            onClick={async () => {
+              const lastAi = [...messages].reverse().find(m => m.role === 'ai');
+              if (!lastAi) return;
+              setTtsLoading(true);
+              try {
+                const res = await fetch('http://localhost:8000/voice/tts', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ text: lastAi.text.slice(0, 2000) }),
+                });
+
+                console.log('[TTS] status:', res.status);
+                console.log('[TTS] content-type:', res.headers.get('content-type'));
+
+                if (!res.ok) {
+                  console.error('[TTS] backend error:', await res.text());
+                  return;
+                }
+
+                const contentType = res.headers.get('content-type') ?? '';
+                if (!contentType.includes('audio')) {
+                  console.error('[TTS] wrong content-type, body:', await res.text());
+                  return;
+                }
+
                 const blob = await res.blob();
+                console.log('[TTS] blob size:', blob.size, 'type:', blob.type);
+
+                if (blob.size < 1000) {
+                  console.error('[TTS] blob too small, likely an error response');
+                  return;
+                }
+
+                if (ttsAudioRef.current) {
+                  ttsAudioRef.current.pause();
+                  URL.revokeObjectURL(ttsAudioRef.current.src);
+                }
+
                 const url = URL.createObjectURL(blob);
-                if (ttsAudioRef.current) { ttsAudioRef.current.pause(); URL.revokeObjectURL(ttsAudioRef.current.src); }
                 const audio = new Audio(url);
                 ttsAudioRef.current = audio;
-                audio.play();
+
+                try {
+                  await audio.play();
+                } catch (playErr) {
+                  console.error('[TTS] audio.play() failed:', playErr);
+                }
+
+              } catch (err) {
+                console.error('[TTS] fetch failed:', err);
+              } finally {
+                setTtsLoading(false);
               }
-            } catch { /* TTS unavailable */ }
-            setTtsLoading(false);
-          }}
+            }}
           disabled={ttsLoading || messages.filter(m => m.role === 'ai').length === 0}
           title="Read last AI response aloud (Kokoro TTS)"
           style={{
@@ -4228,6 +4952,26 @@ return (
           }}
         >
           {ttsLoading ? '⏳' : '🔊'}
+        </button>
+
+        {/* Image Generation toggle */}
+        <button
+          type="button"
+          onClick={() => setShowImageGenDialog(d => !d)}
+          title="Generate image from text prompt"
+          style={{
+            padding: '10px 12px',
+            borderRadius: '12px',
+            border: '2px solid',
+            borderColor: showImageGenDialog ? '#b388ff' : '#444',
+            backgroundColor: showImageGenDialog ? 'rgba(179,136,255,0.15)' : '#111',
+            color: showImageGenDialog ? '#b388ff' : '#888',
+            cursor: 'pointer',
+            fontSize: '16px',
+            transition: 'all 0.15s',
+          }}
+        >
+          🎨
         </button>
 
         {/* Process log toggle — next to mic */}
@@ -4412,6 +5156,135 @@ return (
         </div>
       </form>
       )}
+
+      {/* ── Image Generation Dialog ─────────────────────────────────── */}
+      {showImageGenDialog && (
+        <div style={{
+          position: 'fixed', bottom: '80px', right: '16px', zIndex: 56,
+          width: '420px', maxWidth: '90vw', borderRadius: '12px', overflow: 'hidden',
+          backgroundColor: 'rgba(0, 5, 10, 0.95)', backdropFilter: 'blur(20px)',
+          border: '1px solid rgba(179,136,255,0.3)', boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
+          display: 'flex', flexDirection: 'column',
+        }}>
+          {/* Header */}
+          <div style={{
+            padding: '10px 14px', borderBottom: '1px solid #222',
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          }}>
+            <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#b388ff' }}>🎨 Image Generation</span>
+            <button
+              onClick={() => setShowImageGenDialog(false)}
+              style={{
+                background: 'none', border: '1px solid #33333366', borderRadius: '4px',
+                color: '#666', cursor: 'pointer', padding: '2px 8px', fontSize: '10px',
+              }}
+            >✕</button>
+          </div>
+
+          {/* Body */}
+          <div style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+
+            {/* Input row */}
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <input
+                type="text"
+                value={imageGenPrompt}
+                onChange={e => setImageGenPrompt(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleImageGenerate();
+                  }
+                }}
+                placeholder="Describe what to generate..."
+                style={{
+                  flex: 1, padding: '8px 12px', borderRadius: '8px', border: '1px solid #333',
+                  backgroundColor: '#0a0a0a', color: '#eee', fontSize: '13px', outline: 'none',
+                }}
+              />
+              <button
+                disabled={!imageGenPrompt.trim() || imageGenLoading}
+                onClick={handleImageGenerate}
+                style={{
+                  padding: '8px 16px', borderRadius: '8px', border: 'none',
+                  backgroundColor: imageGenLoading ? '#333' : '#7c4dff', color: '#fff',
+                  cursor: imageGenLoading ? 'wait' : 'pointer', fontSize: '13px', fontWeight: 'bold',
+                }}
+              >
+                {imageGenLoading ? '⏳' : 'Generate'}
+              </button>
+            </div>
+
+            {/* Loading state */}
+            {imageGenLoading && (
+              <div style={{ color: '#b388ff', fontSize: '12px', textAlign: 'center', padding: '20px 0' }}>
+                ⏳ Generating image, this takes ~10 seconds...
+              </div>
+            )}
+
+            {/* Result — image or description or error */}
+            {imageGenResult && (
+              imageGenResult.startsWith('Error') ? (
+                <div style={{
+                  padding: '10px 12px', borderRadius: '8px', backgroundColor: '#111',
+                  border: '1px solid #331111', fontSize: '13px', color: '#ff6666',
+                }}>
+                  {imageGenResult}
+                </div>
+              ) : imageGenResult.startsWith('blob:') ? (
+                <div style={{ borderRadius: '8px', overflow: 'hidden', border: '1px solid #333' }}>
+                  <img
+                    src={imageGenResult}
+                    alt="Generated image"
+                    onClick={() => setLightboxUrl(imageGenResult)}
+                    style={{ width: '100%', display: 'block', cursor: 'zoom-in' }}
+                  />
+                </div>
+              ) : (
+                <div style={{
+                  padding: '10px 12px', borderRadius: '8px', backgroundColor: '#111',
+                  border: '1px solid #222', maxHeight: '250px', overflowY: 'auto',
+                  fontSize: '13px', lineHeight: '1.6', color: '#ccc', whiteSpace: 'pre-wrap',
+                }}>
+                  {imageGenResult}
+                </div>
+              )
+            )}
+
+            {/* ── Lightbox ─────────────────────────────────── */}
+            {lightboxUrl && (
+              <div
+                onClick={() => setLightboxUrl(null)}
+                style={{
+                  position: 'fixed', inset: 0, zIndex: 999,
+                  backgroundColor: 'rgba(0,0,0,0.85)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  cursor: 'zoom-out',
+                }}
+              >
+                <img
+                  src={lightboxUrl}
+                  alt="Enlarged"
+                  style={{
+                    maxWidth: '90vw', maxHeight: '90vh',
+                    borderRadius: '10px',
+                    border: '1px solid rgba(179,136,255,0.4)',
+                    boxShadow: '0 0 60px rgba(0,0,0,0.9)',
+                  }}
+                />
+              </div>
+            )}
+            {/* Empty state */}
+            {!imageGenResult && !imageGenLoading && (
+              <div style={{ color: '#555', fontSize: '12px', textAlign: 'center', padding: '20px 0' }}>
+                Enter a prompt and press Generate or Enter
+              </div>
+            )}
+
+          </div>
+        </div>
+      )}
+
 
       {/* ── Process Log Panel (collapsible + expandable) ─────────────── */}
       {showProcessPanel && (

@@ -8,7 +8,7 @@ def _env_bool(name: str, default: str = "0") -> bool:
 	return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 # Directory paths
-BASE_DIR = Path(__file__).parent.parent
+BASE_DIR = Path(__file__).parent
 DATA_DIR = os.getenv("RAG_DATA_DIR", str(BASE_DIR / "data"))
 #FAISS_DIR = os.getenv("RAG_FAISS_DIR", str(BASE_DIR / "faiss_index"))
 CHROMA_DIR = os.getenv("RAG_CHROMA_DIR", str(BASE_DIR / "cache" / "chroma_db"))
@@ -212,3 +212,9 @@ CHROMA_CHUNK_OVERLAP = 64               # optional for new ingest
 
 # fitler settings for query pipeline
 USE_SMART_K = True
+
+#image generation
+OUTPUT_DIR = os.getenv(
+    "RAG_IMAGE_OUTPUT_DIR",
+    str(BASE_DIR.parent / "generated_images")  # = Aion/generated_images/
+)

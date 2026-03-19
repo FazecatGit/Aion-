@@ -69,7 +69,7 @@ VISUALIZATION_MODULES = {
         "name": "Matrix Transformation Grid",
         "category": "Vectors & Linear Algebra",
         "icon": "🔢",
-        "description": "Show how 2x2 matrices shear/rotate a grid; tied to FPS camera math",
+        "description": "Apply a 2×2 matrix to a point grid and see the geometric transformation (rotation, shear, reflection, scaling)",
         "params": {
             "matrix": {"type": "matrix", "rows": 2, "cols": 2, "default": [[1, 0], [0, 1]]},
             "grid_density": {"type": "slider", "min": 3, "max": 20, "default": 10},
@@ -284,6 +284,56 @@ VISUALIZATION_MODULES = {
         "outputs": ["pixel_data", "iteration_counts"],
         "curriculum_topics": ["Fractals (Mandelbrot/Julia sets)"],
     },
+
+    # ── Algebra ────────────────────────────────────────────────────────────
+    "quadratic_explorer": {
+        "name": "Quadratic Formula & Graph",
+        "category": "Algebra",
+        "icon": "📈",
+        "description": "Enter a, b, c → see the parabola, vertex, axis of symmetry, roots via quadratic formula",
+        "params": {
+            "a": {"type": "slider", "min": -5, "max": 5, "step": 0.1, "default": 1, "label": "a"},
+            "b": {"type": "slider", "min": -10, "max": 10, "step": 0.1, "default": 0, "label": "b"},
+            "c": {"type": "slider", "min": -10, "max": 10, "step": 0.1, "default": -4, "label": "c"},
+        },
+        "outputs": ["roots", "vertex", "axis_of_symmetry", "discriminant", "parabola_points", "direction"],
+        "curriculum_topics": ["Quadratic formula", "Completing the square", "Graphing quadratics", "Vertex form"],
+    },
+
+    # ── Scientific Calculator ─────────────────────────────────────────────
+    "scientific_calculator": {
+        "name": "Scientific Calculator",
+        "category": "Tools",
+        "icon": "🔬",
+        "description": "Calculator with trig, log, summation (Σ), integrals (∫), imaginary numbers, e, π and more",
+        "params": {
+            "expression": {"type": "text", "default": "", "label": "Expression"},
+        },
+        "outputs": ["result", "latex", "steps", "visualization"],
+        "curriculum_topics": [],
+        "special_symbols": [
+            {"symbol": "π", "insert": "pi", "label": "Pi"},
+            {"symbol": "e", "insert": "E", "label": "Euler's number"},
+            {"symbol": "i", "insert": "I", "label": "Imaginary unit"},
+            {"symbol": "sin", "insert": "sin(", "label": "Sine"},
+            {"symbol": "cos", "insert": "cos(", "label": "Cosine"},
+            {"symbol": "tan", "insert": "tan(", "label": "Tangent"},
+            {"symbol": "sin⁻¹", "insert": "asin(", "label": "Arcsine"},
+            {"symbol": "cos⁻¹", "insert": "acos(", "label": "Arccosine"},
+            {"symbol": "tan⁻¹", "insert": "atan(", "label": "Arctangent"},
+            {"symbol": "ln", "insert": "ln(", "label": "Natural log"},
+            {"symbol": "log", "insert": "log(", "label": "Log base 10"},
+            {"symbol": "√", "insert": "sqrt(", "label": "Square root"},
+            {"symbol": "|", "insert": "Abs(", "label": "Absolute value"},
+            {"symbol": "x²", "insert": "**2", "label": "Square"},
+            {"symbol": "xⁿ", "insert": "**", "label": "Power"},
+            {"symbol": "n!", "insert": "factorial(", "label": "Factorial"},
+            {"symbol": "Σ", "insert": "Sum(", "label": "Summation"},
+            {"symbol": "∫", "insert": "integrate(", "label": "Integral"},
+            {"symbol": "d/dx", "insert": "diff(", "label": "Derivative"},
+            {"symbol": "∞", "insert": "oo", "label": "Infinity"},
+        ],
+    },
 }
 
 
@@ -302,3 +352,130 @@ def get_module(module_id: str) -> dict:
     if not mod:
         return {"error": f"Module '{module_id}' not found"}
     return {"id": module_id} | mod
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMPUTE BACKENDS — real math evaluation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import math
+import cmath
+
+
+def compute_quadratic(a: float, b: float, c: float) -> dict:
+    """Compute quadratic formula results: roots, vertex, discriminant, parabola points."""
+    if a == 0:
+        # Linear: bx + c = 0
+        if b == 0:
+            return {"error": "Not a valid equation (a=0, b=0)", "roots": [], "vertex": None, "discriminant": None, "parabola_points": [], "direction": "none", "axis_of_symmetry": None}
+        root = -c / b
+        return {"roots": [root], "roots_display": [f"x = {root:.4g}"], "vertex": None, "discriminant": None, "axis_of_symmetry": None, "direction": "none",
+                "parabola_points": [{"x": x / 5, "y": b * (x / 5) + c} for x in range(-50, 51)]}
+
+    disc = b * b - 4 * a * c
+    vertex_x = -b / (2 * a)
+    vertex_y = a * vertex_x * vertex_x + b * vertex_x + c
+
+    roots = []
+    roots_display = []
+    if disc > 0:
+        r1 = (-b + math.sqrt(disc)) / (2 * a)
+        r2 = (-b - math.sqrt(disc)) / (2 * a)
+        roots = [r1, r2]
+        roots_display = [f"x₁ = {r1:.4g}", f"x₂ = {r2:.4g}"]
+    elif disc == 0:
+        r = -b / (2 * a)
+        roots = [r]
+        roots_display = [f"x = {r:.4g} (repeated)"]
+    else:
+        # Complex roots
+        real_part = -b / (2 * a)
+        imag_part = math.sqrt(-disc) / (2 * a)
+        roots_display = [f"x₁ = {real_part:.4g} + {imag_part:.4g}i", f"x₂ = {real_part:.4g} - {imag_part:.4g}i"]
+
+    # Generate parabola points centered around vertex
+    x_span = max(6, abs(vertex_x) + 5)
+    x_min = vertex_x - x_span
+    x_max = vertex_x + x_span
+    step = (x_max - x_min) / 200
+    parabola_points = []
+    x = x_min
+    while x <= x_max:
+        y = a * x * x + b * x + c
+        if abs(y) < 1e6:
+            parabola_points.append({"x": round(x, 4), "y": round(y, 4)})
+        x += step
+
+    return {
+        "roots": roots,
+        "roots_display": roots_display,
+        "vertex": {"x": round(vertex_x, 4), "y": round(vertex_y, 4)},
+        "axis_of_symmetry": round(vertex_x, 4),
+        "discriminant": round(disc, 4),
+        "direction": "up" if a > 0 else "down",
+        "parabola_points": parabola_points,
+        "equation_display": f"f(x) = {a}x² + {b}x + {c}",
+        "vertex_form": f"f(x) = {a}(x - {round(vertex_x, 4)})² + {round(vertex_y, 4)}",
+        "formula_steps": [
+            f"Discriminant: Δ = b² − 4ac = {b}² − 4({a})({c}) = {round(disc, 4)}",
+            f"Vertex: x = −b/(2a) = −{b}/(2·{a}) = {round(vertex_x, 4)}",
+            f"Vertex y: f({round(vertex_x, 4)}) = {round(vertex_y, 4)}",
+        ] + ([f"Roots: x = (−b ± √Δ) / (2a) → {', '.join(roots_display)}"] if roots else [f"No real roots (Δ < 0): {', '.join(roots_display)}"]),
+    }
+
+
+def compute_scientific(expression: str) -> dict:
+    """Evaluate a scientific expression using sympy. Returns result, LaTeX, and optional steps."""
+    import sympy
+    from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application, convert_xor
+
+    allowed_names = {
+        "pi": sympy.pi, "e": sympy.E, "E": sympy.E, "I": sympy.I, "i": sympy.I,
+        "oo": sympy.oo, "inf": sympy.oo,
+        "sin": sympy.sin, "cos": sympy.cos, "tan": sympy.tan,
+        "asin": sympy.asin, "acos": sympy.acos, "atan": sympy.atan,
+        "sinh": sympy.sinh, "cosh": sympy.cosh, "tanh": sympy.tanh,
+        "ln": sympy.ln, "log": sympy.log,
+        "sqrt": sympy.sqrt, "Abs": sympy.Abs, "abs": sympy.Abs,
+        "factorial": sympy.factorial,
+        "Sum": sympy.Sum, "sum": sympy.Sum,
+        "integrate": sympy.integrate, "diff": sympy.diff,
+        "limit": sympy.limit, "solve": sympy.solve,
+        "Product": sympy.Product, "product": sympy.Product,
+        "x": sympy.Symbol("x"), "y": sympy.Symbol("y"),
+        "n": sympy.Symbol("n"), "k": sympy.Symbol("k"),
+        "t": sympy.Symbol("t"),
+    }
+
+    try:
+        transformations = standard_transformations + (implicit_multiplication_application, convert_xor)
+        parsed = parse_expr(expression, local_dict=allowed_names, transformations=transformations)
+
+        # Evaluate unevaluated forms (Sum, Product) so they return a number
+        if hasattr(parsed, 'doit'):
+            parsed = parsed.doit()
+
+        # Try to evaluate to a number
+        result_exact = sympy.simplify(parsed)
+        result_float = None
+        try:
+            f = complex(result_exact.evalf())
+            if f.imag == 0:
+                result_float = f.real
+            else:
+                result_float = f
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+        latex_str = sympy.latex(result_exact)
+        input_latex = sympy.latex(parsed)
+
+        return {
+            "result": str(result_exact),
+            "result_float": result_float if isinstance(result_float, (int, float)) else str(result_float) if result_float else None,
+            "latex": latex_str,
+            "input_latex": input_latex,
+            "expression": expression,
+        }
+    except Exception as e:
+        return {"error": str(e), "expression": expression}

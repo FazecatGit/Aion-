@@ -22,3 +22,8 @@ vscode-extension/node_modules/
 vscode-extension/.vscode-test/
 
 tests/
+
+brain/generated_images
+
+/generated_images
+/models
