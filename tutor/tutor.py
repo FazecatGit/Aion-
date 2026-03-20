@@ -353,6 +353,116 @@ CS_CURRICULUM = {
             ]},
         ],
     },
+    "functional_programming": {
+        "name": "Functional Programming",
+        "icon": "λ",
+        "level": "mid",
+        "chapters": [
+            {"id": "fp-basics", "name": "FP Fundamentals", "topics": [
+                "Pure functions and side effects", "Immutability and persistent data structures",
+                "First-class and higher-order functions", "Map, filter, and reduce",
+                "Function composition and piping",
+            ]},
+            {"id": "fp-advanced", "name": "Advanced FP", "topics": [
+                "Closures and currying", "Monads and functors (intuition)",
+                "Pattern matching and algebraic data types",
+                "Lazy evaluation and generators", "Tail recursion and trampolining",
+            ]},
+        ],
+    },
+    "web_development": {
+        "name": "Web Development",
+        "icon": "🌐",
+        "level": "junior",
+        "chapters": [
+            {"id": "web-frontend", "name": "Frontend Basics", "topics": [
+                "HTML structure and semantic elements", "CSS layout (flexbox, grid, positioning)",
+                "DOM manipulation and events", "Responsive design and media queries",
+                "Accessibility (ARIA, keyboard navigation)",
+            ]},
+            {"id": "web-js", "name": "JavaScript & TypeScript", "topics": [
+                "Promises, async/await, and event loop", "ES6+ features (destructuring, spread, modules)",
+                "TypeScript types, generics, and utility types",
+                "Fetch API and HTTP requests", "LocalStorage, SessionStorage, and cookies",
+            ]},
+            {"id": "web-frameworks", "name": "Frameworks & SPAs", "topics": [
+                "React components and hooks", "State management (Context, Redux concepts)",
+                "Routing and navigation in SPAs", "Server-side rendering vs client-side rendering",
+                "Build tools (bundlers, transpilers, dev servers)",
+            ]},
+            {"id": "web-backend", "name": "Backend Web Development", "topics": [
+                "HTTP methods and REST conventions", "Middleware and request lifecycle",
+                "Authentication and session management", "Input validation and sanitization",
+                "CORS, CSP, and web security headers",
+            ]},
+        ],
+    },
+    "testing_quality": {
+        "name": "Testing & Quality",
+        "icon": "🧪",
+        "level": "mid",
+        "chapters": [
+            {"id": "tq-unit", "name": "Unit Testing", "topics": [
+                "Writing good unit tests (AAA pattern)", "Test doubles: mocks, stubs, and fakes",
+                "Code coverage and its limitations", "Table-driven / parameterized tests",
+                "Testing edge cases and boundary values",
+            ]},
+            {"id": "tq-integration", "name": "Integration & E2E Testing", "topics": [
+                "Integration tests vs unit tests", "Testing APIs and HTTP endpoints",
+                "Database testing with fixtures/seeds", "End-to-end testing concepts",
+                "Test environments and CI integration",
+            ]},
+            {"id": "tq-tdd", "name": "TDD & BDD", "topics": [
+                "Red-Green-Refactor cycle", "Behavior-Driven Development basics",
+                "Writing tests before code", "Refactoring with test safety nets",
+                "When TDD helps and when it doesn't",
+            ]},
+        ],
+    },
+    "ai_ml_basics": {
+        "name": "AI & Machine Learning",
+        "icon": "🤖",
+        "level": "mid",
+        "chapters": [
+            {"id": "ml-foundations", "name": "ML Foundations", "topics": [
+                "Supervised vs unsupervised learning", "Training, validation, and test sets",
+                "Overfitting and underfitting", "Feature engineering basics",
+                "Bias-variance tradeoff",
+            ]},
+            {"id": "ml-algorithms", "name": "Core Algorithms", "topics": [
+                "Linear regression and logistic regression", "Decision trees and random forests",
+                "K-nearest neighbors", "K-means clustering",
+                "Neural networks and backpropagation basics",
+            ]},
+            {"id": "ml-practical", "name": "Practical ML & NLP", "topics": [
+                "Data preprocessing and normalization", "Evaluation metrics (accuracy, precision, recall, F1)",
+                "Text embeddings and vector search", "Transformer architecture intuition",
+                "Prompt engineering and LLM concepts",
+            ]},
+        ],
+    },
+    "compilers_languages": {
+        "name": "Compilers & Languages",
+        "icon": "📜",
+        "level": "senior",
+        "chapters": [
+            {"id": "cl-parsing", "name": "Lexing & Parsing", "topics": [
+                "Tokenization and lexical analysis", "Context-free grammars and BNF",
+                "Recursive descent parsing", "Abstract syntax trees (ASTs)",
+                "Operator precedence and associativity",
+            ]},
+            {"id": "cl-interpreters", "name": "Interpreters & VMs", "topics": [
+                "Tree-walking interpreters", "Bytecode and virtual machines",
+                "Scope chains and environments", "Garbage collection concepts",
+                "JIT compilation basics",
+            ]},
+            {"id": "cl-type-systems", "name": "Type Systems", "topics": [
+                "Static vs dynamic typing", "Type inference algorithms",
+                "Generics and parametric polymorphism", "Structural vs nominal typing",
+                "Soundness and completeness of type systems",
+            ]},
+        ],
+    },
 }
 
 # Track completed chapters for CS curriculum

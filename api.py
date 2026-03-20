@@ -1743,7 +1743,7 @@ async def curriculum_get_problem(subject_id: str, chapter_id: str, problem_index
     return {"status": "ok", "problem": result}
 
 
-# ── TTS Kokoro endpoint ────────────────────────────────────────────────
+# ── TTS Kokoro endpoint (delegated to agent/tts_kokoro.py) ────────────────
 
 class TTSKokoroRequest(BaseModel):
     text: str
@@ -1755,124 +1755,188 @@ class TTSKokoroRequest(BaseModel):
 async def voice_tts_kokoro(req: TTSKokoroRequest):
     """Text-to-speech using Kokoro ONNX. Returns WAV audio file."""
     _api_log.info("[API] /voice/tts — text=%d chars, voice=%s", len(req.text), req.voice)
+    from agent.tts_kokoro import generate_speech
 
-    def _generate():
-        try:
-            from kokoro_onnx import Kokoro
-            import soundfile as sf
-            import numpy as np
-            import tempfile
-        except ImportError:
-            return None, "kokoro-onnx not installed. Run: pip install kokoro-onnx"
+    result = await asyncio.to_thread(generate_speech, req.text, req.voice, req.speed)
+    if result["status"] == "error":
+        return result
 
-        kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
-        samples, sample_rate = kokoro.create(
-            req.text,
-            voice=req.voice,
-            speed=req.speed,
-            lang="en-us"
-        )
-
-        if samples is None or len(samples) == 0:
-            return None, "No audio generated"
-
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        sf.write(tmp.name, samples, sample_rate)
-        return tmp.name, None
-
-    try:
-        wav_path, error = await asyncio.to_thread(_generate)
-        if error:
-            return {"status": "error", "error": error}
-
-        from starlette.responses import FileResponse
-        return FileResponse(wav_path, media_type="audio/wav", filename="tts_output.wav")
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    from starlette.responses import FileResponse
+    return FileResponse(result["path"], media_type="audio/wav", filename="tts_output.wav")
 
 
-
-# ── Image generation endpoint ────────────────────────────────────────────
-
-from diffusers import StableDiffusionXLPipeline
-import torch
-
-MODEL_PATH = "C:/Users/Pog Pete/Desktop/projects/Aion/models/illustriousXL_v01.safetensors"
-assert Path(MODEL_PATH).exists(), f"Model not found at: {MODEL_PATH}"
-
-_sd_pipe = None
-
-def _get_sd_pipe():
-    global _sd_pipe
-    if _sd_pipe is None:
-        _sd_pipe = StableDiffusionXLPipeline.from_single_file(
-            MODEL_PATH,
-            torch_dtype=torch.float16,
-            use_safetensors=True,
-        ).to("cuda")
-        _sd_pipe.enable_attention_slicing()
-    return _sd_pipe
-
+# ── Image generation endpoints (delegated to agent/image_generation.py) ──
 
 class ImageGenRequest(BaseModel):
     prompt: str
     width: int = 1024
     height: int = 1024
+    model: Optional[str] = None        # checkpoint name (resolved to path)
+    loras: list[str] = []              # LoRA names to apply
+    lora_weights: list[float] = []     # weights per LoRA
+    mode: str = "normal"               # "normal" or "explicit"
+    steps: int = 35
+    guidance_scale: float = 7.5
+    negative_prompt: Optional[str] = None
+    seed: int = -1
 
 
 @app.post("/generate/image")
-async def generate_image(req: ImageGenRequest):
-    _api_log.info("[API] /generate/image — prompt=%s", req.prompt[:60])
+async def generate_image_endpoint(req: ImageGenRequest):
+    """Generate an image using local Stable Diffusion XL."""
+    _api_log.info("[API] /generate/image — prompt=%s, mode=%s", req.prompt[:60], req.mode)
+    from agent.image_generation import generate_image, list_models
 
-    # def _expand_prompt(raw: str) -> str:
-    #     # Ask Ollama to expand the prompt
-    #     import httpx
-    #     resp = httpx.post("http://localhost:11434/api/generate", json={
-    #         "model": "qwen3",
-    #         "prompt": f"Expand this image generation prompt into a detailed, descriptive prompt for Stable Diffusion XL. Return only the prompt, no explanation: '{raw}'",
-    #         "stream": False,
-    #     }, timeout=30.0)
-    #     if resp.status_code == 200:
-    #         return resp.json().get("response", raw).strip()
-    #     return raw
+    # Resolve model name to path
+    model_path = None
+    if req.model:
+        models = list_models()
+        match = next((m for m in models if m["name"] == req.model or m["filename"] == req.model), None)
+        if match:
+            model_path = match["path"]
+        else:
+            return {"status": "error", "error": f"Model '{req.model}' not found"}
 
-    def _generate():
-        try:
-            output_dir_path = Path(OUTPUT_DIR)
-            output_dir_path.mkdir(parents=True, exist_ok=True)
+    # Resolve LoRA names to paths
+    lora_paths = []
+    if req.loras:
+        models = list_models()
+        for ln in req.loras:
+            lmatch = next((m for m in models if m["name"] == ln and m["type"] == "lora"), None)
+            if lmatch:
+                lora_paths.append(lmatch["path"])
 
-            pipe = _get_sd_pipe()
+    def _gen():
+        return generate_image(
+            prompt=req.prompt,
+            width=req.width,
+            height=req.height,
+            model_path=model_path,
+            lora_paths=lora_paths or None,
+            lora_weights=req.lora_weights or None,
+            mode=req.mode,
+            steps=req.steps,
+            guidance_scale=req.guidance_scale,
+            negative_prompt=req.negative_prompt,
+            seed=req.seed,
+        )
 
-            # Pony requires these prefix tags
-            full_prompt = f"rating_explicit, amazing quality, sexy,{req.prompt}"
-            full_negative = "score_4, score_3, score_2, score_1, " + \
-                            "blurry, low quality, deformed, bad anatomy, watermark, bad hands, text, error, cropped, worst quality,bad quality,worst quality,worst detail,sketch,censored, artist os.name,signature, watermark,patreon username, patreon logo,pov, doorway, door, tattoo"
+    result = await asyncio.to_thread(_gen)
+    if result.get("status") == "error":
+        return result
 
-            image = pipe(
-                full_prompt,
-                width=req.width,
-                height=req.height,
-                num_inference_steps=35,
-                guidance_scale=8.0,
-                negative_prompt=full_negative,
-            ).images[0]
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = str(output_dir_path / f"{timestamp}_{req.prompt[:20].replace(' ', '_')}.png")
-            image.save(filename)
-            _api_log.info("[IMAGE GEN] Saved to: %s", filename)
-            return filename, None
-        except Exception as e:
-            _api_log.error("[IMAGE GEN] Error: %s", str(e))
-            return None, str(e)
+    # Return image file + metadata
+    from starlette.responses import FileResponse
+    import json as _json
+    response = FileResponse(result["path"], media_type="image/png", filename="generated.png")
+    response.headers["X-Generation-Meta"] = _json.dumps({
+        "seed": result.get("seed"),
+        "prompt_used": result.get("prompt_used"),
+        "negative_used": result.get("negative_used"),
+        "prompt_analysis": result.get("prompt_analysis"),
+        "settings": result.get("settings"),
+    })
+    return response
 
 
-    img_path, error = await asyncio.to_thread(_generate)
-    if error:
-        return {"status": "error", "error": error}
+class AnimatedGenRequest(BaseModel):
+    prompt: str
+    width: int = 512
+    height: int = 512
+    model: Optional[str] = None
+    mode: str = "normal"
+    num_frames: int = 8
+    steps: int = 25
+    guidance_scale: float = 7.5
+    seed: int = -1
+
+
+@app.post("/generate/animated")
+async def generate_animated_endpoint(req: AnimatedGenRequest):
+    """Generate an animated GIF from a text prompt."""
+    _api_log.info("[API] /generate/animated — prompt=%s, frames=%d", req.prompt[:60], req.num_frames)
+    from agent.image_generation import generate_animated, list_models
+
+    model_path = None
+    if req.model:
+        models = list_models()
+        match = next((m for m in models if m["name"] == req.model), None)
+        if match:
+            model_path = match["path"]
+
+    def _gen():
+        return generate_animated(
+            prompt=req.prompt,
+            width=req.width,
+            height=req.height,
+            model_path=model_path,
+            mode=req.mode,
+            num_frames=req.num_frames,
+            steps=req.steps,
+            guidance_scale=req.guidance_scale,
+            seed=req.seed,
+        )
+
+    result = await asyncio.to_thread(_gen)
+    if result.get("status") == "error":
+        return result
 
     from starlette.responses import FileResponse
-    return FileResponse(img_path, media_type="image/png", filename="generated.png")
+    return FileResponse(result["path"], media_type="image/gif", filename="animated.gif")
+
+
+# ── Image generation model management ─────────────────────────────────────
+
+@app.get("/generate/models")
+async def list_image_models():
+    """List all available checkpoint and LoRA models."""
+    from agent.image_generation import list_models, get_active_model
+    return {
+        "status": "ok",
+        "models": list_models(),
+        "active": get_active_model(),
+    }
+
+
+class DeleteImageModelRequest(BaseModel):
+    model_path: str
+
+@app.post("/generate/models/delete")
+async def delete_image_model(req: DeleteImageModelRequest):
+    """Delete an image generation model from disk."""
+    from agent.image_generation import delete_model
+    return delete_model(req.model_path)
+
+
+class UnloadImageModelRequest(BaseModel):
+    model_path: Optional[str] = None
+
+@app.post("/generate/models/unload")
+async def unload_image_model(req: UnloadImageModelRequest):
+    """Unload a model from GPU memory."""
+    from agent.image_generation import unload_model
+    unload_model(req.model_path)
+    return {"status": "ok", "message": "Model unloaded"}
+
+
+# ── Image generation feedback ─────────────────────────────────────────────
+
+class ImageFeedbackRequest(BaseModel):
+    generation_index: int
+    feedback: str
+
+@app.post("/generate/feedback")
+async def image_feedback(req: ImageFeedbackRequest):
+    """Submit feedback about a generated image to improve future generations."""
+    from agent.image_generation import submit_feedback
+    return submit_feedback(req.generation_index, req.feedback)
+
+
+@app.get("/generate/history")
+async def image_gen_history(limit: int = 20):
+    """Get recent image generation history with prompt analysis."""
+    from agent.image_generation import get_generation_history
+    return {"status": "ok", "history": get_generation_history(limit)}
 
 
 

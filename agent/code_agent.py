@@ -415,7 +415,7 @@ class CodeAgent:
         context_block = combined_context + extra_syntax
 
         # --- Cap context to avoid bloated prompts that stall the LLM ---
-        _MAX_CONTEXT_CHARS = 12000  # ~3000 tokens of reference context
+        _MAX_CONTEXT_CHARS = 8000  # ~2000 tokens — keep small for speed
         if len(context_block) > _MAX_CONTEXT_CHARS:
             logger.warning(
                 "[AGENT] Context block too large (%d chars), truncating to %d",
@@ -460,7 +460,7 @@ class CodeAgent:
         )
 
         # --- Cap original_snippet to prevent enormous prompts ---
-        _MAX_SNIPPET_CHARS = 20000  # ~5000 tokens of code
+        _MAX_SNIPPET_CHARS = 12000  # ~3000 tokens — shorter = faster LLM response
         if len(original_snippet) > _MAX_SNIPPET_CHARS:
             logger.warning(
                 "[AGENT] File snippet too large (%d chars), truncating to %d",
@@ -541,7 +541,8 @@ class CodeAgent:
             )
 
         # --- Two-stage: analysis (reasoning, temp=0.1) then edit (coding, temp=0.0) ---
-        reasoning_llm = make_llm(temperature=0.1)
+        # Use lower num_predict for analysis to keep it concise and fast
+        reasoning_llm = make_llm(temperature=0.1, num_predict=2048)
         logger.info("Waiting for LLM to analyze the issue...")
         try:
             if is_implement:

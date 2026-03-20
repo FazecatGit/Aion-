@@ -5,7 +5,7 @@ import './index.css';
 
 type Message    = { role: 'user' | 'ai'; text: string; isDiff?: boolean; imageData?: string };
 type OrbMode    = 'idle' | 'querying' | 'agent-processing';
-type ActiveMode = 'query' | 'agent' | 'tutor';
+type ActiveMode = 'query' | 'agent' | 'tutor' | 'imagegen';
 type TestCase   = { id: number; input: string; expected: string };
 type TestResult = { input: string; expected: string; actual: string | null; passed: boolean; error: string | null };
 type ChatSession = { session_id: string; title: string; created_at?: string; turn_count?: number };
@@ -42,6 +42,7 @@ function App() {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [sessionId, setSessionId] = useState<string>(() => crypto.randomUUID());
   const [showSidebar, setShowSidebar] = useState(false);
+  const [showDataMenu, setShowDataMenu] = useState(false);
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState('');
   const sessionCreatedRef = useRef(false);  // track if current session was persisted
@@ -259,6 +260,29 @@ function App() {
   const [imageGenPrompt, setImageGenPrompt] = useState('');
   const [imageGenResult, setImageGenResult] = useState<string | null>(null);
   const [showImageGenDialog, setShowImageGenDialog] = useState(false);
+  // ── Image generation page state ────────────────────────────────────────────
+  type ImageModel = { name: string; filename: string; path: string; size_mb: number; type: 'checkpoint' | 'lora' };
+  const [imageModels, setImageModels] = useState<ImageModel[]>([]);
+  const [activeImageModel, setActiveImageModel] = useState<string | null>(null);
+  const [selectedImageModel, setSelectedImageModel] = useState<string>('');
+  const [selectedLoras, setSelectedLoras] = useState<string[]>([]);
+  const [imageGenMode, setImageGenMode] = useState<'normal' | 'explicit'>('normal');
+  const [imageGenSteps, setImageGenSteps] = useState(35);
+  const [imageGenCfg, setImageGenCfg] = useState(7.5);
+  const [imageGenSeed, setImageGenSeed] = useState(-1);
+  const [imageGenWidth, setImageGenWidth] = useState(1024);
+  const [imageGenHeight, setImageGenHeight] = useState(1024);
+  const [imageGenNegative, setImageGenNegative] = useState('');
+  const [imageGenMeta, setImageGenMeta] = useState<any>(null);
+  const [imageGenHistory, setImageGenHistory] = useState<any[]>([]);
+  const [imageGenFeedback, setImageGenFeedback] = useState('');
+  const [imageGenAnimated, setImageGenAnimated] = useState(false);
+  const [imageGenFrames, setImageGenFrames] = useState(8);
+  // ── Image lightbox with zoom+pan ───────────────────────────────────────────
+  const [lightboxZoom, setLightboxZoom] = useState(1);
+  const [lightboxPan, setLightboxPan] = useState({ x: 0, y: 0 });
+  const lightboxDragging = useRef(false);
+  const lightboxDragStart = useRef({ x: 0, y: 0 });
 
   // ── Process / backend log panel ────────────────────────────────────────────
   type ProcessLog = { ts: number; level: string; logger: string; message: string };
@@ -469,6 +493,7 @@ function App() {
   // Fetch gamification profile when entering tutor mode
   useEffect(() => {
     if (activeMode === 'tutor') fetchGamifProfile();
+    if (activeMode === 'imagegen') { fetchImageModels(); fetchImageHistory(); }
   }, [activeMode]);
 
   // Refresh gamification profile after solving a problem
@@ -1249,12 +1274,30 @@ const handleImageGenerate = async () => {
   if (!imageGenPrompt.trim() || imageGenLoading) return;
   setImageGenLoading(true);
   setImageGenResult(null);
+  setImageGenMeta(null);
+  setMode('querying');  // activate orb animation during generation
+
+  const endpoint = imageGenAnimated ? '/generate/animated' : '/generate/image';
 
   try {
-    const res = await fetch('http://localhost:8000/generate/image', {
+    const body: any = {
+      prompt: imageGenPrompt.trim(),
+      width: imageGenWidth,
+      height: imageGenHeight,
+      mode: imageGenMode,
+      steps: imageGenSteps,
+      guidance_scale: imageGenCfg,
+      seed: imageGenSeed,
+    };
+    if (selectedImageModel) body.model = selectedImageModel;
+    if (selectedLoras.length > 0) body.loras = selectedLoras;
+    if (imageGenNegative.trim()) body.negative_prompt = imageGenNegative.trim();
+    if (imageGenAnimated) body.num_frames = imageGenFrames;
+
+    const res = await fetch(`http://localhost:8000${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: imageGenPrompt.trim() }),
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {
@@ -1264,16 +1307,20 @@ const handleImageGenerate = async () => {
     }
 
     const contentType = res.headers.get('content-type') ?? '';
-    if (contentType.includes('image')) {
-      // Response is an image blob
+    if (contentType.includes('image') || contentType.includes('gif')) {
+      // Parse metadata from custom header
+      const metaHeader = res.headers.get('X-Generation-Meta');
+      if (metaHeader) {
+        try { setImageGenMeta(JSON.parse(metaHeader)); } catch {}
+      }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       setImageGenResult(url);
     } else {
-      // Response is JSON (description)
       const data = await res.json();
       if (data.status === 'ok') {
-        setImageGenResult(data.description);
+        setImageGenResult(data.description || data.path);
+        setImageGenMeta(data);
       } else {
         setImageGenResult(`Error: ${data.error || 'Generation failed'}`);
       }
@@ -1282,7 +1329,60 @@ const handleImageGenerate = async () => {
     setImageGenResult(`Error: ${err.message}`);
   } finally {
     setImageGenLoading(false);
+    setMode('idle');  // deactivate orb
+    fetchImageHistory();  // refresh history after every generation attempt
   }
+};
+
+// Fetch image generation models
+const fetchImageModels = async () => {
+  try {
+    const res = await fetch('http://localhost:8000/generate/models');
+    const data = await res.json();
+    if (data.status === 'ok') {
+      setImageModels(data.models || []);
+      setActiveImageModel(data.active);
+      if (!selectedImageModel && data.models?.length > 0) {
+        const checkpoints = data.models.filter((m: ImageModel) => m.type === 'checkpoint');
+        if (checkpoints.length > 0) setSelectedImageModel(checkpoints[0].name);
+      }
+    }
+  } catch {}
+};
+
+// Fetch image generation history
+const fetchImageHistory = async () => {
+  try {
+    const res = await fetch('http://localhost:8000/generate/history?limit=20');
+    const data = await res.json();
+    if (data.status === 'ok') setImageGenHistory(data.history || []);
+  } catch {}
+};
+
+// Submit feedback for a generation
+const submitImageFeedback = async (index: number, feedback: string) => {
+  try {
+    await fetch('http://localhost:8000/generate/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ generation_index: index, feedback }),
+    });
+    setImageGenFeedback('');
+    fetchImageHistory();
+  } catch {}
+};
+
+// Delete an image model
+const deleteImageModel = async (modelPath: string) => {
+  if (!confirm('Delete this model permanently?')) return;
+  try {
+    await fetch('http://localhost:8000/generate/models/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_path: modelPath }),
+    });
+    fetchImageModels();
+  } catch {}
 };
 
 return (
@@ -1386,117 +1486,143 @@ return (
 
       {/* ── Top Left Toolbar: RAG / Data controls ──────────────────────── */}
       <div style={{ position: 'fixed', top: '20px', left: '20px', zIndex: 50, display: 'flex', gap: '8px' }}>
-        <button
-          onClick={async () => {
-            try {
-              const res = await fetch('http://localhost:8000/open_data_folder', { method: 'POST' });
-              const json = await res.json();
-              if (json.status === 'opened') {
-                setMessages(prev => [...prev, { role: 'ai', text: `Opened data folder: ${json.path}` }]);
-              } else {
-                setMessages(prev => [...prev, { role: 'ai', text: `Open failed: ${json.error}` }]);
-              }
-            } catch (e) {
-              setMessages(prev => [...prev, { role: 'ai', text: 'Open data folder failed.' }]);
-            }
-          }}
-          style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#333', color: '#fff', border: 'none' }}
-          disabled={mode !== 'idle'}
-        >
-          Open Data Folder
-        </button>
-
-        <button
-          onClick={async () => {
-            setMode('querying');
-            setMessages(prev => [...prev, { role: 'user', text: 'Batch ingesting all PDFs in data folder...' }]);
-            try {
-              const res = await fetch('http://localhost:8000/ingest', { method: 'POST' });
-              const json = await res.json();
-              const topics: string[] = Array.isArray(json.topics) ? json.topics : Object.keys(json.topics || {});
-              setMessages(prev => [...prev, { 
-                role: 'ai', 
-                text: `✓ Batch ingest complete! Processed all PDFs in data folder. Extracted ${topics.length} topics: ${topics.slice(0, 10).join(', ')}${topics.length > 10 ? '...' : ''}` 
-              }]);
-            } catch (e) {
-              setMessages(prev => [...prev, { role: 'ai', text: `Batch ingest failed: ${e.message}` }]);
-            }
-            setMode('idle');
-          }}
-          style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#2068b8', color: '#fff', border: 'none', fontWeight: 'bold' }}
-          disabled={mode !== 'idle'}
-          title="Process all PDF files in the data folder at once"
-        >
-          Batch Ingest All
-        </button>
-
-        <button
-          onClick={async () => {
-            setMode('querying');
-            setMessages(prev => [...prev, { role: 'user', text: 'Re-ingesting all documents (force rebuild)...' }]);
-            try {
-              // Start the background reingest
-              let res = await fetch('http://localhost:8000/reingest', { method: 'POST' });
-              if (res.status === 404 || res.status === 405) {
-                setMessages(prev => [...prev, { role: 'ai', text: '(Server needs restart for force-rebuild — falling back to batch ingest)' }]);
-                res = await fetch('http://localhost:8000/ingest', { method: 'POST' });
-                if (!res.ok) throw new Error(`Server returned ${res.status}`);
-                const json = await res.json();
-                const topics: string[] = Array.isArray(json.topics) ? json.topics : Object.keys(json.topics || {});
-                setMessages(prev => [...prev, { role: 'ai', text: `✓ Ingest complete! ${topics.length} topics extracted.` }]);
-                setMode('idle');
-                return;
-              }
-              if (!res.ok) throw new Error(`Server returned ${res.status}`);
-              const startJson = await res.json();
-              if (startJson.status === 'already_running') {
-                setMessages(prev => [...prev, { role: 'ai', text: 'Re-ingest is already running in the background — check back in a minute.' }]);
-                setMode('idle');
-                return;
-              }
-              setMessages(prev => [...prev, { role: 'ai', text: ' Starting re-ingest... polling for progress.' }]);
-
-              // Poll /reingest/status with log_cursor for incremental verbose logs
-              let done = false;
-              let logCursor = 0;
-              while (!done) {
-                await new Promise(r => setTimeout(r, 3000));
-                const statusRes = await fetch(`http://localhost:8000/reingest/status?log_cursor=${logCursor}`);
-                const statusJson = await statusRes.json();
-
-                // Show new log lines as individual messages
-                const newLines: string[] = statusJson.log || [];
-                if (newLines.length > 0) {
-                  setMessages(prev => [...prev, ...newLines.map((line: string) => ({ role: 'ai' as const, text: `[ingest] ${line}` }))]);
-                  logCursor = statusJson.log_cursor ?? (logCursor + newLines.length);
-                }
-
-                if (statusJson.status === 'done') {
-                  done = true;
-                  const topics: string[] = statusJson.topics || [];
-                  setMessages(prev => [...prev, {
-                    role: 'ai',
-                    text: `Re-ingest complete! ${topics.length} topics extracted: ${topics.slice(0, 15).join(', ')}${topics.length > 15 ? '...' : ''}`
-                  }]);
-                } else if (statusJson.status === 'error') {
-                  done = true;
-                  setMessages(prev => [...prev, {
-                    role: 'ai',
-                    text: `Re-ingest stopped: ${statusJson.error}\n\nProgress has been saved — click Re-ingest again to resume from where it left off.`
-                  }]);
-                }
-              }
-            } catch (e: any) {
-              setMessages(prev => [...prev, { role: 'ai', text: `Re-ingest failed: ${e.message}\n\nClick Re-ingest again to resume from the last checkpoint.` }]);
-            }
-            setMode('idle');
-          }}
-          style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#b85820', color: '#fff', border: 'none', fontWeight: 'bold' }}
-          disabled={mode !== 'idle'}
-          title="Force full re-ingestion: rebuilds everything with improved keyword extraction and topic tagging"
-        >
-          🔄 Re-ingest
-        </button>
+        {/* Data Management Dropdown */}
+        <div style={{ position: 'relative' }}>
+          <button
+            onClick={() => setShowDataMenu(prev => !prev)}
+            style={{ padding: '6px 12px', borderRadius: '6px', backgroundColor: '#333', color: '#fff', border: '1px solid #555', cursor: 'pointer', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px' }}
+            disabled={mode !== 'idle'}
+          >
+            📂 Data ▾
+          </button>
+          {showDataMenu && (
+            <>
+            <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 99 }} onClick={() => setShowDataMenu(false)} />
+            <div style={{
+              position: 'absolute', top: '100%', left: 0, marginTop: '4px',
+              backgroundColor: '#1a1a1a', border: '1px solid #444', borderRadius: '8px',
+              minWidth: '180px', padding: '4px', zIndex: 100,
+              boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+            }}>
+              <button
+                onClick={async () => {
+                  setShowDataMenu(false);
+                  try {
+                    const res = await fetch('http://localhost:8000/open_data_folder', { method: 'POST' });
+                    const json = await res.json();
+                    if (json.status === 'opened') {
+                      setMessages(prev => [...prev, { role: 'ai', text: `Opened data folder: ${json.path}` }]);
+                    } else {
+                      setMessages(prev => [...prev, { role: 'ai', text: `Open failed: ${json.error}` }]);
+                    }
+                  } catch (e) {
+                    setMessages(prev => [...prev, { role: 'ai', text: 'Open data folder failed.' }]);
+                  }
+                }}
+                style={{ display: 'block', width: '100%', padding: '8px 12px', borderRadius: '6px', backgroundColor: 'transparent', color: '#fff', border: 'none', textAlign: 'left', cursor: 'pointer', fontSize: '13px' }}
+                onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#333')}
+                onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+              >
+                📁 Open Data Folder
+              </button>
+              <button
+                onClick={async () => {
+                  setShowDataMenu(false);
+                  setMode('querying');
+                  setMessages(prev => [...prev, { role: 'user', text: 'Batch ingesting all PDFs in data folder...' }]);
+                  try {
+                    const res = await fetch('http://localhost:8000/ingest', { method: 'POST' });
+                    const json = await res.json();
+                    const topics: string[] = Array.isArray(json.topics) ? json.topics : Object.keys(json.topics || {});
+                    setMessages(prev => [...prev, { 
+                      role: 'ai', 
+                      text: `✓ Batch ingest complete! Processed all PDFs in data folder. Extracted ${topics.length} topics: ${topics.slice(0, 10).join(', ')}${topics.length > 10 ? '...' : ''}` 
+                    }]);
+                  } catch (e) {
+                    setMessages(prev => [...prev, { role: 'ai', text: `Batch ingest failed: ${e.message}` }]);
+                  }
+                  setMode('idle');
+                }}
+                style={{ display: 'block', width: '100%', padding: '8px 12px', borderRadius: '6px', backgroundColor: 'transparent', color: '#fff', border: 'none', textAlign: 'left', cursor: 'pointer', fontSize: '13px' }}
+                onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#333')}
+                onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+              >
+                📥 Batch Ingest All
+              </button>
+              <button
+                onClick={async () => {
+                  setShowDataMenu(false);
+                  setMode('querying');
+                  setMessages(prev => [...prev, { role: 'user', text: 'Re-ingesting all documents (force rebuild)...' }]);
+                  try {
+                    let res = await fetch('http://localhost:8000/reingest', { method: 'POST' });
+                    if (res.status === 404 || res.status === 405) {
+                      setMessages(prev => [...prev, { role: 'ai', text: '(Server needs restart for force-rebuild — falling back to batch ingest)' }]);
+                      res = await fetch('http://localhost:8000/ingest', { method: 'POST' });
+                      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+                      const json = await res.json();
+                      const topics: string[] = Array.isArray(json.topics) ? json.topics : Object.keys(json.topics || {});
+                      setMessages(prev => [...prev, { role: 'ai', text: `✓ Ingest complete! ${topics.length} topics extracted.` }]);
+                      setMode('idle');
+                      return;
+                    }
+                    if (!res.ok) throw new Error(`Server returned ${res.status}`);
+                    const startJson = await res.json();
+                    if (startJson.status === 'already_running') {
+                      setMessages(prev => [...prev, { role: 'ai', text: 'Re-ingest is already running in the background — check back in a minute.' }]);
+                      setMode('idle');
+                      return;
+                    }
+                    setMessages(prev => [...prev, { role: 'ai', text: ' Starting re-ingest... polling for progress.' }]);
+                    let done = false;
+                    let logCursor = 0;
+                    while (!done) {
+                      await new Promise(r => setTimeout(r, 3000));
+                      const statusRes = await fetch(`http://localhost:8000/reingest/status?log_cursor=${logCursor}`);
+                      const statusJson = await statusRes.json();
+                      const newLines: string[] = statusJson.log || [];
+                      if (newLines.length > 0) {
+                        setMessages(prev => [...prev, ...newLines.map((line: string) => ({ role: 'ai' as const, text: `[ingest] ${line}` }))]);
+                        logCursor = statusJson.log_cursor ?? (logCursor + newLines.length);
+                      }
+                      if (statusJson.status === 'done') {
+                        done = true;
+                        const topics: string[] = statusJson.topics || [];
+                        setMessages(prev => [...prev, {
+                          role: 'ai',
+                          text: `Re-ingest complete! ${topics.length} topics extracted: ${topics.slice(0, 15).join(', ')}${topics.length > 15 ? '...' : ''}`
+                        }]);
+                      } else if (statusJson.status === 'error') {
+                        done = true;
+                        setMessages(prev => [...prev, {
+                          role: 'ai',
+                          text: `Re-ingest stopped: ${statusJson.error}\n\nProgress has been saved — click Re-ingest again to resume from where it left off.`
+                        }]);
+                      }
+                    }
+                  } catch (e: any) {
+                    setMessages(prev => [...prev, { role: 'ai', text: `Re-ingest failed: ${e.message}\n\nClick Re-ingest again to resume from the last checkpoint.` }]);
+                  }
+                  setMode('idle');
+                }}
+                style={{ display: 'block', width: '100%', padding: '8px 12px', borderRadius: '6px', backgroundColor: 'transparent', color: '#fff', border: 'none', textAlign: 'left', cursor: 'pointer', fontSize: '13px' }}
+                onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#333')}
+                onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+              >
+                🔄 Re-ingest
+              </button>
+              <button
+                onClick={() => { setShowDataMenu(false); (document.getElementById('pdf-upload') as HTMLInputElement).click(); }}
+                style={{ display: 'block', width: '100%', padding: '8px 12px', borderRadius: '6px', backgroundColor: 'transparent', color: '#fff', border: 'none', textAlign: 'left', cursor: 'pointer', fontSize: '13px' }}
+                onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#333')}
+                onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+              >
+                📄 Upload PDF
+              </button>
+            </div>
+            </>
+          )}
+        </div>
 
         <input id="pdf-upload" type="file" accept="application/pdf" style={{ display: 'none' }} onChange={async (e) => {
           const f = (e.target as HTMLInputElement).files?.[0];
@@ -1537,14 +1663,6 @@ return (
           setMode('idle');
           (document.getElementById('pdf-upload') as HTMLInputElement).value = '';
         }} />
-
-        <button
-          onClick={() => (document.getElementById('pdf-upload') as HTMLInputElement).click()}
-          style={{ padding: '6px 10px', borderRadius: '6px', backgroundColor: '#228822', color: '#fff', border: 'none' }}
-          disabled={mode !== 'idle'}
-        >
-          Upload PDF
-        </button>
 
         {activeMode === 'query' && (
           <select
@@ -1968,14 +2086,31 @@ return (
       {/* ── Tutor Mode Panel ─────────────────────────────────────────────── */}
       {activeMode === 'tutor' && (
         <div style={{
-          position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
-          zIndex: 35, width: '96%', maxWidth: '98vw', maxHeight: '92vh', overflowY: 'auto',
-          padding: '28px', borderRadius: '20px',
+          position: 'fixed', top: '60px', left: '16px', right: '16px', bottom: '16px',
+          zIndex: 35, overflowY: 'auto',
+          padding: '24px 28px', borderRadius: '20px',
           backgroundColor: 'rgba(0, 20, 15, 0.94)', backdropFilter: 'blur(25px)',
           border: '1px solid rgba(0,204,136,0.3)', boxShadow: '0 12px 40px rgba(0,0,0,0.6)',
         }}>
           {/* Setup bar */}
-          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '16px', alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '10px', alignItems: 'center' }}>
+            {/* Math / CS mode toggle — first for visibility */}
+            <button
+              type="button"
+              onClick={() => setIsMathMode(p => !p)}
+              disabled={tutorLoading}
+              style={{
+                padding: '6px 14px', borderRadius: '8px', fontSize: '12px', fontWeight: 'bold',
+                border: '1px solid',
+                borderColor: isMathMode ? '#00cc88' : '#5533ff',
+                backgroundColor: isMathMode ? 'rgba(0,204,136,0.15)' : 'rgba(85,51,255,0.12)',
+                color: isMathMode ? '#00cc88' : '#b388ff',
+                cursor: tutorLoading ? 'not-allowed' : 'pointer', transition: 'all 0.2s',
+                opacity: tutorLoading ? 0.5 : 1,
+              }}
+            >
+              {isMathMode ? '∑ Math' : '🖥 CS'}
+            </button>
             <input value={tutorTopic} onChange={e => setTutorTopic(e.target.value)} disabled={tutorLoading} placeholder="Topic (e.g. arrays, recursion)"
               style={{ padding: '8px 12px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', flex: '1', minWidth: '120px', opacity: tutorLoading ? 0.5 : 1, cursor: tutorLoading ? 'not-allowed' : 'text' }} />
             <button onClick={async () => {
@@ -1997,29 +2132,12 @@ return (
             }}
               disabled={tutorLoading}
               style={{ padding: '8px 14px', borderRadius: '8px', border: '1px solid #00cc8866', backgroundColor: showCurriculum ? 'rgba(0,204,136,0.15)' : 'transparent', color: '#00cc88', fontWeight: 'bold', cursor: tutorLoading ? 'not-allowed' : 'pointer', fontSize: '12px', opacity: tutorLoading ? 0.5 : 1 }}>
-              Browse Topics
+              📚 Browse Topics
             </button>
             <select value={tutorDifficulty} onChange={e => setTutorDifficulty(e.target.value as any)} disabled={tutorLoading}
               style={{ padding: '8px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1, cursor: tutorLoading ? 'not-allowed' : 'pointer' }}>
               <option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option>
             </select>
-            {/* Math / CS mode toggle */}
-            <button
-              type="button"
-              onClick={() => setIsMathMode(p => !p)}
-              disabled={tutorLoading}
-              style={{
-                padding: '6px 14px', borderRadius: '8px', fontSize: '12px', fontWeight: 'bold',
-                border: '1px solid',
-                borderColor: isMathMode ? '#00cc88' : '#5533ff',
-                backgroundColor: isMathMode ? 'rgba(0,204,136,0.15)' : 'rgba(85,51,255,0.12)',
-                color: isMathMode ? '#00cc88' : '#b388ff',
-                cursor: tutorLoading ? 'not-allowed' : 'pointer', transition: 'all 0.2s',
-                opacity: tutorLoading ? 0.5 : 1,
-              }}
-            >
-              {isMathMode ? 'Math' : 'CS'}
-            </button>
             {/* Language selector - hidden in math mode */}
             {!isMathMode && (
               <select value={tutorLanguage} onChange={e => setTutorLanguage(e.target.value)} disabled={tutorLoading}
@@ -2053,8 +2171,41 @@ return (
               style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#b388ff', fontWeight: 'bold', cursor: tutorLoading ? 'not-allowed' : 'pointer', fontSize: '13px', opacity: tutorLoading ? 0.5 : 1 }}>
               Learnings
             </button>
-
           </div>
+
+          {/* ── Math / CS Tools Bar — always visible when a problem exists ── */}
+          {tutorProblem && (
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '10px', padding: '8px 12px', borderRadius: '10px', backgroundColor: 'rgba(0,204,136,0.05)', border: '1px solid rgba(0,204,136,0.15)' }}>
+              <button onClick={() => { triggerPulse('hint'); handleTutorHint(); }} disabled={tutorLoading || (tutorFeedback?.solved ?? false)}
+                style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#5533ff', cursor: 'pointer', fontSize: '12px', animation: pulsingBtn === 'hint' ? 'greenPulse 0.6s ease-out' : undefined }}>
+                💡 Hint
+              </button>
+              {isMathMode && (
+                <button onClick={() => { triggerPulse('steps'); handleMathSteps(); }}
+                  style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #00cc8866', backgroundColor: 'transparent', color: '#00cc88', cursor: 'pointer', fontSize: '12px', animation: pulsingBtn === 'steps' ? 'greenPulse 0.6s ease-out' : undefined }}>
+                  📝 Step-by-Step
+                </button>
+              )}
+              {isMathMode && (
+                <button onClick={() => { triggerPulse('graph'); setShowMathGraph(g => { if (!g) handleMathGraph(); return !g; }); }}
+                  style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #ff990066', backgroundColor: showMathGraph ? 'rgba(255,153,0,0.15)' : 'transparent', color: '#ff9900', cursor: 'pointer', fontSize: '12px', animation: pulsingBtn === 'graph' ? 'greenPulse 0.6s ease-out' : undefined }}>
+                  📊 Graph
+                </button>
+              )}
+              {isMathMode && (
+                <button onClick={() => { triggerPulse('mathviz'); setShowMathViz(v => !v); }}
+                  style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #b388ff66', backgroundColor: showMathViz ? 'rgba(179,136,255,0.15)' : 'transparent', color: '#b388ff', cursor: 'pointer', fontSize: '12px', animation: pulsingBtn === 'mathviz' ? 'greenPulse 0.6s ease-out' : undefined }}>
+                  🧮 Math Tools
+                </button>
+              )}
+              {tutorFeedback?.solved && (
+                <button onClick={() => { triggerPulse('next'); handleTutorGenerate(); }}
+                  style={{ padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '12px', animation: pulsingBtn === 'next' ? 'greenPulse 0.6s ease-out' : undefined }}>
+                  Next Problem →
+                </button>
+              )}
+            </div>
+          )}
 
           {/* ── Gamification Status Bar ─────────────────────────────────────── */}
           {gamifProfile && (
@@ -2680,52 +2831,7 @@ return (
                 </div>
               )}
 
-              {/* Hint / Next / Steps buttons */}
-              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                <button onClick={() => { triggerPulse('hint'); handleTutorHint(); }} disabled={tutorLoading || (tutorFeedback?.solved ?? false)}
-                  style={{
-                    padding: '8px 16px', borderRadius: '8px', border: '1px solid #5533ff', backgroundColor: 'transparent', color: '#5533ff', cursor: 'pointer', fontSize: '12px',
-                    animation: pulsingBtn === 'hint' ? 'greenPulse 0.6s ease-out' : undefined,
-                  }}>
-                  Hint
-                </button>
-                {isMathMode && (
-                  <button onClick={() => { triggerPulse('steps'); handleMathSteps(); }}
-                    style={{
-                      padding: '8px 16px', borderRadius: '8px', border: '1px solid #00cc8866', backgroundColor: 'transparent', color: '#00cc88', cursor: 'pointer', fontSize: '12px',
-                      animation: pulsingBtn === 'steps' ? 'greenPulse 0.6s ease-out' : undefined,
-                    }}>
-                    Step-by-Step
-                  </button>
-                )}
-                {isMathMode && (
-                  <button onClick={() => { triggerPulse('graph'); setShowMathGraph(g => { if (!g) handleMathGraph(); return !g; }); }}
-                    style={{
-                      padding: '8px 16px', borderRadius: '8px', border: '1px solid #ff990066', backgroundColor: showMathGraph ? 'rgba(255,153,0,0.15)' : 'transparent', color: '#ff9900', cursor: 'pointer', fontSize: '12px',
-                      animation: pulsingBtn === 'graph' ? 'greenPulse 0.6s ease-out' : undefined,
-                    }}>
-                    Graph
-                  </button>
-                )}
-                {isMathMode && (
-                  <button onClick={() => { triggerPulse('mathviz'); setShowMathViz(v => !v); }}
-                    style={{
-                      padding: '8px 16px', borderRadius: '8px', border: '1px solid #b388ff66', backgroundColor: showMathViz ? 'rgba(179,136,255,0.15)' : 'transparent', color: '#b388ff', cursor: 'pointer', fontSize: '12px',
-                      animation: pulsingBtn === 'mathviz' ? 'greenPulse 0.6s ease-out' : undefined,
-                    }}>
-                    Math Tools
-                  </button>
-                )}
-                {tutorFeedback?.solved && (
-                  <button onClick={() => { triggerPulse('next'); handleTutorGenerate(); }}
-                    style={{
-                      padding: '8px 16px', borderRadius: '8px', border: 'none', backgroundColor: '#00cc88', color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '12px',
-                      animation: pulsingBtn === 'next' ? 'greenPulse 0.6s ease-out' : undefined,
-                    }}>
-                    Next Problem →
-                  </button>
-                )}
-              </div>
+              {/* Hint / Next / Steps buttons moved to toolbar above */}
 
               {/* Step-by-step solution display */}
               {mathSteps && mathSteps.length > 0 && (
@@ -4143,8 +4249,335 @@ return (
         </div>
       )}
 
+      {/* ── Image Generation Page ──────────────────────────────────── */}
+      {activeMode === 'imagegen' && (
+        <div style={{
+          position: 'fixed', top: '60px', left: '50%', transform: 'translateX(-50%)',
+          width: '92%', maxWidth: '1200px', bottom: '30px',
+          display: 'flex', gap: '16px', color: '#fff', zIndex: 30,
+        }}>
+          {/* Left panel: Settings */}
+          <div style={{
+            width: '300px', flexShrink: 0,
+            backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
+            border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
+            overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '14px',
+          }}>
+            <h3 style={{ margin: 0, fontSize: '15px', color: '#b388ff', display: 'flex', alignItems: 'center', gap: '8px' }}>🎨 Image Generation</h3>
+
+            {/* Model selector */}
+            <div>
+              <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>Checkpoint Model</label>
+              <select
+                value={selectedImageModel}
+                onChange={e => setSelectedImageModel(e.target.value)}
+                style={{ width: '100%', padding: '7px 10px', borderRadius: '8px', backgroundColor: '#111', color: '#fff', border: '1px solid #333', fontSize: '12px' }}
+              >
+                <option value="">Auto (first available)</option>
+                {imageModels.filter(m => m.type === 'checkpoint').map(m => (
+                  <option key={m.name} value={m.name}>{m.name} ({m.size_mb}MB)</option>
+                ))}
+              </select>
+            </div>
+
+            {/* LoRA selector */}
+            {imageModels.filter(m => m.type === 'lora').length > 0 && (
+              <div>
+                <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>LoRA Adapters</label>
+                {imageModels.filter(m => m.type === 'lora').map(m => (
+                  <label key={m.name} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#ccc', cursor: 'pointer', padding: '3px 0' }}>
+                    <input
+                      type="checkbox"
+                      checked={selectedLoras.includes(m.name)}
+                      onChange={e => {
+                        if (e.target.checked) setSelectedLoras(prev => [...prev, m.name]);
+                        else setSelectedLoras(prev => prev.filter(l => l !== m.name));
+                      }}
+                      style={{ accentColor: '#b388ff' }}
+                    />
+                    {m.name} ({m.size_mb}MB)
+                  </label>
+                ))}
+              </div>
+            )}
+
+            {/* Mode toggle */}
+            <div>
+              <label style={{ fontSize: '11px', color: '#888', marginBottom: '4px', display: 'block' }}>Mode</label>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                {(['normal', 'explicit'] as const).map(m => (
+                  <button key={m} onClick={() => setImageGenMode(m)} style={{
+                    flex: 1, padding: '6px', borderRadius: '8px', border: '1px solid',
+                    borderColor: imageGenMode === m ? '#b388ff' : '#333',
+                    backgroundColor: imageGenMode === m ? 'rgba(179,136,255,0.15)' : '#111',
+                    color: imageGenMode === m ? '#b388ff' : '#888',
+                    cursor: 'pointer', fontSize: '11px', textTransform: 'capitalize',
+                  }}>{m}</button>
+                ))}
+              </div>
+            </div>
+
+            {/* Dimensions */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Width</label>
+                <input type="number" value={imageGenWidth} onChange={e => setImageGenWidth(+e.target.value)} min={512} max={2048} step={64}
+                  style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Height</label>
+                <input type="number" value={imageGenHeight} onChange={e => setImageGenHeight(+e.target.value)} min={512} max={2048} step={64}
+                  style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+              </div>
+            </div>
+
+            {/* Steps & CFG */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>Steps ({imageGenSteps})</label>
+                <input type="range" min={10} max={80} value={imageGenSteps} onChange={e => setImageGenSteps(+e.target.value)}
+                  style={{ width: '100%', accentColor: '#b388ff' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: '11px', color: '#888' }}>CFG ({imageGenCfg.toFixed(1)})</label>
+                <input type="range" min={1} max={20} step={0.5} value={imageGenCfg} onChange={e => setImageGenCfg(+e.target.value)}
+                  style={{ width: '100%', accentColor: '#b388ff' }} />
+              </div>
+            </div>
+
+            {/* Seed */}
+            <div>
+              <label style={{ fontSize: '11px', color: '#888' }}>Seed (-1 = random)</label>
+              <input type="number" value={imageGenSeed} onChange={e => setImageGenSeed(+e.target.value)}
+                style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+            </div>
+
+            {/* Negative prompt */}
+            <div>
+              <label style={{ fontSize: '11px', color: '#888' }}>Custom Negative Prompt (optional)</label>
+              <textarea value={imageGenNegative} onChange={e => setImageGenNegative(e.target.value)} placeholder="Leave empty for smart defaults..."
+                rows={2} style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px', resize: 'vertical', fontFamily: 'inherit' }} />
+            </div>
+
+            {/* Animation toggle */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: '#ccc', cursor: 'pointer' }}>
+                <input type="checkbox" checked={imageGenAnimated} onChange={e => setImageGenAnimated(e.target.checked)} style={{ accentColor: '#b388ff' }} />
+                Animated GIF
+              </label>
+              {imageGenAnimated && (
+                <input type="number" value={imageGenFrames} onChange={e => setImageGenFrames(+e.target.value)} min={2} max={24}
+                  title="Number of frames"
+                  style={{ width: '50px', padding: '4px', borderRadius: '4px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px' }} />
+              )}
+            </div>
+
+            {/* Model management */}
+            <div style={{ borderTop: '1px solid #222', paddingTop: '12px', marginTop: '4px' }}>
+              <h4 style={{ margin: '0 0 8px', fontSize: '12px', color: '#888' }}>Model Management</h4>
+              {imageModels.map(m => (
+                <div key={m.path} style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  padding: '4px 0', fontSize: '11px', color: '#ccc',
+                }}>
+                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {m.type === 'lora' ? '🔗 ' : '🧠 '}{m.name}
+                    <span style={{ color: '#666', marginLeft: '4px' }}>({m.size_mb}MB)</span>
+                  </span>
+                  <button onClick={() => deleteImageModel(m.path)}
+                    title="Delete model"
+                    style={{ background: 'none', border: 'none', color: '#ff4444', cursor: 'pointer', fontSize: '12px', padding: '2px 6px' }}>🗑</button>
+                </div>
+              ))}
+              {imageModels.length === 0 && <div style={{ fontSize: '11px', color: '#555' }}>No models found in models/ folder</div>}
+              <div style={{ fontSize: '10px', color: '#555', marginTop: '6px' }}>
+                Drop .safetensors files into models/ folder. LoRAs go in models/loras/
+              </div>
+            </div>
+          </div>
+
+          {/* Center panel: Prompt + Result */}
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', minWidth: 0 }}>
+            {/* Prompt input */}
+            <div style={{
+              backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
+              border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
+              padding: '14px', display: 'flex', gap: '10px', alignItems: 'flex-start',
+            }}>
+              <textarea
+                value={imageGenPrompt}
+                onChange={e => setImageGenPrompt(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleImageGenerate(); } }}
+                placeholder="Describe what to generate... (supports long prompts, no 77-token limit)"
+                rows={3}
+                style={{
+                  flex: 1, padding: '10px 14px', borderRadius: '10px', border: '1px solid #333',
+                  backgroundColor: '#0a0a0a', color: '#eee', fontSize: '14px', outline: 'none',
+                  resize: 'vertical', fontFamily: 'inherit', lineHeight: '1.5',
+                }}
+              />
+              <button
+                disabled={!imageGenPrompt.trim() || imageGenLoading}
+                onClick={handleImageGenerate}
+                style={{
+                  padding: '12px 24px', borderRadius: '10px', border: 'none',
+                  backgroundColor: imageGenLoading ? '#333' : '#7c4dff', color: '#fff',
+                  cursor: imageGenLoading ? 'wait' : 'pointer', fontSize: '14px', fontWeight: 'bold',
+                  whiteSpace: 'nowrap', transition: 'background 0.2s',
+                }}
+              >
+                {imageGenLoading ? '⏳ Generating...' : imageGenAnimated ? '🎬 Animate' : '🎨 Generate'}
+              </button>
+            </div>
+
+            {/* Result area */}
+            <div style={{
+              flex: 1, backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
+              border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
+              overflow: 'hidden', display: 'flex', flexDirection: 'column',
+            }}>
+              {imageGenLoading && (
+                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '12px' }}>
+                  <div style={{ fontSize: '32px', animation: 'spin 2s linear infinite' }}>🎨</div>
+                  <div style={{ color: '#b388ff', fontSize: '14px' }}>
+                    {imageGenAnimated ? `Generating ${imageGenFrames} frames...` : 'Generating image...'}
+                  </div>
+                  <div style={{ color: '#555', fontSize: '11px' }}>This may take 10-30 seconds depending on settings</div>
+                </div>
+              )}
+
+              {!imageGenLoading && imageGenResult && (
+                imageGenResult.startsWith('Error') ? (
+                  <div style={{ padding: '20px', color: '#ff6666', fontSize: '14px' }}>{imageGenResult}</div>
+                ) : imageGenResult.startsWith('blob:') ? (
+                  <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px', position: 'relative' }}>
+                    <img
+                      src={imageGenResult}
+                      alt="Generated"
+                      onClick={() => { setLightboxUrl(imageGenResult); setLightboxZoom(1); setLightboxPan({ x: 0, y: 0 }); }}
+                      style={{ maxWidth: '100%', maxHeight: '100%', borderRadius: '8px', cursor: 'zoom-in', objectFit: 'contain' }}
+                    />
+                  </div>
+                ) : (
+                  <div style={{ padding: '20px', color: '#ccc', fontSize: '13px', whiteSpace: 'pre-wrap' }}>{imageGenResult}</div>
+                )
+              )}
+
+              {!imageGenLoading && !imageGenResult && (
+                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#444', fontSize: '14px' }}>
+                  Enter a prompt and press Generate
+                </div>
+              )}
+            </div>
+
+            {/* Prompt analysis + feedback */}
+            {imageGenMeta && (
+              <div style={{
+                backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
+                border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
+                padding: '14px', display: 'flex', flexDirection: 'column', gap: '10px',
+              }}>
+                {/* Prompt analysis */}
+                <div>
+                  <h4 style={{ margin: '0 0 6px', fontSize: '12px', color: '#b388ff' }}>Prompt Analysis</h4>
+                  <div style={{ fontSize: '11px', color: '#888', marginBottom: '4px' }}>
+                    Seed: <span style={{ color: '#fff', fontFamily: 'monospace' }}>{imageGenMeta.seed}</span>
+                    {imageGenMeta.settings && <> | Model: <span style={{ color: '#fff' }}>{imageGenMeta.settings.model}</span></>}
+                  </div>
+                  {imageGenMeta.prompt_analysis?.estimated_focus && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                      {imageGenMeta.prompt_analysis.estimated_focus.map((f: any, i: number) => (
+                        <span key={i} style={{
+                          padding: '2px 8px', borderRadius: '12px', fontSize: '10px',
+                          backgroundColor: f.priority === 'high' ? 'rgba(0,204,136,0.2)' : f.priority === 'medium' ? 'rgba(255,153,0,0.15)' : 'rgba(100,100,100,0.15)',
+                          color: f.priority === 'high' ? '#00cc88' : f.priority === 'medium' ? '#ff9900' : '#666',
+                          border: '1px solid',
+                          borderColor: f.priority === 'high' ? 'rgba(0,204,136,0.3)' : f.priority === 'medium' ? 'rgba(255,153,0,0.2)' : 'rgba(100,100,100,0.2)',
+                        }}>
+                          {f.text}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Full prompt used */}
+                <details style={{ fontSize: '11px', color: '#888' }}>
+                  <summary style={{ cursor: 'pointer', color: '#666' }}>Full prompt sent to model</summary>
+                  <pre style={{ marginTop: '4px', padding: '8px', backgroundColor: '#0a0a0a', borderRadius: '6px', whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontSize: '10px', color: '#aaa', maxHeight: '120px', overflowY: 'auto' }}>
+                    {imageGenMeta.prompt_used}
+                  </pre>
+                </details>
+
+                {/* Feedback input */}
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <input
+                    type="text"
+                    value={imageGenFeedback}
+                    onChange={e => setImageGenFeedback(e.target.value)}
+                    placeholder="What went wrong? (e.g., bad hands, wrong position, wrong clothing...)"
+                    style={{ flex: 1, padding: '7px 10px', borderRadius: '8px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px', outline: 'none' }}
+                  />
+                  <button
+                    disabled={!imageGenFeedback.trim()}
+                    onClick={() => submitImageFeedback(imageGenHistory.length - 1, imageGenFeedback)}
+                    style={{
+                      padding: '7px 14px', borderRadius: '8px', border: 'none',
+                      backgroundColor: imageGenFeedback.trim() ? '#ff9900' : '#333',
+                      color: '#fff', cursor: imageGenFeedback.trim() ? 'pointer' : 'not-allowed',
+                      fontSize: '12px', whiteSpace: 'nowrap',
+                    }}
+                  >
+                    Submit Feedback
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Right panel: History */}
+          <div style={{
+            width: '250px', flexShrink: 0,
+            backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
+            border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
+            overflowY: 'auto', padding: '12px', display: 'flex', flexDirection: 'column', gap: '8px',
+          }}>
+            <h4 style={{ margin: 0, fontSize: '13px', color: '#888', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              Recent Generations
+              <button onClick={fetchImageHistory} style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '12px' }}>⟳</button>
+            </h4>
+            {imageGenHistory.length === 0 && <div style={{ color: '#444', fontSize: '11px', textAlign: 'center', padding: '20px 0' }}>No history yet</div>}
+            {imageGenHistory.slice().reverse().map((h, i) => (
+              <div key={i} style={{
+                padding: '8px', borderRadius: '8px', backgroundColor: '#111',
+                border: '1px solid #222', fontSize: '11px', cursor: 'pointer',
+              }}
+                onClick={() => {
+                  if (h.result_path) {
+                    setImageGenPrompt(h.prompt?.replace(/^(masterpiece, best quality, |masterpiece, best quality, amazing quality, )/, '') || '');
+                  }
+                }}
+              >
+                <div style={{ color: '#ccc', marginBottom: '4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {h.prompt?.slice(0, 60) || 'Unknown'}
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#555', fontSize: '10px' }}>
+                  <span>{h.settings?.model || '?'}</span>
+                  <span>seed:{h.settings?.seed}</span>
+                </div>
+                {h.feedback && (
+                  <div style={{ marginTop: '4px', padding: '3px 6px', borderRadius: '4px', backgroundColor: 'rgba(255,153,0,0.1)', color: '#ff9900', fontSize: '10px' }}>
+                    📝 {h.feedback.slice(0, 40)}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Chat history — infinite scroll */}
-      {activeMode !== 'tutor' && (
+      {activeMode !== 'tutor' && activeMode !== 'imagegen' && (
         <div
         ref={chatContainerRef}
         onScroll={(e) => {
@@ -4733,26 +5166,26 @@ return (
         </div>
         <button
           onClick={() => {
-            const modes: ActiveMode[] = ['query', 'agent', 'tutor'];
+            const modes: ActiveMode[] = ['query', 'agent', 'tutor', 'imagegen'];
             const idx = modes.indexOf(activeMode);
             setActiveMode(modes[(idx + 1) % modes.length]);
           }}
           disabled={mode !== 'idle'}
           style={{
             padding: '10px 14px', borderRadius: '12px', border: '2px solid',
-            borderColor: activeMode === 'agent' ? '#ff00ff' : activeMode === 'tutor' ? '#00cc88' : '#5533ff',
-            backgroundColor: activeMode === 'agent' ? 'rgba(255,0,255,0.1)' : activeMode === 'tutor' ? 'rgba(0,204,136,0.1)' : 'rgba(85,51,255,0.1)',
-            color: activeMode === 'agent' ? '#ff00ff' : activeMode === 'tutor' ? '#00cc88' : '#5533ff',
+            borderColor: activeMode === 'agent' ? '#ff00ff' : activeMode === 'tutor' ? '#00cc88' : activeMode === 'imagegen' ? '#b388ff' : '#5533ff',
+            backgroundColor: activeMode === 'agent' ? 'rgba(255,0,255,0.1)' : activeMode === 'tutor' ? 'rgba(0,204,136,0.1)' : activeMode === 'imagegen' ? 'rgba(179,136,255,0.1)' : 'rgba(85,51,255,0.1)',
+            color: activeMode === 'agent' ? '#ff00ff' : activeMode === 'tutor' ? '#00cc88' : activeMode === 'imagegen' ? '#b388ff' : '#5533ff',
             cursor: 'pointer', fontSize: '12px', fontWeight: 'bold', textTransform: 'uppercase', transition: 'all 0.3s',
             backdropFilter: 'blur(10px)',
           }}
         >
-          {activeMode === 'agent' ? '🤖 Agent' : activeMode === 'tutor' ? '📚 Tutor' : '🔍 Query'}
+          {activeMode === 'agent' ? '🤖 Agent' : activeMode === 'tutor' ? '📚 Tutor' : activeMode === 'imagegen' ? '🎨 ImageGen' : '🔍 Query'}
         </button>
       </div>
 
       {/* Input bar fixed at bottom center */}
-      {activeMode !== 'tutor' && (
+      {activeMode !== 'tutor' && activeMode !== 'imagegen' && (
       <form
         onSubmit={handleSubmit}
         style={{
@@ -4852,220 +5285,6 @@ return (
             <option value="twomode">🎯 Two-Mode</option>
           </select>
         )}
-        {/* Voice input button */}
-        <button
-          type="button"
-          onClick={() => {
-            if (isRecording) {
-              stopVoiceRecording();
-            } else {
-              startVoiceRecording();
-            }
-          }}
-          disabled={mode !== 'idle' || voiceLoading}
-          title="Click to start/stop voice recording (Whisper transcription)"
-          style={{
-            padding: '10px 12px',
-            borderRadius: '12px',
-            border: '2px solid',
-            borderColor: isRecording ? '#ff4444' : voiceLoading ? '#ff9900' : '#444',
-            backgroundColor: isRecording ? 'rgba(255,68,68,0.2)' : voiceLoading ? 'rgba(255,153,0,0.15)' : '#111',
-            color: isRecording ? '#ff4444' : voiceLoading ? '#ff9900' : '#888',
-            cursor: mode !== 'idle' ? 'not-allowed' : 'pointer',
-            fontSize: '16px',
-            transition: 'all 0.15s',
-            animation: isRecording ? 'pulse 0.8s infinite' : 'none',
-          }}
-        >
-          {voiceLoading ? '⏳' : isRecording ? '⏹' : '🎤'}
-        </button>
-
-        {/* TTS — read last AI message aloud */}
-        <button
-          type="button"
-            onClick={async () => {
-              const lastAi = [...messages].reverse().find(m => m.role === 'ai');
-              if (!lastAi) return;
-              setTtsLoading(true);
-              try {
-                const res = await fetch('http://localhost:8000/voice/tts', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ text: lastAi.text.slice(0, 2000) }),
-                });
-
-                console.log('[TTS] status:', res.status);
-                console.log('[TTS] content-type:', res.headers.get('content-type'));
-
-                if (!res.ok) {
-                  console.error('[TTS] backend error:', await res.text());
-                  return;
-                }
-
-                const contentType = res.headers.get('content-type') ?? '';
-                if (!contentType.includes('audio')) {
-                  console.error('[TTS] wrong content-type, body:', await res.text());
-                  return;
-                }
-
-                const blob = await res.blob();
-                console.log('[TTS] blob size:', blob.size, 'type:', blob.type);
-
-                if (blob.size < 1000) {
-                  console.error('[TTS] blob too small, likely an error response');
-                  return;
-                }
-
-                if (ttsAudioRef.current) {
-                  ttsAudioRef.current.pause();
-                  URL.revokeObjectURL(ttsAudioRef.current.src);
-                }
-
-                const url = URL.createObjectURL(blob);
-                const audio = new Audio(url);
-                ttsAudioRef.current = audio;
-
-                try {
-                  await audio.play();
-                } catch (playErr) {
-                  console.error('[TTS] audio.play() failed:', playErr);
-                }
-
-              } catch (err) {
-                console.error('[TTS] fetch failed:', err);
-              } finally {
-                setTtsLoading(false);
-              }
-            }}
-          disabled={ttsLoading || messages.filter(m => m.role === 'ai').length === 0}
-          title="Read last AI response aloud (Kokoro TTS)"
-          style={{
-            padding: '10px 12px',
-            borderRadius: '12px',
-            border: '2px solid',
-            borderColor: ttsLoading ? '#ff9900' : '#444',
-            backgroundColor: ttsLoading ? 'rgba(255,153,0,0.15)' : '#111',
-            color: ttsLoading ? '#ff9900' : '#888',
-            cursor: ttsLoading ? 'wait' : 'pointer',
-            fontSize: '16px',
-            transition: 'all 0.15s',
-          }}
-        >
-          {ttsLoading ? '⏳' : '🔊'}
-        </button>
-
-        {/* Image Generation toggle */}
-        <button
-          type="button"
-          onClick={() => setShowImageGenDialog(d => !d)}
-          title="Generate image from text prompt"
-          style={{
-            padding: '10px 12px',
-            borderRadius: '12px',
-            border: '2px solid',
-            borderColor: showImageGenDialog ? '#b388ff' : '#444',
-            backgroundColor: showImageGenDialog ? 'rgba(179,136,255,0.15)' : '#111',
-            color: showImageGenDialog ? '#b388ff' : '#888',
-            cursor: 'pointer',
-            fontSize: '16px',
-            transition: 'all 0.15s',
-          }}
-        >
-          🎨
-        </button>
-
-        {/* Process log toggle — next to mic */}
-        <button
-          type="button"
-          onClick={() => setShowProcessPanel(p => !p)}
-          title="Toggle backend process logs"
-          style={{
-            padding: '10px 12px',
-            borderRadius: '12px',
-            border: '2px solid',
-            borderColor: showProcessPanel ? '#ff9900' : '#444',
-            backgroundColor: showProcessPanel ? 'rgba(255,153,0,0.15)' : '#111',
-            color: showProcessPanel ? '#ff9900' : '#888',
-            cursor: 'pointer',
-            fontSize: '14px',
-            transition: 'all 0.15s',
-            position: 'relative',
-          }}
-        >
-          ⚙{processLogs.length > 0 && <span style={{ position: 'absolute', top: '-4px', right: '-4px', backgroundColor: '#ff9900', color: '#000', borderRadius: '50%', width: '16px', height: '16px', fontSize: '9px', fontWeight: 'bold', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{processLogs.length > 99 ? '99+' : processLogs.length}</span>}
-        </button>
-
-        {/* OCR capture button with dropdown */}
-        <div style={{ position: 'relative' }}>
-          <input
-            id="ocr-image-picker"
-            type="file"
-            accept="image/*"
-            style={{ display: 'none' }}
-            onChange={async (e) => {
-              const f = (e.target as HTMLInputElement).files?.[0];
-              if (f) await handleOCRCapture(f);
-              (document.getElementById('ocr-image-picker') as HTMLInputElement).value = '';
-            }}
-          />
-          <button
-            type="button"
-            onClick={() => setShowOcrMenu(p => !p)}
-            disabled={mode !== 'idle' || ocrLoading}
-            title="OCR: capture screenshot or upload image → extract text"
-            style={{
-              padding: '10px 12px',
-              borderRadius: '12px',
-              border: '2px solid',
-              borderColor: ocrLoading ? '#ff9900' : showOcrMenu ? '#22bbff' : '#444',
-              backgroundColor: ocrLoading ? 'rgba(255,153,0,0.15)' : showOcrMenu ? 'rgba(34,187,255,0.15)' : '#111',
-              color: ocrLoading ? '#ff9900' : '#888',
-              cursor: mode !== 'idle' || ocrLoading ? 'not-allowed' : 'pointer',
-              fontSize: '16px',
-              transition: 'all 0.15s',
-            }}
-          >
-            {ocrLoading ? '⏳' : '📷'}
-          </button>
-          {showOcrMenu && (
-            <div style={{
-              position: 'absolute', bottom: '48px', left: '50%', transform: 'translateX(-50%)',
-              backgroundColor: 'rgba(20,20,30,0.97)', border: '1px solid rgba(85,51,255,0.4)',
-              borderRadius: '10px', padding: '6px', display: 'flex', flexDirection: 'column', gap: '4px',
-              minWidth: '160px', boxShadow: '0 8px 24px rgba(0,0,0,0.6)', zIndex: 100,
-            }}>
-              <button
-                type="button"
-                onClick={handleScreenCapture}
-                style={{
-                  padding: '8px 12px', borderRadius: '6px', border: 'none',
-                  backgroundColor: 'transparent', color: '#fff', cursor: 'pointer',
-                  fontSize: '13px', textAlign: 'left',
-                }}
-                onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'rgba(85,51,255,0.2)')}
-                onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
-              >
-                🖥 Capture Screen
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setShowOcrMenu(false);
-                  (document.getElementById('ocr-image-picker') as HTMLInputElement)?.click();
-                }}
-                style={{
-                  padding: '8px 12px', borderRadius: '6px', border: 'none',
-                  backgroundColor: 'transparent', color: '#fff', cursor: 'pointer',
-                  fontSize: '13px', textAlign: 'left',
-                }}
-                onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'rgba(85,51,255,0.2)')}
-                onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
-              >
-                📁 Upload Image
-              </button>
-            </div>
-          )}
-        </div>
 
         {/* Pending image indicator */}
         {pendingImageBlob && (
@@ -5080,7 +5299,7 @@ return (
           </div>
         )}
 
-        {/* Persistent OCR context indicator — shows when image context is active for follow-up questions */}
+        {/* Persistent OCR context indicator */}
         {!pendingImageBlob && ocrContext && (
           <div style={{
             padding: '4px 10px', borderRadius: '12px', backgroundColor: 'rgba(0,204,136,0.15)',
@@ -5157,132 +5376,206 @@ return (
       </form>
       )}
 
-      {/* ── Image Generation Dialog ─────────────────────────────────── */}
-      {showImageGenDialog && (
-        <div style={{
-          position: 'fixed', bottom: '80px', right: '16px', zIndex: 56,
-          width: '420px', maxWidth: '90vw', borderRadius: '12px', overflow: 'hidden',
-          backgroundColor: 'rgba(0, 5, 10, 0.95)', backdropFilter: 'blur(20px)',
-          border: '1px solid rgba(179,136,255,0.3)', boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
-          display: 'flex', flexDirection: 'column',
-        }}>
-          {/* Header */}
-          <div style={{
-            padding: '10px 14px', borderBottom: '1px solid #222',
-            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-          }}>
-            <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#b388ff' }}>🎨 Image Generation</span>
-            <button
-              onClick={() => setShowImageGenDialog(false)}
-              style={{
-                background: 'none', border: '1px solid #33333366', borderRadius: '4px',
-                color: '#666', cursor: 'pointer', padding: '2px 8px', fontSize: '10px',
-              }}
-            >✕</button>
-          </div>
+      {/* ── Utility buttons — fixed bottom-left ────────────────────── */}
+      {activeMode !== 'tutor' && activeMode !== 'imagegen' && (
+      <div style={{
+        position: 'fixed', bottom: '24px', left: '24px', zIndex: 45,
+        display: 'flex', gap: '6px', alignItems: 'center',
+        backgroundColor: 'rgba(10,10,15,0.85)', backdropFilter: 'blur(12px)',
+        borderRadius: '14px', padding: '6px 10px',
+        border: '1px solid rgba(255,255,255,0.08)',
+      }}>
+        {/* Voice input button */}
+        <button
+          type="button"
+          onClick={() => {
+            if (isRecording) {
+              stopVoiceRecording();
+            } else {
+              startVoiceRecording();
+            }
+          }}
+          disabled={mode !== 'idle' || voiceLoading}
+          title="Click to start/stop voice recording (Whisper transcription)"
+          style={{
+            padding: '8px 10px',
+            borderRadius: '10px',
+            border: '1px solid',
+            borderColor: isRecording ? '#ff4444' : voiceLoading ? '#ff9900' : '#333',
+            backgroundColor: isRecording ? 'rgba(255,68,68,0.2)' : voiceLoading ? 'rgba(255,153,0,0.15)' : 'transparent',
+            color: isRecording ? '#ff4444' : voiceLoading ? '#ff9900' : '#888',
+            cursor: mode !== 'idle' ? 'not-allowed' : 'pointer',
+            fontSize: '15px',
+            transition: 'all 0.15s',
+            animation: isRecording ? 'pulse 0.8s infinite' : 'none',
+          }}
+        >
+          {voiceLoading ? '⏳' : isRecording ? '⏹' : '🎤'}
+        </button>
 
-          {/* Body */}
-          <div style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+        {/* TTS — read last AI message aloud */}
+        <button
+          type="button"
+            onClick={async () => {
+              const lastAi = [...messages].reverse().find(m => m.role === 'ai');
+              if (!lastAi) return;
+              setTtsLoading(true);
+              try {
+                const res = await fetch('http://localhost:8000/voice/tts', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ text: lastAi.text.slice(0, 2000) }),
+                });
 
-            {/* Input row */}
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <input
-                type="text"
-                value={imageGenPrompt}
-                onChange={e => setImageGenPrompt(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    handleImageGenerate();
-                  }
-                }}
-                placeholder="Describe what to generate..."
-                style={{
-                  flex: 1, padding: '8px 12px', borderRadius: '8px', border: '1px solid #333',
-                  backgroundColor: '#0a0a0a', color: '#eee', fontSize: '13px', outline: 'none',
-                }}
-              />
+                if (!res.ok) {
+                  console.error('[TTS] backend error:', await res.text());
+                  return;
+                }
+
+                const contentType = res.headers.get('content-type') ?? '';
+                if (!contentType.includes('audio')) {
+                  console.error('[TTS] wrong content-type, body:', await res.text());
+                  return;
+                }
+
+                const blob = await res.blob();
+
+                if (blob.size < 1000) {
+                  console.error('[TTS] blob too small, likely an error response');
+                  return;
+                }
+
+                if (ttsAudioRef.current) {
+                  ttsAudioRef.current.pause();
+                  URL.revokeObjectURL(ttsAudioRef.current.src);
+                }
+
+                const url = URL.createObjectURL(blob);
+                const audio = new Audio(url);
+                ttsAudioRef.current = audio;
+
+                try {
+                  await audio.play();
+                } catch (playErr) {
+                  console.error('[TTS] audio.play() failed:', playErr);
+                }
+
+              } catch (err) {
+                console.error('[TTS] fetch failed:', err);
+              } finally {
+                setTtsLoading(false);
+              }
+            }}
+          disabled={ttsLoading || messages.filter(m => m.role === 'ai').length === 0}
+          title="Read last AI response aloud (Kokoro TTS)"
+          style={{
+            padding: '8px 10px',
+            borderRadius: '10px',
+            border: '1px solid',
+            borderColor: ttsLoading ? '#ff9900' : '#333',
+            backgroundColor: ttsLoading ? 'rgba(255,153,0,0.15)' : 'transparent',
+            color: ttsLoading ? '#ff9900' : '#888',
+            cursor: ttsLoading ? 'wait' : 'pointer',
+            fontSize: '15px',
+            transition: 'all 0.15s',
+          }}
+        >
+          {ttsLoading ? '⏳' : '🔊'}
+        </button>
+
+        {/* OCR capture button with dropdown */}
+        <div style={{ position: 'relative' }}>
+          <input
+            id="ocr-image-picker"
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={async (e) => {
+              const f = (e.target as HTMLInputElement).files?.[0];
+              if (f) await handleOCRCapture(f);
+              (document.getElementById('ocr-image-picker') as HTMLInputElement).value = '';
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => setShowOcrMenu(p => !p)}
+            disabled={mode !== 'idle' || ocrLoading}
+            title="OCR: capture screenshot or upload image → extract text"
+            style={{
+              padding: '8px 10px',
+              borderRadius: '10px',
+              border: '1px solid',
+              borderColor: ocrLoading ? '#ff9900' : showOcrMenu ? '#22bbff' : '#333',
+              backgroundColor: ocrLoading ? 'rgba(255,153,0,0.15)' : showOcrMenu ? 'rgba(34,187,255,0.15)' : 'transparent',
+              color: ocrLoading ? '#ff9900' : '#888',
+              cursor: mode !== 'idle' || ocrLoading ? 'not-allowed' : 'pointer',
+              fontSize: '15px',
+              transition: 'all 0.15s',
+            }}
+          >
+            {ocrLoading ? '⏳' : '📷'}
+          </button>
+          {showOcrMenu && (
+            <div style={{
+              position: 'absolute', bottom: '48px', left: '50%', transform: 'translateX(-50%)',
+              backgroundColor: 'rgba(20,20,30,0.97)', border: '1px solid rgba(85,51,255,0.4)',
+              borderRadius: '10px', padding: '6px', display: 'flex', flexDirection: 'column', gap: '4px',
+              minWidth: '160px', boxShadow: '0 8px 24px rgba(0,0,0,0.6)', zIndex: 100,
+            }}>
               <button
-                disabled={!imageGenPrompt.trim() || imageGenLoading}
-                onClick={handleImageGenerate}
+                type="button"
+                onClick={handleScreenCapture}
                 style={{
-                  padding: '8px 16px', borderRadius: '8px', border: 'none',
-                  backgroundColor: imageGenLoading ? '#333' : '#7c4dff', color: '#fff',
-                  cursor: imageGenLoading ? 'wait' : 'pointer', fontSize: '13px', fontWeight: 'bold',
+                  padding: '8px 12px', borderRadius: '6px', border: 'none',
+                  backgroundColor: 'transparent', color: '#fff', cursor: 'pointer',
+                  fontSize: '13px', textAlign: 'left',
                 }}
+                onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'rgba(85,51,255,0.2)')}
+                onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
               >
-                {imageGenLoading ? '⏳' : 'Generate'}
+                🖥 Capture Screen
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOcrMenu(false);
+                  (document.getElementById('ocr-image-picker') as HTMLInputElement)?.click();
+                }}
+                style={{
+                  padding: '8px 12px', borderRadius: '6px', border: 'none',
+                  backgroundColor: 'transparent', color: '#fff', cursor: 'pointer',
+                  fontSize: '13px', textAlign: 'left',
+                }}
+                onMouseEnter={e => (e.currentTarget.style.backgroundColor = 'rgba(85,51,255,0.2)')}
+                onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+              >
+                📁 Upload Image
               </button>
             </div>
-
-            {/* Loading state */}
-            {imageGenLoading && (
-              <div style={{ color: '#b388ff', fontSize: '12px', textAlign: 'center', padding: '20px 0' }}>
-                ⏳ Generating image, this takes ~10 seconds...
-              </div>
-            )}
-
-            {/* Result — image or description or error */}
-            {imageGenResult && (
-              imageGenResult.startsWith('Error') ? (
-                <div style={{
-                  padding: '10px 12px', borderRadius: '8px', backgroundColor: '#111',
-                  border: '1px solid #331111', fontSize: '13px', color: '#ff6666',
-                }}>
-                  {imageGenResult}
-                </div>
-              ) : imageGenResult.startsWith('blob:') ? (
-                <div style={{ borderRadius: '8px', overflow: 'hidden', border: '1px solid #333' }}>
-                  <img
-                    src={imageGenResult}
-                    alt="Generated image"
-                    onClick={() => setLightboxUrl(imageGenResult)}
-                    style={{ width: '100%', display: 'block', cursor: 'zoom-in' }}
-                  />
-                </div>
-              ) : (
-                <div style={{
-                  padding: '10px 12px', borderRadius: '8px', backgroundColor: '#111',
-                  border: '1px solid #222', maxHeight: '250px', overflowY: 'auto',
-                  fontSize: '13px', lineHeight: '1.6', color: '#ccc', whiteSpace: 'pre-wrap',
-                }}>
-                  {imageGenResult}
-                </div>
-              )
-            )}
-
-            {/* ── Lightbox ─────────────────────────────────── */}
-            {lightboxUrl && (
-              <div
-                onClick={() => setLightboxUrl(null)}
-                style={{
-                  position: 'fixed', inset: 0, zIndex: 999,
-                  backgroundColor: 'rgba(0,0,0,0.85)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  cursor: 'zoom-out',
-                }}
-              >
-                <img
-                  src={lightboxUrl}
-                  alt="Enlarged"
-                  style={{
-                    maxWidth: '90vw', maxHeight: '90vh',
-                    borderRadius: '10px',
-                    border: '1px solid rgba(179,136,255,0.4)',
-                    boxShadow: '0 0 60px rgba(0,0,0,0.9)',
-                  }}
-                />
-              </div>
-            )}
-            {/* Empty state */}
-            {!imageGenResult && !imageGenLoading && (
-              <div style={{ color: '#555', fontSize: '12px', textAlign: 'center', padding: '20px 0' }}>
-                Enter a prompt and press Generate or Enter
-              </div>
-            )}
-
-          </div>
+          )}
         </div>
+
+        {/* Process log toggle */}
+        <button
+          type="button"
+          onClick={() => setShowProcessPanel(p => !p)}
+          title="Toggle backend process logs"
+          style={{
+            padding: '8px 10px',
+            borderRadius: '10px',
+            border: '1px solid',
+            borderColor: showProcessPanel ? '#ff9900' : '#333',
+            backgroundColor: showProcessPanel ? 'rgba(255,153,0,0.15)' : 'transparent',
+            color: showProcessPanel ? '#ff9900' : '#888',
+            cursor: 'pointer',
+            fontSize: '13px',
+            transition: 'all 0.15s',
+            position: 'relative',
+          }}
+        >
+          ⚙{processLogs.length > 0 && <span style={{ position: 'absolute', top: '-4px', right: '-4px', backgroundColor: '#ff9900', color: '#000', borderRadius: '50%', width: '14px', height: '14px', fontSize: '8px', fontWeight: 'bold', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{processLogs.length > 99 ? '99+' : processLogs.length}</span>}
+        </button>
+      </div>
       )}
 
 
@@ -5354,6 +5647,85 @@ return (
           </div>
         </div>
       )}
+
+      {/* ── Global Lightbox with zoom + pan ─────────────────────────── */}
+      {lightboxUrl && (
+        <div
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setLightboxUrl(null);
+              setLightboxZoom(1);
+              setLightboxPan({ x: 0, y: 0 });
+            }
+          }}
+          onWheel={(e) => {
+            e.preventDefault();
+            setLightboxZoom(z => Math.max(0.5, Math.min(5, z + (e.deltaY < 0 ? 0.25 : -0.25))));
+          }}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 999,
+            backgroundColor: 'rgba(0,0,0,0.85)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            cursor: lightboxZoom > 1 ? 'grab' : 'zoom-in',
+            overflow: 'hidden',
+          }}
+        >
+          <img
+            src={lightboxUrl}
+            alt="Enlarged"
+            draggable={false}
+            onMouseDown={(e) => {
+              if (lightboxZoom > 1) {
+                lightboxDragging.current = true;
+                lightboxDragStart.current = { x: e.clientX - lightboxPan.x, y: e.clientY - lightboxPan.y };
+                e.preventDefault();
+              }
+            }}
+            onMouseMove={(e) => {
+              if (lightboxDragging.current) {
+                setLightboxPan({
+                  x: e.clientX - lightboxDragStart.current.x,
+                  y: e.clientY - lightboxDragStart.current.y,
+                });
+              }
+            }}
+            onMouseUp={() => { lightboxDragging.current = false; }}
+            onMouseLeave={() => { lightboxDragging.current = false; }}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (lightboxZoom <= 1) {
+                setLightboxZoom(2);
+              }
+            }}
+            style={{
+              maxWidth: '90vw', maxHeight: '90vh',
+              borderRadius: '10px',
+              border: '1px solid rgba(179,136,255,0.4)',
+              boxShadow: '0 0 60px rgba(0,0,0,0.9)',
+              transform: `scale(${lightboxZoom}) translate(${lightboxPan.x / lightboxZoom}px, ${lightboxPan.y / lightboxZoom}px)`,
+              transition: lightboxDragging.current ? 'none' : 'transform 0.15s',
+              cursor: lightboxZoom > 1 ? (lightboxDragging.current ? 'grabbing' : 'grab') : 'zoom-in',
+              userSelect: 'none',
+            }}
+          />
+          {/* Zoom controls */}
+          <div style={{
+            position: 'fixed', bottom: '20px', left: '50%', transform: 'translateX(-50%)',
+            display: 'flex', gap: '8px', alignItems: 'center', zIndex: 1000,
+            backgroundColor: 'rgba(0,0,0,0.7)', borderRadius: '20px', padding: '6px 14px',
+          }}>
+            <button onClick={(e) => { e.stopPropagation(); setLightboxZoom(z => Math.max(0.5, z - 0.25)); }}
+              style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '18px', padding: '2px 6px' }}>−</button>
+            <span style={{ color: '#aaa', fontSize: '12px', minWidth: '40px', textAlign: 'center' }}>{Math.round(lightboxZoom * 100)}%</span>
+            <button onClick={(e) => { e.stopPropagation(); setLightboxZoom(z => Math.min(5, z + 0.25)); }}
+              style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', fontSize: '18px', padding: '2px 6px' }}>+</button>
+            <button onClick={(e) => { e.stopPropagation(); setLightboxZoom(1); setLightboxPan({ x: 0, y: 0 }); }}
+              style={{ background: 'none', border: '1px solid #555', borderRadius: '6px', color: '#888', cursor: 'pointer', fontSize: '10px', padding: '3px 8px', marginLeft: '4px' }}>Reset</button>
+            <button onClick={(e) => { e.stopPropagation(); setLightboxUrl(null); setLightboxZoom(1); setLightboxPan({ x: 0, y: 0 }); }}
+              style={{ background: 'none', border: '1px solid #555', borderRadius: '6px', color: '#ff6666', cursor: 'pointer', fontSize: '10px', padding: '3px 8px' }}>Close</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -5365,6 +5737,7 @@ const styleEl = document.createElement('style');
 styleEl.textContent = `
 @keyframes pulse { 0%,100%{box-shadow:0 0 0 0 rgba(255,68,68,0.5)} 50%{box-shadow:0 0 0 6px rgba(255,68,68,0.0)} }
 @keyframes greenPulse { 0%{box-shadow:0 0 0 0 rgba(0,204,136,0.6)} 50%{box-shadow:0 0 0 8px rgba(0,204,136,0)} 100%{box-shadow:0 0 0 0 rgba(0,204,136,0)} }
+@keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
 `;
 document.head.appendChild(styleEl);
 
