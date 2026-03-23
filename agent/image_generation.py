@@ -205,6 +205,49 @@ def _load_pipeline(model_path: str) -> StableDiffusionXLPipeline:
     return pipe
 
 
+def evict_ollama_models():
+    """Evict all Ollama models from GPU so VRAM is free for image generation."""
+    import gc
+    try:
+        import httpx
+        resp = httpx.get("http://localhost:11434/api/ps", timeout=5)
+        if resp.status_code == 200:
+            running = resp.json().get("models", [])
+            for m in running:
+                name = m.get("name", "")
+                _log.info("[IMAGE GEN] Evicting Ollama model from GPU: %s", name)
+                httpx.post(
+                    "http://localhost:11434/api/generate",
+                    json={"model": name, "keep_alive": 0},
+                    timeout=10,
+                )
+    except Exception as e:
+        _log.warning("[IMAGE GEN] Could not evict Ollama models: %s", e)
+    gc.collect()
+
+
+def flush_vram():
+    """Unload ALL image-gen pipelines + evict Ollama models to fully free VRAM."""
+    import gc
+    global _active_model, _active_loras
+
+    # Unload all cached pipelines
+    keys = list(_loaded_pipelines.keys())
+    for k in keys:
+        del _loaded_pipelines[k]
+    _active_model = None
+    _active_loras = []
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _log.info("[IMAGE GEN] Flushed all SD pipelines from VRAM")
+
+    # Also evict Ollama models
+    evict_ollama_models()
+    _log.info("[IMAGE GEN] VRAM flush complete")
+
+
 def unload_model(model_path: str | None = None):
     """Free a model from GPU memory."""
     global _active_model, _active_loras
@@ -239,6 +282,40 @@ def unload_loras(pipe: StableDiffusionXLPipeline):
 
 
 # ── Long prompt handling (bypass CLIP 77-token limit) ─────────────────────
+
+
+def count_tokens(prompt: str) -> dict:
+    """Count CLIP tokens for a prompt.
+
+    Uses the actual CLIP tokenizer from the loaded pipeline if available,
+    otherwise falls back to a heuristic estimate (~1.3 tokens per word).
+    """
+    # Try to use the actual tokenizer from a loaded pipeline
+    if _active_model and _active_model in _loaded_pipelines:
+        pipe = _loaded_pipelines[_active_model]
+        if pipe.tokenizer is not None:
+            tokens = pipe.tokenizer.encode(prompt, add_special_tokens=False)
+            token_count = len(tokens)
+            return {
+                "token_count": token_count,
+                "max_single_segment": 75,
+                "segments_needed": max(1, (token_count + 74) // 75),
+                "exceeds_limit": token_count > 75,
+                "method": "clip_tokenizer",
+            }
+
+    # Fallback: heuristic estimate
+    # CLIP BPE averages ~1.3 tokens per whitespace-delimited word
+    words = prompt.split()
+    estimated = max(1, int(len(words) * 1.3))
+    return {
+        "token_count": estimated,
+        "max_single_segment": 75,
+        "segments_needed": max(1, (estimated + 74) // 75),
+        "exceeds_limit": estimated > 75,
+        "method": "estimate",
+    }
+
 
 def _chunk_prompt(prompt: str, pipe: StableDiffusionXLPipeline) -> str:
     """
@@ -511,7 +588,25 @@ def save_custom_negative(negative_text: str):
 # Helps users find the right tokens that the CLIP model weights strongly.
 _VOCAB_EXPANSION: dict[str, list[str]] = {
     # ── explicit terms ─────────────────────────────────────────────────────────
-    "nsfw": ["erotic", "libidinous", "Lascivious", "salacious", "prurient", "lewd", "raunchy", "smutty", "depraved", "indecent", "randy"],
+    "nsfw": ["erotic", "libidinous", "Lascivious", "salacious", "prurient", "lewd", "raunchy", "smutty", "depraved", "indecent", "randy", "kinky", "naughty", "filthy", "sultry", "seductive", "provocative"],
+    "blowjob": ["Wet", "sloppy", "gagging", "deepthroat", "gluttonous", "throatclenching", "saliva-drenched", "oral fixation", "mouth worship", "fellatio"],
+    "teasing": ["provocative", "suggestive", "flirtatious", "enticing", "tantalizing", "seductive tease", "playful allure", "coquettish", "sultry hint", "alluring glimpse"],
+    "breasts": ["bountiful bosom", "ample cleavage", "voluptuous chest", "curvaceous bust", "well-endowed", "firm mounds", "luscious curves", "sculpted chest", "desirable décolletage", "seductive swell"],
+    "petite breasts": ["perky small breasts", "petite bust", "delicate chest", "small but shapely breasts", "modest bosom", "cute cleavage", "dainty curves", "compact chest", "adorable bust", "subtle swell"],
+    "bouncy breasts": ["perky breasts", "springy breasts", "energetic breasts", "vibrant breasts", "lively breasts", "jiggly breasts", "shaking breasts", "wobbly breasts", "bust in motion", "animated cleavage"],
+    "big butt": ["voluptuous rear", "ample behind", "curvy buttocks", "well-defined glutes", "shapely posterior", "bountiful booty", "full-figured rear", "desirable derriere", "sculpted buttocks", "seductive backside"],
+    "small butt": ["petite rear", "delicate behind", "compact buttocks", "dainty posterior", "subtle glutes", "modest booty", "slim rear", "neat derriere", "svelte buttocks", "cute backside"],
+    "tight clothes": ["form-fitting clothes", "body-hugging outfit", "clinging attire", "snug clothing", "figure-emphasizing garments", "skin-tight apparel", "revealing outfit", "sculpting clothes", "sensual attire", "alluring tightwear"],
+    "loose clothes": ["flowing clothes", "billowy garments", "draped outfit", "relaxed fit clothing", "oversized attire", "airy clothes", "casual loosewear", "comfortably baggy clothes", "non-restrictive garments", "free-flowing outfit"],
+
+    # ── adjectives for people ────────────────────────────────────────────
+
+    "skilled": ["masterful", "expert", "proficient", "adept", "virtuoso"],
+    "devout": ["pious", "reverent", "faithful", "spiritual", "godly"],
+    "mischievous": ["playful", "naughty", "impish", "roguish", "cheeky"],
+    "passionate": ["ardent", "fervent", "intense", "fiery", "zealous"],
+    "methodical": ["precise", "deliberate", "careful", "thorough", "systematic"],
+    "soft": ["gentle", "tender", "delicate", "plush", "cushy", "velvety", "silky", "downy", "satin-like"],
     
 
     # ── Emotions & expressions ────────────────────────────────────────────
@@ -524,27 +619,28 @@ _VOCAB_EXPANSION: dict[str, list[str]] = {
     "surprised": ["astonished", "jaw-dropped", "wide-eyed shock", "startled", "dumbfounded"],
     "calm": ["serene", "tranquil", "composed", "placid", "unperturbed"],
     "confident": ["self-assured", "commanding presence", "proud stance", "dignified", "resolute"],
-    "shy": ["bashful", "timid", "demure", "coy", "flustered"],
-    "tired": ["exhausted", "fatigued", "weary", "drowsy", "heavy-lidded"],
+    "shy": ["bashful", "timid", "demure", "coy", "flustered", "nervous smile", "averted gaze", "blushing cheeks", "hesitant posture", "introverted demeanor"],
+    "tired": ["exhausted", "fatigued", "weary", "drowsy", "heavy-lidded", "sluggish", "drained", "sleepy", "worn out", "lethargic"],
     "smiling": ["grinning", "beaming smile", "radiant expression", "warm smile", "gentle smile"],
-    "crying": ["tears streaming", "sobbing", "weeping", "teary-eyed", "emotional tears"],
+    "crying": ["tears streaming", "sobbing", "weeping", "teary-eyed", "emotional tears", "heartbroken", "anguished", "despairing", "grief-stricken", "wailing"],
     "laughing": ["cackling", "hearty laughter", "giggling", "roaring with laughter", "mirthful"],
     "thinking": ["contemplative", "pensive", "deep in thought", "reflective", "pondering"],
     "pleasure": ["ecstasy", "bliss", "sensual delight", "carnal joy", "intimate pleasure", "Rapture", "orgasmic", "satisfaction", "intoxication", "euphoria"],
 
     # ── Physical descriptors ──────────────────────────────────────────────
-    "big": ["massive", "enormous", "towering", "imposing", "grand"],
-    "small": ["petite", "tiny", "diminutive", "compact", "delicate"],
-    "strong": ["muscular", "powerful", "athletic build", "toned", "robust"],
-    "cute": ["adorable", "kawaii", "charming", "sweet", "endearing"],
-    "old": ["aged", "weathered", "elderly", "ancient", "wizened"],
-    "young": ["youthful", "adolescent", "fresh-faced", "juvenile", "vibrant youth"],
-    "fat": ["plump", "voluptuous", "curvy", "rotund", "full-figured"],
-    "thin": ["slender", "lithe", "svelte", "willowy", "lean"],
-    "tall": ["towering", "statuesque", "elongated figure", "lofty", "imposing height"],
-    "short": ["petite", "compact stature", "diminutive frame", "stubby", "low to ground"],
-    "plump": ["voluptuous rear", "curvy buttocks", "well-defined glutes", "ample behind", "shapely posterior"],
-    "voluptuous": ["curvaceous", "full-figured", "ample", "buxom", "well-endowed", "zaftig", "rubenesque"],
+    "big": ["massive", "enormous", "towering", "imposing", "grand", "gigantic", "colossal", "immense", "monumental", "mammoth"],
+    "small": ["petite", "tiny", "diminutive", "compact", "delicate", "miniature", "dainty", "modest", "little", "subtle"],
+    "strong": ["muscular", "powerful", "athletic build", "toned", "robust", "sturdy", "well-built", "brawny", "sinewy", "ripped"],
+    "cute": ["adorable", "kawaii", "charming", "sweet", "endearing", "lovely", "precious", "delightful", "winsome", "heartwarming"],
+    "old": ["aged", "weathered", "elderly", "ancient", "wizened", "senescent", "venerable", "timeworn", "grizzled", "hoary"],
+    "young": ["youthful", "adolescent", "fresh-faced", "juvenile", "vibrant youth", "childlike", "innocent", "naive", "sprightly", "blooming"],
+    "fat": ["plump", "voluptuous", "curvy", "rotund", "full-figured", "chubby", "well-padded", "ample", "stout", "portly"],
+    "thin": ["slender", "lithe", "svelte", "willowy", "lean", "skinny", "slim", "spindly", "gaunt", "scrawny"],
+    "tall": ["towering", "statuesque", "elongated figure", "lofty", "imposing height", "elevated stature", "lofty frame", "soaring height", "grand height", "lofty build"],
+    "short": ["petite", "compact stature", "diminutive frame", "stubby", "low to ground", "shortened limbs", "compressed proportions", "fun-sized", "miniature build", "small stature"],
+    "plump": ["voluptuous rear", "curvy buttocks", "well-defined glutes", "ample behind", "shapely posterior", "bountiful booty", "full-figured rear", "desirable derriere", "sculpted buttocks", "seductive backside"],
+    "voluptuous": ["curvaceous", "full-figured", "ample", "buxom", "well-endowed", "zaftig", "rubenesque", "luscious", "sculpted curves", "seductive figure"],
+    
 
     # ── Lighting & atmosphere ─────────────────────────────────────────────
     "dark": ["shadowy", "dimly lit", "noir", "tenebrous", "deep shadows"],
@@ -635,7 +731,7 @@ _VOCAB_EXPANSION: dict[str, list[str]] = {
 
     # ── Clothing & accessories ────────────────────────────────────────────
     "armor": ["plate armor", "battle-worn armor", "ornate breastplate", "chainmail", "knight's regalia"],
-    "dress": ["flowing gown", "elegant dress", "ball gown", "sundress", "cocktail dress"],
+    "dress": ["flowing gown", "elegant dress", "ball gown", "sundress", "cocktail dress", "evening wear"],
     "uniform": ["military uniform", "school uniform", "formal attire", "officer's garb", "ceremonial dress"],
     "casual": ["streetwear", "relaxed outfit", "everyday clothing", "hoodie and jeans", "comfortable attire"],
     "cloak": ["billowing cape", "hooded mantle", "flowing cloak", "mysterious shroud", "traveler's cloak"],
@@ -712,6 +808,9 @@ def generate_image(
     if not Path(model_path).exists():
         return {"error": f"Model not found: {model_path}", "status": "error"}
 
+    # Free Ollama models from VRAM before loading SD pipeline
+    evict_ollama_models()
+
     # Load pipeline
     pipe = _load_pipeline(model_path)
 
@@ -775,12 +874,20 @@ def generate_image(
         output_dir_path = Path(OUTPUT_DIR)
         output_dir_path.mkdir(parents=True, exist_ok=True)
 
+        def _cancel_callback(pipe_self, step_index, timestep, callback_kwargs):
+            """Check cancel flag between diffusion steps."""
+            if _cancel_event.is_set():
+                _cancel_event.clear()
+                raise InterruptedError("Generation cancelled by user")
+            return callback_kwargs
+
         gen_kwargs = {
             "width": width,
             "height": height,
             "num_inference_steps": steps,
             "guidance_scale": guidance_scale,
             "generator": generator,
+            "callback_on_step_end": _cancel_callback,
         }
 
         if long_prompt_used and embed_kwargs:
@@ -822,6 +929,9 @@ def generate_image(
             "long_prompt": long_prompt_used,
         }
 
+    except InterruptedError:
+        _log.info("[IMAGE GEN] Generation cancelled by user")
+        return {"status": "cancelled", "message": "Generation was stopped by user"}
     except Exception as e:
         _log.error("[IMAGE GEN] Error: %s", str(e))
         return {"status": "error", "error": str(e)}
@@ -1091,6 +1201,7 @@ def generate_animated(
     full_negative = apply_feedback_learnings(styled_negative)
 
     # ── Load pipelines ────────────────────────────────────────────
+    evict_ollama_models()  # free VRAM before loading SD
     _load_pipeline(model_path)  # ensure txt2img is ready
     img2img_pipe = _load_img2img_pipeline(model_path)
     if img2img_pipe is None:
@@ -1141,6 +1252,12 @@ def generate_animated(
         t0 = time.time()
         generator = torch.Generator(device="cuda").manual_seed(frame_seed)
 
+        def _anim_cancel_cb(pipe_self, step_index, timestep, callback_kwargs):
+            if _cancel_event.is_set():
+                _cancel_event.clear()
+                raise InterruptedError("Animation cancelled by user")
+            return callback_kwargs
+
         if i == 0 and prev_image is None:
             # First frame: txt2img
             gen_kwargs = {
@@ -1151,8 +1268,13 @@ def generate_animated(
                 "num_inference_steps": steps,
                 "guidance_scale": guidance_scale,
                 "generator": generator,
+                "callback_on_step_end": _anim_cancel_cb,
             }
-            image = txt2img_pipe(**gen_kwargs).images[0]
+            try:
+                image = txt2img_pipe(**gen_kwargs).images[0]
+            except InterruptedError:
+                _log.info("[ANIM GEN] Cancelled during frame %d generation", i)
+                break
         else:
             # Subsequent frames: img2img from previous frame
             init = prev_image.resize((width, height), PILImage.LANCZOS)
@@ -1172,9 +1294,13 @@ def generate_animated(
                 "num_inference_steps": adjusted_steps,
                 "guidance_scale": guidance_scale,
                 "generator": generator,
+                "callback_on_step_end": _anim_cancel_cb,
             }
             try:
                 image = img2img_pipe(**gen_kwargs).images[0]
+            except InterruptedError:
+                _log.info("[ANIM GEN] Cancelled during frame %d generation", i)
+                break
             except Exception as e:
                 _log.error("[ANIM GEN] Frame %d failed: %s", i, e)
                 # Use previous frame as fallback
@@ -1197,8 +1323,11 @@ def generate_animated(
             "current_frame": i + 1,
             "total_frames": num_frames,
             "prompt": prompt,
+            "negative_prompt": negative_prompt or "",
             "art_style": art_style,
             "model_path": model_path,
+            "lora_paths": [str(p) for p in (lora_paths or [])],
+            "lora_weights": lora_weights or [],
             "width": width,
             "height": height,
             "steps": steps,
@@ -1398,11 +1527,32 @@ def list_animation_jobs() -> list[dict]:
                 "current_frame": ckpt.get("current_frame", 0),
                 "total_frames": ckpt.get("total_frames", 0),
                 "prompt": ckpt.get("prompt", "")[:80],
+                "negative_prompt": ckpt.get("negative_prompt", ""),
                 "art_style": ckpt.get("art_style", ""),
+                "seed": ckpt.get("seed", -1),
+                "frame_strength": ckpt.get("frame_strength", 0.35),
+                "fps": ckpt.get("fps", 12),
+                "steps": ckpt.get("steps", 26),
+                "guidance_scale": ckpt.get("guidance_scale", 7.5),
+                "width": ckpt.get("width", 512),
+                "height": ckpt.get("height", 512),
+                "storyboard": ckpt.get("storyboard", []),
+                "output_format": ckpt.get("output_format", "gif"),
             })
         except Exception:
             continue
     return jobs
+
+
+def get_animation_job(job_id: str) -> dict | None:
+    """Get full checkpoint data for a specific animation job."""
+    ckpt_file = _ANIM_SAVES_DIR / job_id / "checkpoint.json"
+    if not ckpt_file.exists():
+        return None
+    try:
+        return json.loads(ckpt_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 # ── Storyboard / Line-Drawing Preview ─────────────────────────────────────
@@ -1496,6 +1646,57 @@ def _make_storyboard_grid(paths: list[str], out_path: str, cols: int = 4):
 
 
 # ── Quick Preview (low-res → high-res two-pass) ───────────────────────────
+
+
+def generate_preview_only(
+    prompt: str,
+    width: int = 1024,
+    height: int = 1024,
+    model_path: str | None = None,
+    mode: str = "normal",
+    steps: int = 12,
+    guidance_scale: float = 7.5,
+    seed: int = -1,
+    art_style: str = "anime",
+    lora_paths: list[str] | None = None,
+    lora_weights: list[float] | None = None,
+    negative_prompt: str | None = None,
+) -> dict:
+    """Fast noisy preview at quarter resolution with minimal steps.
+
+    Returns the preview image path and the resolved seed so the user can
+    proceed to a full render with the same seed if they like the composition.
+    """
+    preview_w = max(256, width // 4)
+    preview_h = max(256, height // 4)
+    preview = generate_image(
+        prompt=prompt,
+        width=preview_w,
+        height=preview_h,
+        model_path=model_path,
+        lora_paths=lora_paths,
+        lora_weights=lora_weights,
+        mode=mode,
+        steps=max(4, min(steps, 8)),
+        guidance_scale=guidance_scale,
+        negative_prompt=negative_prompt,
+        seed=seed,
+        art_style=art_style,
+    )
+    if preview.get("status") == "error":
+        return preview
+
+    return {
+        "status": "ok",
+        "preview_path": preview.get("path"),
+        "seed": preview.get("seed"),
+        "prompt_used": preview.get("prompt_used"),
+        "negative_used": preview.get("negative_used"),
+        "settings": preview.get("settings"),
+        "is_preview": True,
+        "long_prompt": preview.get("long_prompt", False),
+    }
+
 
 def generate_with_preview(
     prompt: str,
@@ -1897,8 +2098,6 @@ def start_lora_training(
         "output_path": str(output_lora_path),
         "job_name": name,
     }
-
-    import threading
 
     def _run_training():
         global _training_state

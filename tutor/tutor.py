@@ -207,6 +207,110 @@ MATH_CURRICULUM = {
             ]},
         ],
     },
+    "geometry": {
+        "name": "Geometry",
+        "icon": "📐",
+        "chapters": [
+            {"id": "geo-basics", "name": "Euclidean Geometry", "topics": [
+                "Points, lines, and planes", "Angles and angle relationships",
+                "Parallel and perpendicular lines", "Triangle congruence (SSS, SAS, ASA, AAS)",
+                "Triangle similarity",
+            ]},
+            {"id": "geo-shapes", "name": "Polygons & Circles", "topics": [
+                "Properties of quadrilaterals", "Regular polygons and interior angles",
+                "Circle theorems (inscribed angles, tangent lines)",
+                "Arc length and sector area", "Circumscribed and inscribed circles",
+            ]},
+            {"id": "geo-coordinate", "name": "Coordinate Geometry", "topics": [
+                "Distance formula and midpoint", "Equation of a line (slope-intercept, point-slope)",
+                "Perpendicular and parallel line equations", "Circle equation in standard form",
+                "Conic sections (parabola, ellipse, hyperbola)",
+            ]},
+            {"id": "geo-transforms", "name": "Transformations & Symmetry", "topics": [
+                "Translations, rotations, reflections", "Dilations and scale factors",
+                "Composition of transformations", "Symmetry (line, rotational, point)",
+            ]},
+            {"id": "geo-solid", "name": "Solid Geometry", "topics": [
+                "Surface area of prisms, cylinders, cones, spheres",
+                "Volume formulas", "Cross-sections of solids",
+                "Cavalieri's principle",
+            ]},
+        ],
+    },
+    "number_theory": {
+        "name": "Number Theory",
+        "icon": "🔢",
+        "chapters": [
+            {"id": "nt-divisibility", "name": "Divisibility & Primes", "topics": [
+                "Divisibility rules", "Prime numbers and prime factorization",
+                "Greatest common divisor (GCD)", "Least common multiple (LCM)",
+                "Euclidean algorithm",
+            ]},
+            {"id": "nt-modular", "name": "Modular Arithmetic", "topics": [
+                "Modular arithmetic basics", "Congruences and residues",
+                "Solving linear congruences", "Chinese remainder theorem",
+                "Modular exponentiation",
+            ]},
+            {"id": "nt-advanced", "name": "Number-Theoretic Functions", "topics": [
+                "Euler's totient function", "Fermat's little theorem",
+                "Wilson's theorem", "Möbius function",
+                "Multiplicative functions",
+            ]},
+            {"id": "nt-diophantine", "name": "Diophantine Equations", "topics": [
+                "Linear Diophantine equations", "Pythagorean triples",
+                "Pell's equation", "Sum of squares",
+            ]},
+        ],
+    },
+    "diff_equations": {
+        "name": "Differential Equations",
+        "icon": "📈",
+        "chapters": [
+            {"id": "de-first", "name": "First-Order ODEs", "topics": [
+                "Separable equations", "Linear first-order equations",
+                "Exact equations", "Integrating factors",
+                "Direction fields and Euler's method",
+            ]},
+            {"id": "de-second", "name": "Second-Order ODEs", "topics": [
+                "Homogeneous equations with constant coefficients",
+                "Characteristic equation and roots",
+                "Non-homogeneous equations (undetermined coefficients)",
+                "Variation of parameters", "Reduction of order",
+            ]},
+            {"id": "de-systems", "name": "Systems of ODEs", "topics": [
+                "Systems of first-order linear ODEs", "Matrix methods for linear systems",
+                "Phase plane analysis", "Stability of equilibrium points",
+            ]},
+            {"id": "de-applications", "name": "Applications", "topics": [
+                "Population models (logistic growth)", "Spring-mass systems",
+                "Electrical circuits (RLC)", "Mixing problems",
+                "Predator-prey models (Lotka-Volterra)",
+            ]},
+        ],
+    },
+    "complex_analysis": {
+        "name": "Complex Numbers & Analysis",
+        "icon": "ℂ",
+        "chapters": [
+            {"id": "cx-basics", "name": "Complex Numbers", "topics": [
+                "Complex number arithmetic (addition, multiplication)",
+                "Complex conjugate and modulus",
+                "Polar form and Euler's formula",
+                "De Moivre's theorem", "Roots of complex numbers",
+            ]},
+            {"id": "cx-functions", "name": "Complex Functions", "topics": [
+                "Complex exponential and logarithm",
+                "Complex trigonometric functions",
+                "Analytic functions and Cauchy-Riemann equations",
+                "Harmonic functions",
+            ]},
+            {"id": "cx-integration", "name": "Complex Integration", "topics": [
+                "Contour integrals", "Cauchy's integral theorem",
+                "Cauchy's integral formula", "Residue theorem",
+                "Applications to real integrals",
+            ]},
+        ],
+    },
 }
 
 
@@ -2252,12 +2356,53 @@ def get_generated_chapter(subject_id: str, chapter_id: str) -> dict | None:
     return None
 
 
+def restore_chapter_session(subject_id: str, chapter_id: str, problem_index: int) -> dict:
+    """Re-register a curriculum problem's session in _tutor_sessions so check_answer works.
+
+    When a user resumes a chapter after a server restart, the in-memory session is gone.
+    This recreates it from the persisted chapter data.
+    """
+    chapter_data = get_generated_chapter(subject_id, chapter_id)
+    if not chapter_data:
+        return {"error": "Chapter not generated"}
+    problems = chapter_data.get("problems", [])
+    if problem_index < 0 or problem_index >= len(problems):
+        return {"error": f"Problem index {problem_index} out of range"}
+
+    prob = problems[problem_index]
+    session_id = prob.get("session_id")
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    # Only re-register if not already in memory
+    if session_id not in _tutor_sessions:
+        state = {
+            "session_id": session_id,
+            "style": prob.get("style", "mcq"),
+            "topic": prob.get("topic", ""),
+            "difficulty": prob.get("difficulty", "medium"),
+            "language": prob.get("language", "python"),
+            "problem": prob,
+            "lesson": prob.get("lesson"),
+            "hints_given": 0,
+            "attempts": 0,
+            "solved": False,
+            "is_math": chapter_data.get("is_math", True),
+        }
+        _tutor_sessions[session_id] = state
+        logger.info("[CURRICULUM] Restored session %s for %s/%s problem %d",
+                     session_id, subject_id, chapter_id, problem_index)
+
+    return {"session_id": session_id, "status": "ok"}
+
+
 def generate_full_chapter(
     subject_id: str,
     chapter_id: str,
     is_math: bool = True,
     language: str = "python",
     progress_callback=None,
+    force: bool = False,
 ) -> dict:
     """Generate an entire chapter's worth of problems in one go, then persist.
 
@@ -2266,6 +2411,7 @@ def generate_full_chapter(
 
     Args:
         progress_callback: optional callable(step, total, message) for progress bar
+        force: if True, delete existing chapter and regenerate
     Returns:
         dict with keys: subject_id, chapter_id, chapter_name, topics,
                         total_problems, problems (list of dicts)
@@ -2283,12 +2429,22 @@ def generate_full_chapter(
     if not chapter:
         return {"error": f"Chapter '{chapter_id}' not found"}
 
-    # Check if already generated
-    existing = get_generated_chapter(subject_id, chapter_id)
-    if existing:
-        logger.info("[CURRICULUM] Chapter already generated: %s / %s (%d problems)",
-                     subject_id, chapter_id, len(existing.get("problems", [])))
-        return existing
+    # Check if already generated (skip if force-regenerating)
+    if not force:
+        existing = get_generated_chapter(subject_id, chapter_id)
+        if existing:
+            logger.info("[CURRICULUM] Chapter already generated: %s / %s (%d problems)",
+                         subject_id, chapter_id, len(existing.get("problems", [])))
+            return existing
+    else:
+        # Delete existing files so we regenerate
+        path = _curriculum_path(subject_id, chapter_id)
+        if os.path.isfile(path):
+            os.remove(path)
+            logger.info("[CURRICULUM] Force-regenerating: deleted %s", path)
+        progress_path = _progress_path(subject_id, chapter_id)
+        if os.path.isfile(progress_path):
+            os.remove(progress_path)
 
     topics = chapter["topics"]
     difficulties = ["easy", "medium", "hard"]
@@ -2325,6 +2481,19 @@ def generate_full_chapter(
                         topic=topic, difficulty=diff, language=language,
                         style=style,
                     )
+                # Retrieve correct_answer from the in-memory session
+                # (generate_*_problem strips it from the response to avoid
+                #  leaking to the frontend, but we need it for persistence)
+                sid = problem_data.get("session_id")
+                if sid and sid in _tutor_sessions:
+                    full_problem = _tutor_sessions[sid]["problem"]
+                    problem_data["correct_answer"] = full_problem.get("correct_answer", "")
+                    problem_data["hints"] = full_problem.get("hints", [])
+                    problem_data["explanation"] = full_problem.get("explanation", "")
+                    if full_problem.get("steps"):
+                        problem_data["steps"] = full_problem["steps"]
+                    if full_problem.get("related_formulas"):
+                        problem_data["related_formulas"] = full_problem["related_formulas"]
                 # Add metadata
                 problem_data["topic"] = topic
                 problem_data["difficulty"] = diff
@@ -2370,3 +2539,72 @@ def get_chapter_problem(subject_id: str, chapter_id: str, problem_index: int) ->
     if problem_index < 0 or problem_index >= len(problems):
         return {"error": f"Problem index {problem_index} out of range (0-{len(problems)-1})"}
     return problems[problem_index]
+
+
+# ── Curriculum progress persistence ──────────────────────────────────────────
+
+def _progress_path(subject_id: str, chapter_id: str) -> str:
+    return os.path.join(_GENERATED_CURRICULUM_DIR, f"{subject_id}__{chapter_id}__progress.json")
+
+
+def get_chapter_progress(subject_id: str, chapter_id: str) -> dict:
+    """Load saved progress for a chapter. Returns current_index, answers, etc."""
+    path = _progress_path(subject_id, chapter_id)
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"current_index": 0, "answers": {}, "completed": False}
+
+
+def save_chapter_progress(subject_id: str, chapter_id: str, current_index: int,
+                          answers: dict, completed: bool = False) -> dict:
+    """Save progress for a chapter to disk.
+
+    Args:
+        current_index: which problem the user is currently on
+        answers: dict mapping problem index (str) -> {correct: bool, user_answer: str, attempts: int}
+        completed: whether the user has finished all problems
+    """
+    progress = {
+        "subject_id": subject_id,
+        "chapter_id": chapter_id,
+        "current_index": current_index,
+        "answers": answers,
+        "completed": completed,
+        "last_updated": datetime.now().isoformat(),
+    }
+    os.makedirs(_GENERATED_CURRICULUM_DIR, exist_ok=True)
+    with open(_progress_path(subject_id, chapter_id), "w", encoding="utf-8") as f:
+        json.dump(progress, f, indent=2, ensure_ascii=False)
+    logger.info("[CURRICULUM] Progress saved: %s/%s — index=%d, answered=%d, completed=%s",
+                subject_id, chapter_id, current_index, len(answers), completed)
+    return progress
+
+
+def list_generated_chapters() -> list[dict]:
+    """List all generated chapters with their progress state."""
+    chapters = []
+    if not os.path.isdir(_GENERATED_CURRICULUM_DIR):
+        return chapters
+    for f in sorted(os.listdir(_GENERATED_CURRICULUM_DIR)):
+        if f.endswith(".json") and "__progress" not in f:
+            parts = f.replace(".json", "").split("__", 1)
+            if len(parts) == 2:
+                subject_id, chapter_id = parts
+                chapter_data = get_generated_chapter(subject_id, chapter_id)
+                progress = get_chapter_progress(subject_id, chapter_id)
+                if chapter_data:
+                    chapters.append({
+                        "subject_id": subject_id,
+                        "chapter_id": chapter_id,
+                        "chapter_name": chapter_data.get("chapter_name", ""),
+                        "subject_name": chapter_data.get("subject_name", ""),
+                        "total_problems": chapter_data.get("total_problems", 0),
+                        "is_math": chapter_data.get("is_math", True),
+                        "current_index": progress.get("current_index", 0),
+                        "answered_count": len(progress.get("answers", {})),
+                        "completed": progress.get("completed", False),
+                        "generated_at": chapter_data.get("generated_at", ""),
+                        "last_updated": progress.get("last_updated", ""),
+                    })
+    return chapters

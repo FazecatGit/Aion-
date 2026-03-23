@@ -240,10 +240,14 @@ async def switch_model(req: SwitchModelRequest):
 
     old_model = cfg.LLM_MODEL
     cfg.LLM_MODEL = new_model
+    is_large = cfg._is_large_model(new_model)
     return {
         "status": "ok",
         "previous_model": old_model,
         "current_model": new_model,
+        "resource_saving": is_large or cfg.LOW_RESOURCE_MODE,
+        "effective_ctx": cfg.LOW_RESOURCE_NUM_CTX if (is_large or cfg.LOW_RESOURCE_MODE) else cfg.LLM_NUM_CTX,
+        "effective_predict": cfg.LOW_RESOURCE_NUM_PREDICT if (is_large or cfg.LOW_RESOURCE_MODE) else cfg.LLM_NUM_PREDICT,
     }
 
 
@@ -1678,6 +1682,7 @@ class GenerateChapterRequest(BaseModel):
     chapter_id: str
     is_math: bool = True
     language: str = "python"
+    force: bool = False
 
 @app.post("/curriculum/generate")
 async def curriculum_generate(req: GenerateChapterRequest):
@@ -1685,10 +1690,11 @@ async def curriculum_generate(req: GenerateChapterRequest):
     from tutor.tutor import get_generated_chapter
     global _curriculum_gen_state
 
-    # Return cached if already exists
-    existing = get_generated_chapter(req.subject_id, req.chapter_id)
-    if existing:
-        return {"status": "ok", "cached": True, **existing}
+    # Return cached if already exists (unless force regenerating)
+    if not req.force:
+        existing = get_generated_chapter(req.subject_id, req.chapter_id)
+        if existing:
+            return {"status": "ok", "cached": True, **existing}
 
     if _curriculum_gen_state["status"] == "running":
         return {"status": "already_running"}
@@ -1711,6 +1717,7 @@ async def curriculum_generate(req: GenerateChapterRequest):
                 is_math=req.is_math,
                 language=req.language,
                 progress_callback=_progress,
+                force=req.force,
             )
             _curriculum_gen_state = {"status": "done", "step": 0, "total": 0, "message": "Complete", "result": result}
         except Exception as e:
@@ -1741,6 +1748,51 @@ async def curriculum_get_problem(subject_id: str, chapter_id: str, problem_index
     if "error" in result:
         return {"status": "error", **result}
     return {"status": "ok", "problem": result}
+
+
+# ── Curriculum progress / resume ──────────────────────────────────────────
+
+@app.get("/curriculum/chapters")
+async def list_generated_chapters_endpoint():
+    """List all generated chapters with their progress."""
+    from tutor.tutor import list_generated_chapters
+    return {"status": "ok", "chapters": list_generated_chapters()}
+
+
+@app.get("/curriculum/progress/{subject_id}/{chapter_id}")
+async def get_chapter_progress_endpoint(subject_id: str, chapter_id: str):
+    """Get saved progress for a chapter."""
+    from tutor.tutor import get_chapter_progress
+    return {"status": "ok", **get_chapter_progress(subject_id, chapter_id)}
+
+
+class SaveProgressRequest(BaseModel):
+    subject_id: str
+    chapter_id: str
+    current_index: int
+    answers: dict = {}
+    completed: bool = False
+
+
+@app.post("/curriculum/progress")
+async def save_chapter_progress_endpoint(req: SaveProgressRequest):
+    """Save user progress on a generated chapter."""
+    from tutor.tutor import save_chapter_progress
+    result = save_chapter_progress(
+        req.subject_id, req.chapter_id,
+        req.current_index, req.answers, req.completed,
+    )
+    return {"status": "ok", **result}
+
+
+@app.post("/curriculum/restore-session/{subject_id}/{chapter_id}/{problem_index}")
+async def restore_chapter_session_endpoint(subject_id: str, chapter_id: str, problem_index: int):
+    """Re-register a curriculum problem's session so check_answer works after restart."""
+    from tutor.tutor import restore_chapter_session
+    result = restore_chapter_session(subject_id, chapter_id, problem_index)
+    if "error" in result:
+        return {"status": "error", **result}
+    return {"status": "ok", **result}
 
 
 # ── TTS Kokoro endpoint (delegated to agent/tts_kokoro.py) ────────────────
@@ -1786,6 +1838,32 @@ async def serve_file(path: str):
                  ".gif": "image/gif", ".webp": "image/webp", ".mp4": "video/mp4"}
     media_type = media_map.get(suffix, "application/octet-stream")
     return FileResponse(str(p), media_type=media_type, filename=p.name)
+
+
+@app.post("/file/open")
+async def open_file_in_os(path: str):
+    """Open a file in the OS default application (e.g. image viewer)."""
+    import subprocess, platform
+    p = Path(path).resolve()
+    # Safety: only allow opening from output dirs
+    allowed_roots = [
+        Path(OUTPUT_DIR).resolve(),
+        (Path(__file__).parent / "cache").resolve(),
+    ]
+    if not any(str(p).startswith(str(root)) for root in allowed_roots):
+        return {"status": "error", "error": "Access denied"}
+    if not p.exists():
+        return {"status": "error", "error": "File not found"}
+    try:
+        if platform.system() == "Windows":
+            os.startfile(str(p))
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 # ── Image generation endpoints (delegated to agent/image_generation.py) ──
@@ -1860,8 +1938,17 @@ async def generate_image_endpoint(req: ImageGenRequest):
         "negative_used": result.get("negative_used"),
         "prompt_analysis": result.get("prompt_analysis"),
         "settings": result.get("settings"),
+        "long_prompt": result.get("long_prompt", False),
     })
     return response
+
+
+@app.post("/generate/tokenize")
+async def tokenize_prompt_endpoint(req: dict):
+    """Count CLIP tokens for a prompt without generating an image."""
+    from agent.image_generation import count_tokens
+    prompt = req.get("prompt", "")
+    return count_tokens(prompt)
 
 
 class AnimatedGenRequest(BaseModel):
@@ -1961,6 +2048,16 @@ async def list_animation_jobs():
     return {"status": "ok", "jobs": list_animation_jobs()}
 
 
+@app.get("/generate/animated/jobs/{job_id}")
+async def get_animation_job_endpoint(job_id: str):
+    """Get full checkpoint data for a specific animation job."""
+    from agent.image_generation import get_animation_job
+    data = get_animation_job(job_id)
+    if not data:
+        return {"status": "error", "error": "Job not found"}
+    return {"status": "ok", **data}
+
+
 @app.post("/generate/cancel")
 async def cancel_generation_endpoint():
     """Cancel any running image/animation generation."""
@@ -2051,6 +2148,62 @@ class PreviewGenRequest(BaseModel):
     seed: int = -1
     art_style: str = "anime"
     negative_prompt: Optional[str] = None
+
+
+@app.post("/generate/preview/quick")
+async def generate_preview_only_endpoint(req: PreviewGenRequest):
+    """Fast noisy preview — quarter res, 6 steps. Returns preview image + seed."""
+    from agent.image_generation import generate_preview_only, list_models
+
+    model_path = None
+    if req.model:
+        models = list_models()
+        match = next((m for m in models if m["name"] == req.model), None)
+        if match:
+            model_path = match["path"]
+
+    lora_paths = []
+    if req.loras:
+        models = list_models()
+        for ln in req.loras:
+            lmatch = next((m for m in models if m["name"] == ln and m["type"] == "lora"), None)
+            if lmatch:
+                lora_paths.append(lmatch["path"])
+
+    def _gen():
+        return generate_preview_only(
+            prompt=req.prompt,
+            width=req.width,
+            height=req.height,
+            model_path=model_path,
+            mode=req.mode,
+            steps=6,
+            guidance_scale=req.guidance_scale,
+            seed=req.seed,
+            art_style=req.art_style,
+            lora_paths=lora_paths or None,
+            lora_weights=req.lora_weights or None,
+            negative_prompt=req.negative_prompt,
+        )
+
+    result = await asyncio.to_thread(_gen)
+    if result.get("status") == "error":
+        return result
+
+    # Return the preview image as file response + metadata
+    from starlette.responses import FileResponse
+    import json as _json
+    response = FileResponse(result["preview_path"], media_type="image/png", filename="preview.png")
+    response.headers["X-Generation-Meta"] = _json.dumps({
+        "seed": result.get("seed"),
+        "prompt_used": result.get("prompt_used"),
+        "negative_used": result.get("negative_used"),
+        "settings": result.get("settings"),
+        "is_preview": True,
+        "long_prompt": result.get("long_prompt", False),
+    })
+    return response
+
 
 @app.post("/generate/preview")
 async def generate_preview_endpoint(req: PreviewGenRequest):
@@ -2231,6 +2384,14 @@ async def unload_image_model(req: UnloadImageModelRequest):
     from agent.image_generation import unload_model
     unload_model(req.model_path)
     return {"status": "ok", "message": "Model unloaded"}
+
+
+@app.post("/generate/vram/flush")
+async def flush_vram_endpoint():
+    """Unload ALL image-gen pipelines and evict Ollama models to fully free VRAM."""
+    from agent.image_generation import flush_vram
+    await asyncio.to_thread(flush_vram)
+    return {"status": "ok", "message": "VRAM flushed — all models evicted"}
 
 
 # ── Image generation feedback ─────────────────────────────────────────────

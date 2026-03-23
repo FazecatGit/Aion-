@@ -302,6 +302,10 @@ function App() {
   // ── Vocab expansion & tag marking ──────────────────────────────────────────
   const [vocabSuggestions, setVocabSuggestions] = useState<Record<string, string[]>>({});
   const [tagRating, setTagRating] = useState<string>('');  // danbooru/e621 tag category
+  // ── Token counter state ────────────────────────────────────────────────────
+  const [promptTokenCount, setPromptTokenCount] = useState<number>(0);
+  const [promptTokenMethod, setPromptTokenMethod] = useState<string>('estimate');
+  const tokenDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // ── LoRA browser & trigger word management ─────────────────────────────────
   const [loraCategories, setLoraCategories] = useState<Record<string, {name:string; filename:string; path:string; size_mb:number; trigger_words:string[]}[]>>({});
   const [loraBrowserOpen, setLoraBrowserOpen] = useState(false);
@@ -311,11 +315,24 @@ function App() {
   const [loraSearchQuery, setLoraSearchQuery] = useState('');
   const [loraSearchResults, setLoraSearchResults] = useState<any[]>([]);
   const [loraSearchHistoryResults, setLoraSearchHistoryResults] = useState<any[]>([]);
+  // ── Image preview mode ─────────────────────────────────────────────────────
+  const [previewResult, setPreviewResult] = useState<string | null>(null);
+  const [previewSeed, setPreviewSeed] = useState<number | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
   // ── Image lightbox with zoom+pan ───────────────────────────────────────────
   const [lightboxZoom, setLightboxZoom] = useState(1);
   const [lightboxPan, setLightboxPan] = useState({ x: 0, y: 0 });
   const lightboxDragging = useRef(false);
   const lightboxDragStart = useRef({ x: 0, y: 0 });
+  // ── Curriculum chapter resume state ────────────────────────────────────────
+  const [currChapterData, setCurrChapterData] = useState<any>(null);
+  const [currChapterProgress, setCurrChapterProgress] = useState<any>(null);
+  const [currChapterIndex, setCurrChapterIndex] = useState(0);
+  const [currChapterAnswers, setCurrChapterAnswers] = useState<Record<string, any>>({});
+  const [currChapterActive, setCurrChapterActive] = useState(false);
+  const [currChapterInput, setCurrChapterInput] = useState('');
+  const [currChapterFeedback, setCurrChapterFeedback] = useState<any>(null);
+  const [currChapterLoading, setCurrChapterLoading] = useState(false);
 
   // ── Process / backend log panel ────────────────────────────────────────────
   type ProcessLog = { ts: number; level: string; logger: string; message: string };
@@ -703,6 +720,122 @@ function App() {
       setAgentLearnings([]);
       setShowLearnings(true);
     }
+  };
+
+  // ── Curriculum chapter resume handlers ──────────────────────────────────
+  const handleOpenChapter = async (subjectId: string, chapterId: string) => {
+    setCurrChapterLoading(true);
+    setCurrChapterFeedback(null);
+    setCurrChapterInput('');
+    try {
+      const [chapterRes, progressRes] = await Promise.all([
+        fetch(`http://localhost:8000/curriculum/chapter/${subjectId}/${chapterId}`),
+        fetch(`http://localhost:8000/curriculum/progress/${subjectId}/${chapterId}`),
+      ]);
+      const chapterData = await chapterRes.json();
+      const progressData = await progressRes.json();
+      if (chapterData.status === 'ok') {
+        setCurrChapterData(chapterData);
+        const answers = progressData.answers || {};
+        const startIdx = progressData.current_index || 0;
+        setCurrChapterAnswers(answers);
+        setCurrChapterIndex(startIdx);
+        setCurrChapterActive(true);
+        setShowCurriculum(false);
+      }
+    } catch (err) {
+      console.error('Failed to load chapter:', err);
+    } finally {
+      setCurrChapterLoading(false);
+    }
+  };
+
+  const handleChapterAnswer = async () => {
+    if (!currChapterData || currChapterLoading) return;
+    const problem = currChapterData.problems?.[currChapterIndex];
+    if (!problem) return;
+    setCurrChapterLoading(true);
+    setCurrChapterFeedback(null);
+
+    try {
+      // Ensure session is registered in backend (may have been lost on restart)
+      await fetch(`http://localhost:8000/curriculum/restore-session/${currChapterData.subject_id}/${currChapterData.chapter_id}/${currChapterIndex}`, { method: 'POST' });
+
+      const endpoint = currChapterData.is_math ? 'http://localhost:8000/math/check' : 'http://localhost:8000/tutor/check';
+      const payload: any = { session_id: problem.session_id, answer: currChapterInput };
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      const correct = data.correct ?? false;
+      const prevAttempts = currChapterAnswers[String(currChapterIndex)]?.attempts ?? 0;
+      const newAnswers = {
+        ...currChapterAnswers,
+        [String(currChapterIndex)]: {
+          correct: correct || (currChapterAnswers[String(currChapterIndex)]?.correct ?? false),
+          user_answer: currChapterInput,
+          attempts: prevAttempts + 1,
+        },
+      };
+      setCurrChapterAnswers(newAnswers);
+      setCurrChapterFeedback(data);
+
+      // Auto-save progress
+      await fetch('http://localhost:8000/curriculum/progress', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subject_id: currChapterData.subject_id,
+          chapter_id: currChapterData.chapter_id,
+          current_index: currChapterIndex,
+          answers: newAnswers,
+          completed: correct && currChapterIndex >= (currChapterData.total_problems ?? 0) - 1,
+        }),
+      });
+
+      // Refresh gamification profile (XP is awarded inside check_answer)
+      if (correct) {
+        try {
+          const gp = await fetch('http://localhost:8000/gamification/profile');
+          const gd = await gp.json();
+          if (gd.status === 'ok') setGamifProfile(gd.profile);
+        } catch {}
+      }
+    } catch (err) {
+      setCurrChapterFeedback({ correct: false, feedback: 'Error checking answer.' });
+    } finally {
+      setCurrChapterLoading(false);
+    }
+  };
+
+  const handleChapterNext = async () => {
+    const nextIdx = currChapterIndex + 1;
+    if (nextIdx >= (currChapterData?.total_problems ?? 0)) return;
+    setCurrChapterIndex(nextIdx);
+    setCurrChapterInput('');
+    setCurrChapterFeedback(null);
+    // Save progress
+    await fetch('http://localhost:8000/curriculum/progress', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        subject_id: currChapterData.subject_id,
+        chapter_id: currChapterData.chapter_id,
+        current_index: nextIdx,
+        answers: currChapterAnswers,
+        completed: false,
+      }),
+    });
+  };
+
+  const handleCloseChapter = () => {
+    setCurrChapterActive(false);
+    setCurrChapterData(null);
+    setCurrChapterProgress(null);
+    setCurrChapterFeedback(null);
+    setCurrChapterInput('');
   };
 
   const handleTutorGenerate = async () => {
@@ -1311,11 +1444,145 @@ const handleRagChunkRetry = async (chunks: number) => {
   setMode('idle');
 };
 
+// ── Fast noisy preview ──────────────────────────────────────────────────
+const handleImagePreview = async () => {
+  if (!imageGenPrompt.trim() || previewLoading || imageGenLoading) return;
+  setPreviewLoading(true);
+  setPreviewResult(null);
+  setPreviewSeed(null);
+  setImageGenResult(null);
+  setMode('querying');
+
+  try {
+    const body: any = {
+      prompt: (tagRating ? tagRating + ', ' : '') + imageGenPrompt.trim(),
+      width: imageGenWidth,
+      height: imageGenHeight,
+      mode: imageGenMode,
+      steps: 12,
+      guidance_scale: imageGenCfg,
+      seed: imageGenSeed,
+      art_style: imageGenArtStyle,
+    };
+    if (selectedImageModel) body.model = selectedImageModel;
+    if (selectedLoras.length > 0) body.loras = selectedLoras;
+    if (imageGenNegative.trim()) body.negative_prompt = imageGenNegative.trim();
+
+    const res = await fetch('http://localhost:8000/generate/preview/quick', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      let errMsg = 'Preview failed';
+      try { const errData = await res.json(); errMsg = errData.error || errData.detail || errMsg; }
+      catch { try { errMsg = await res.text() || errMsg; } catch {} }
+      setImageGenResult(`Error: ${errMsg}`);
+      return;
+    }
+
+    const contentType = res.headers.get('content-type') ?? '';
+    if (contentType.includes('image')) {
+      const metaHeader = res.headers.get('X-Generation-Meta');
+      if (metaHeader) {
+        try {
+          const meta = JSON.parse(metaHeader);
+          setPreviewSeed(meta.seed ?? null);
+          setImageGenMeta(meta);
+        } catch {}
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      setPreviewResult(url);
+    } else {
+      const data = await res.json();
+      if (data.status === 'error') {
+        setImageGenResult(`Error: ${data.error || 'Preview failed'}`);
+      }
+    }
+  } catch (err: any) {
+    setImageGenResult(`Error: ${err.message}`);
+  } finally {
+    setPreviewLoading(false);
+    setMode('idle');
+  }
+};
+
+// ── Full render from preview (uses the preview seed) ────────────────────
+const handleFullRenderFromPreview = async () => {
+  if (previewSeed === null) return;
+  setImageGenSeed(previewSeed);
+  setPreviewResult(null);
+  // Trigger normal generate with the locked seed
+  setImageGenAnimated(false);
+  setImageGenLoading(true);
+  setImageGenResult(null);
+  setImageGenMeta(null);
+  setMode('querying');
+
+  try {
+    const body: any = {
+      prompt: (tagRating ? tagRating + ', ' : '') + imageGenPrompt.trim(),
+      width: imageGenWidth,
+      height: imageGenHeight,
+      mode: imageGenMode,
+      steps: imageGenSteps,
+      guidance_scale: imageGenCfg,
+      seed: previewSeed,
+      art_style: imageGenArtStyle,
+    };
+    if (selectedImageModel) body.model = selectedImageModel;
+    if (selectedLoras.length > 0) body.loras = selectedLoras;
+    if (imageGenNegative.trim()) body.negative_prompt = imageGenNegative.trim();
+
+    const res = await fetch('http://localhost:8000/generate/image', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      let errMsg = 'Generation failed';
+      try { const errData = await res.json(); errMsg = errData.error || errData.detail || errMsg; }
+      catch { try { errMsg = await res.text() || errMsg; } catch {} }
+      setImageGenResult(`Error: ${errMsg}`);
+      return;
+    }
+
+    const contentType = res.headers.get('content-type') ?? '';
+    if (contentType.includes('image')) {
+      const metaHeader = res.headers.get('X-Generation-Meta');
+      if (metaHeader) {
+        try { setImageGenMeta(JSON.parse(metaHeader)); } catch {}
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      setImageGenResult(url);
+    } else {
+      const data = await res.json();
+      if (data.status === 'ok') {
+        setImageGenResult(data.path);
+        setImageGenMeta(data);
+      } else {
+        setImageGenResult(`Error: ${data.error || 'Generation failed'}`);
+      }
+    }
+  } catch (err: any) {
+    setImageGenResult(`Error: ${err.message}`);
+  } finally {
+    setImageGenLoading(false);
+    setMode('idle');
+    fetchImageHistory();
+  }
+};
+
 const handleImageGenerate = async () => {
   if (!imageGenPrompt.trim() || imageGenLoading) return;
   setImageGenLoading(true);
   setImageGenResult(null);
   setImageGenMeta(null);
+  setPreviewResult(null);
   setMode('querying');  // activate orb animation during generation
 
   const endpoint = imageGenAnimated ? '/generate/animated' : '/generate/image';
@@ -1351,8 +1618,10 @@ const handleImageGenerate = async () => {
     });
 
     if (!res.ok) {
-      const errData = await res.json();
-      setImageGenResult(`Error: ${errData.error || 'Generation failed'}`);
+      let errMsg = 'Generation failed';
+      try { const errData = await res.json(); errMsg = errData.error || errData.detail || errMsg; }
+      catch { try { errMsg = await res.text() || errMsg; } catch {} }
+      setImageGenResult(`Error: ${errMsg}`);
       return;
     }
 
@@ -1479,6 +1748,35 @@ const searchLoras = async (query: string) => {
       setLoraSearchHistoryResults(data.history_matches || []);
     }
   } catch {}
+};
+
+// ── Token counter ────────────────────────────────────────────────────────
+const updateTokenCount = (text: string) => {
+  if (tokenDebounceRef.current) clearTimeout(tokenDebounceRef.current);
+  // Immediate client-side estimate
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  const estimate = Math.max(0, Math.round(words.length * 1.3));
+  setPromptTokenCount(estimate);
+  setPromptTokenMethod('estimate');
+  // Debounced backend call for exact count
+  if (text.trim()) {
+    tokenDebounceRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch('http://localhost:8000/generate/tokenize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt: text.trim() }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setPromptTokenCount(data.token_count ?? estimate);
+          setPromptTokenMethod(data.method ?? 'estimate');
+        }
+      } catch {}
+    }, 600);
+  } else {
+    setPromptTokenCount(0);
+  }
 };
 
 // Insert trigger word into prompt
@@ -1621,7 +1919,24 @@ const fetchVocabExpansion = async (text: string) => {
 const handleCancelGeneration = async () => {
   try {
     await fetch('http://localhost:8000/generate/cancel', { method: 'POST' });
+    // Also cancel any in-flight fetch
+    if (globalAbortRef.current) {
+      globalAbortRef.current.abort();
+      globalAbortRef.current = null;
+    }
   } catch {}
+  setImageGenLoading(false);
+  setMode('idle');
+};
+
+// Free all VRAM (unload SD pipelines + evict Ollama models)
+const [vramFlushing, setVramFlushing] = React.useState(false);
+const handleFlushVram = async () => {
+  setVramFlushing(true);
+  try {
+    await fetch('http://localhost:8000/generate/vram/flush', { method: 'POST' });
+  } catch {}
+  setVramFlushing(false);
 };
 
 return (
@@ -2759,6 +3074,62 @@ return (
                                       >
                                         {currGenStatus === 'running' ? '⏳ Generating...' : '📝 Generate Chapter'}
                                       </button>
+                                      <button
+                                        onClick={async () => {
+                                          setCurrGenStatus('running');
+                                          setCurrGenProgress({ step: 0, total: 0, message: 'Force regenerating...' });
+                                          try {
+                                            const res = await fetch('http://localhost:8000/curriculum/generate', {
+                                              method: 'POST',
+                                              headers: { 'Content-Type': 'application/json' },
+                                              body: JSON.stringify({ subject_id: subjId, chapter_id: ch.id, is_math: currTab === 'math', language: tutorLanguage, force: true }),
+                                            });
+                                            const d = await res.json();
+                                            if (d.status === 'started' || d.status === 'already_running') {
+                                              if (currGenPollRef.current) clearInterval(currGenPollRef.current);
+                                              currGenPollRef.current = setInterval(async () => {
+                                                try {
+                                                  const sr = await fetch('http://localhost:8000/curriculum/generate/status');
+                                                  const sd = await sr.json();
+                                                  setCurrGenProgress({ step: sd.step ?? 0, total: sd.total ?? 0, message: sd.message ?? '' });
+                                                  if (sd.status === 'done' || sd.status === 'error') {
+                                                    setCurrGenStatus(sd.status);
+                                                    if (currGenPollRef.current) clearInterval(currGenPollRef.current);
+                                                  }
+                                                } catch {}
+                                              }, 1500);
+                                            }
+                                          } catch (err) {
+                                            setCurrGenStatus('error');
+                                            setCurrGenProgress({ step: 0, total: 0, message: String(err) });
+                                          }
+                                        }}
+                                        disabled={currGenStatus === 'running'}
+                                        title="Delete existing chapter and regenerate all problems with correct answers"
+                                        style={{
+                                          padding: '5px 12px', borderRadius: '6px', border: '1px solid rgba(255,150,0,0.4)',
+                                          backgroundColor: currGenStatus === 'running' ? '#333' : 'rgba(255,150,0,0.1)',
+                                          color: currGenStatus === 'running' ? '#888' : '#ff9900',
+                                          fontWeight: 'bold', cursor: currGenStatus === 'running' ? 'wait' : 'pointer',
+                                          fontSize: '11px',
+                                        }}
+                                      >
+                                        🔄 Regenerate
+                                      </button>
+                                      <button
+                                        onClick={() => handleOpenChapter(subjId, ch.id)}
+                                        disabled={currChapterLoading}
+                                        style={{
+                                          padding: '5px 12px', borderRadius: '6px',
+                                          border: `1px solid rgba(${accentRgb},0.4)`,
+                                          backgroundColor: `rgba(${accentRgb},0.08)`,
+                                          color: currTab === 'cs' ? '#c5b0ff' : '#a0e8d0',
+                                          fontWeight: 'bold', cursor: currChapterLoading ? 'wait' : 'pointer',
+                                          fontSize: '11px',
+                                        }}
+                                      >
+                                        {currChapterLoading ? '⏳...' : '▶ Resume Chapter'}
+                                      </button>
                                       {currGenStatus === 'running' && currGenProgress.total > 0 && (
                                         <div style={{ flex: 1, minWidth: '120px' }}>
                                           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: '#888', marginBottom: '2px' }}>
@@ -2795,6 +3166,213 @@ return (
               })()}
             </div>
           )}
+
+          {/* ── Curriculum Chapter Viewer ─────────────────────────────────── */}
+          {currChapterActive && currChapterData && (() => {
+            const problems = currChapterData.problems || [];
+            const problem = problems[currChapterIndex];
+            const totalProblems = currChapterData.total_problems || problems.length;
+            const answeredCount = Object.values(currChapterAnswers).filter((a: any) => a.correct).length;
+            const currentAnswer = currChapterAnswers[String(currChapterIndex)];
+            const accentCol = currChapterData.is_math ? '#00cc88' : '#b388ff';
+
+            return (
+              <div style={{ marginBottom: '16px', padding: '16px', borderRadius: '12px', backgroundColor: 'rgba(0,0,0,0.3)', border: `1px solid ${accentCol}44` }}>
+                {/* Header */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                  <div>
+                    <span style={{ fontSize: '15px', fontWeight: 'bold', color: accentCol }}>
+                      📚 {currChapterData.chapter_name}
+                    </span>
+                    <span style={{ fontSize: '12px', color: '#888', marginLeft: '10px' }}>
+                      {currChapterData.subject_name}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                    <span style={{ fontSize: '11px', color: '#888' }}>
+                      ✓ {answeredCount}/{totalProblems} · Problem {currChapterIndex + 1}/{totalProblems}
+                    </span>
+                    <button onClick={handleCloseChapter}
+                      style={{ background: 'none', border: '1px solid #55555555', borderRadius: '6px', color: '#888', cursor: 'pointer', padding: '4px 10px', fontSize: '11px' }}>
+                      ✕ Close
+                    </button>
+                  </div>
+                </div>
+
+                {/* Progress bar */}
+                <div style={{ height: '6px', borderRadius: '3px', backgroundColor: '#222', overflow: 'hidden', marginBottom: '14px' }}>
+                  <div style={{
+                    height: '100%', borderRadius: '3px', transition: 'width 0.3s',
+                    width: `${Math.round((answeredCount / totalProblems) * 100)}%`,
+                    background: `linear-gradient(90deg, ${accentCol}, ${accentCol}88)`,
+                  }} />
+                </div>
+
+                {/* Problem navigation dots */}
+                <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', marginBottom: '14px' }}>
+                  {problems.map((_: any, i: number) => {
+                    const ans = currChapterAnswers[String(i)];
+                    const isCurrent = i === currChapterIndex;
+                    return (
+                      <button key={i} onClick={() => { setCurrChapterIndex(i); setCurrChapterInput(''); setCurrChapterFeedback(null); }}
+                        style={{
+                          width: '24px', height: '24px', borderRadius: '50%', border: 'none',
+                          fontSize: '10px', fontWeight: 'bold', cursor: 'pointer',
+                          backgroundColor: ans?.correct ? accentCol
+                            : ans && !ans.correct ? '#ff444444'
+                            : isCurrent ? '#333' : '#1a1a1a',
+                          color: ans?.correct ? '#000' : isCurrent ? '#fff' : '#555',
+                          outline: isCurrent ? `2px solid ${accentCol}` : 'none',
+                          outlineOffset: '2px',
+                        }}
+                      >
+                        {i + 1}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {problem ? (
+                  <>
+                    {/* Lesson card (collapsible) */}
+                    {problem.lesson && (
+                      <details style={{ marginBottom: '12px' }}>
+                        <summary style={{ cursor: 'pointer', color: accentCol, fontSize: '13px', fontWeight: 'bold', marginBottom: '8px' }}>
+                          📖 {problem.lesson.title || 'Lesson'}
+                        </summary>
+                        <div style={{ padding: '10px', borderRadius: '8px', backgroundColor: 'rgba(0,0,0,0.3)', fontSize: '13px', color: '#ccc', lineHeight: '1.6' }}>
+                          <p style={{ margin: '0 0 8px' }}>{problem.lesson.explanation}</p>
+                          {problem.lesson.rules?.map((r: string, ri: number) => (
+                            <div key={ri} style={{ marginBottom: '4px', paddingLeft: '12px', borderLeft: `2px solid ${accentCol}44` }}>
+                              <span style={{ color: '#aaa', fontSize: '12px' }}>{r}</span>
+                            </div>
+                          ))}
+                          {problem.lesson.example_code && (
+                            <div style={{ marginTop: '8px', padding: '8px', borderRadius: '6px', backgroundColor: '#0a0a0a', fontSize: '12px', color: '#eee', whiteSpace: 'pre-wrap', fontFamily: 'monospace' }}>
+                              {problem.lesson.example_code}
+                            </div>
+                          )}
+                        </div>
+                      </details>
+                    )}
+
+                    {/* Question */}
+                    <div style={{ marginBottom: '12px', padding: '12px', borderRadius: '8px', backgroundColor: 'rgba(0,0,0,0.25)' }}>
+                      <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
+                        <span style={{ fontSize: '10px', padding: '2px 8px', borderRadius: '10px', backgroundColor: problem.difficulty === 'easy' ? '#00cc8822' : problem.difficulty === 'medium' ? '#ff990022' : '#ff444422', color: problem.difficulty === 'easy' ? '#00cc88' : problem.difficulty === 'medium' ? '#ff9900' : '#ff4444', textTransform: 'uppercase', fontWeight: 'bold' }}>
+                          {problem.difficulty}
+                        </span>
+                        <span style={{ fontSize: '10px', padding: '2px 8px', borderRadius: '10px', backgroundColor: '#33333366', color: '#888' }}>{problem.style}</span>
+                        <span style={{ fontSize: '11px', color: '#666' }}>{problem.topic}</span>
+                      </div>
+                      <div style={{ fontSize: '14px', color: '#eee', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>
+                        {problem.question}
+                      </div>
+                    </div>
+
+                    {/* Answer area */}
+                    {!currentAnswer?.correct && (
+                      <div style={{ marginBottom: '12px' }}>
+                        {problem.style === 'mcq' && problem.options ? (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                            {problem.options.map((opt: string, oi: number) => (
+                              <button key={oi}
+                                onClick={() => setCurrChapterInput(opt)}
+                                style={{
+                                  padding: '8px 14px', borderRadius: '8px', textAlign: 'left',
+                                  border: currChapterInput === opt ? `2px solid ${accentCol}` : '1px solid #333',
+                                  backgroundColor: currChapterInput === opt ? `${accentCol}15` : '#111',
+                                  color: currChapterInput === opt ? '#fff' : '#ccc',
+                                  cursor: 'pointer', fontSize: '13px', transition: 'all 0.15s',
+                                }}
+                              >
+                                {opt}
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <textarea
+                            value={currChapterInput}
+                            onChange={e => setCurrChapterInput(e.target.value)}
+                            placeholder="Type your answer..."
+                            rows={3}
+                            style={{
+                              width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #333',
+                              backgroundColor: '#0a0a0a', color: '#eee', fontSize: '13px', fontFamily: problem.style === 'code' ? 'monospace' : 'inherit',
+                              resize: 'vertical',
+                            }}
+                          />
+                        )}
+                        <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+                          <button
+                            onClick={handleChapterAnswer}
+                            disabled={!currChapterInput.trim() || currChapterLoading}
+                            style={{
+                              padding: '8px 20px', borderRadius: '8px', border: 'none',
+                              backgroundColor: accentCol, color: '#000', fontWeight: 'bold',
+                              cursor: (!currChapterInput.trim() || currChapterLoading) ? 'not-allowed' : 'pointer',
+                              fontSize: '13px', opacity: (!currChapterInput.trim() || currChapterLoading) ? 0.5 : 1,
+                            }}
+                          >
+                            {currChapterLoading ? '⏳ Checking...' : 'Submit Answer'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Feedback */}
+                    {currChapterFeedback && (
+                      <div style={{
+                        padding: '12px', borderRadius: '8px', marginBottom: '12px',
+                        backgroundColor: currChapterFeedback.correct ? 'rgba(0,204,136,0.08)' : 'rgba(255,68,68,0.08)',
+                        border: `1px solid ${currChapterFeedback.correct ? '#00cc8844' : '#ff444444'}`,
+                      }}>
+                        <div style={{ fontSize: '14px', fontWeight: 'bold', color: currChapterFeedback.correct ? '#00cc88' : '#ff4444', marginBottom: '6px' }}>
+                          {currChapterFeedback.correct ? '✓ Correct!' : '✗ Not quite'}
+                        </div>
+                        {currChapterFeedback.feedback && (
+                          <div style={{ fontSize: '13px', color: '#ccc', lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>
+                            {currChapterFeedback.feedback}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Already answered correctly */}
+                    {currentAnswer?.correct && (
+                      <div style={{ padding: '12px', borderRadius: '8px', backgroundColor: 'rgba(0,204,136,0.08)', border: '1px solid #00cc8844', marginBottom: '12px' }}>
+                        <span style={{ color: '#00cc88', fontSize: '13px', fontWeight: 'bold' }}>✓ Answered correctly</span>
+                        {currentAnswer.user_answer && <span style={{ color: '#888', fontSize: '12px', marginLeft: '8px' }}>— {currentAnswer.user_answer.slice(0, 100)}</span>}
+                      </div>
+                    )}
+
+                    {/* Navigation */}
+                    <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                      {currChapterIndex > 0 && (
+                        <button onClick={() => { setCurrChapterIndex(currChapterIndex - 1); setCurrChapterInput(''); setCurrChapterFeedback(null); }}
+                          style={{ padding: '6px 14px', borderRadius: '6px', border: '1px solid #333', backgroundColor: 'transparent', color: '#888', cursor: 'pointer', fontSize: '12px' }}>
+                          ← Previous
+                        </button>
+                      )}
+                      {currChapterIndex < totalProblems - 1 && (currentAnswer?.correct || currChapterFeedback?.correct) && (
+                        <button onClick={handleChapterNext}
+                          style={{ padding: '6px 14px', borderRadius: '6px', border: 'none', backgroundColor: accentCol, color: '#000', fontWeight: 'bold', cursor: 'pointer', fontSize: '12px' }}>
+                          Next Problem →
+                        </button>
+                      )}
+                      {answeredCount === totalProblems && (
+                        <span style={{ color: '#ffcc00', fontSize: '13px', fontWeight: 'bold', alignSelf: 'center' }}>
+                          🏆 Chapter Complete!
+                        </span>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ color: '#888', fontSize: '13px' }}>Problem data unavailable for index {currChapterIndex}.</div>
+                )}
+              </div>
+            );
+          })()}
 
           {/* Agent learnings display */}
           {showLearnings && (
@@ -4633,12 +5211,61 @@ return (
                 <div style={{
                   border: '1px solid #333', borderRadius: '8px', backgroundColor: '#0a0a0a',
                   padding: '8px', maxHeight: '320px', overflowY: 'auto',
-                }}>
+                }}
+                  onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); (e.currentTarget as HTMLElement).style.borderColor = '#b388ff'; }}
+                  onDragLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = '#333'; }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    (e.currentTarget as HTMLElement).style.borderColor = '#333';
+                    const files = e.dataTransfer?.files;
+                    if (!files || files.length === 0) return;
+                    const file = files[0];
+                    if (!file.name.endsWith('.safetensors')) return;
+                    // Extract LoRA name (strip extension)
+                    const loraName = file.name.replace('.safetensors', '');
+                    // Auto-open trigger word editor for this LoRA
+                    setEditingTriggerLora(loraName);
+                    setTriggerWordInput('');
+                    // Try to find existing trigger words
+                    for (const cat of Object.values(loraCategories)) {
+                      const match = (cat as any[]).find((lr: any) => lr.name === loraName);
+                      if (match?.trigger_words?.length > 0) {
+                        setTriggerWordInput(match.trigger_words.join(', '));
+                        break;
+                      }
+                    }
+                  }}
+                >
                   {/* Search */}
                   <input type="text" value={loraSearchQuery}
                     onChange={e => { setLoraSearchQuery(e.target.value); searchLoras(e.target.value); }}
                     placeholder="Search LoRAs by name or trigger word..."
                     style={{ width: '100%', padding: '5px 8px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '11px', marginBottom: '6px', outline: 'none', boxSizing: 'border-box' }} />
+
+                  {/* Drag-drop hint */}
+                  <div style={{ fontSize: '9px', color: '#555', textAlign: 'center', marginBottom: '4px' }}>
+                    Drop a .safetensors file here to add trigger words
+                  </div>
+
+                  {/* Floating trigger word editor for dropped LoRAs not in any category */}
+                  {editingTriggerLora && !Object.values(loraCategories).flat().some((lr: any) => lr.name === editingTriggerLora) && (
+                    <div style={{ padding: '8px', borderRadius: '6px', backgroundColor: '#1a1a2e', border: '1px solid #b388ff', marginBottom: '8px' }}>
+                      <div style={{ fontSize: '11px', color: '#b388ff', marginBottom: '4px', fontWeight: 'bold' }}>✏️ Set trigger words for: {editingTriggerLora}</div>
+                      <div style={{ display: 'flex', gap: '4px' }}>
+                        <input type="text" value={triggerWordInput}
+                          onChange={e => setTriggerWordInput(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') { saveTriggerWords(editingTriggerLora!, triggerWordInput); fetchLoraCategories(); } }}
+                          placeholder="word1, word2, ..."
+                          autoFocus
+                          style={{ flex: 1, padding: '4px 6px', borderRadius: '4px', border: '1px solid #444', backgroundColor: '#0a0a0a', color: '#fff', fontSize: '10px', outline: 'none' }} />
+                        <button onClick={() => { saveTriggerWords(editingTriggerLora!, triggerWordInput); fetchLoraCategories(); }}
+                          style={{ background: '#00cc88', border: 'none', borderRadius: '4px', color: '#000', cursor: 'pointer', fontSize: '9px', padding: '4px 8px', fontWeight: 'bold' }}>Save</button>
+                        <button onClick={() => { setEditingTriggerLora(null); setTriggerWordInput(''); }}
+                          style={{ background: 'none', border: '1px solid #444', borderRadius: '4px', color: '#888', cursor: 'pointer', fontSize: '9px', padding: '4px 6px' }}>✕</button>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Search results */}
                   {loraSearchQuery && loraSearchResults.length > 0 && (
@@ -4888,11 +5515,62 @@ return (
               {/* Animation jobs */}
               {animJobs.length > 0 && (
                 <div style={{ borderTop: '1px solid #222', paddingTop: '10px' }}>
-                  <h4 style={{ margin: '0 0 6px', fontSize: '11px', color: '#888' }}>Saved Jobs</h4>
+                  <h4 style={{ margin: '0 0 6px', fontSize: '11px', color: '#888', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    Saved Jobs
+                    <button onClick={fetchAnimJobs} style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '10px' }}>⟳</button>
+                  </h4>
                   {animJobs.map(j => (
-                    <div key={j.job_id} style={{ padding: '4px 6px', fontSize: '10px', color: '#aaa', borderRadius: '4px', backgroundColor: '#111', marginBottom: '4px' }}>
-                      <span style={{ color: j.status === 'complete' ? '#00cc88' : '#ff9900' }}>{j.status === 'complete' ? '✓' : '⏸'}</span>{' '}
-                      {j.job_id} — {j.current_frame}/{j.total_frames}
+                    <div key={j.job_id} style={{ padding: '6px', fontSize: '10px', color: '#aaa', borderRadius: '6px', backgroundColor: '#111', marginBottom: '4px', border: '1px solid #222' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '3px' }}>
+                        <span>
+                          <span style={{ color: j.status === 'complete' ? '#00cc88' : '#ff9900' }}>{j.status === 'complete' ? '✓' : '⏸'}</span>{' '}
+                          {j.job_id.slice(0, 12)}... — {j.current_frame}/{j.total_frames}
+                        </span>
+                      </div>
+                      <div style={{ color: '#666', fontSize: '9px', marginBottom: '4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {j.prompt}
+                      </div>
+                      <div style={{ display: 'flex', gap: '4px' }}>
+                        <button onClick={() => {
+                          // Load saved state into form
+                          setImageGenPrompt(j.prompt || '');
+                          if (j.negative_prompt) setImageGenNegative(j.negative_prompt);
+                          if (j.art_style) setImageGenArtStyle(j.art_style);
+                          if (j.seed >= 0) setImageGenSeed(j.seed);
+                          if (j.frame_strength) setImageGenFrameStrength(j.frame_strength);
+                          if (j.fps) setImageGenFps(j.fps);
+                          if (j.steps) setImageGenSteps(j.steps);
+                          if (j.guidance_scale) setImageGenCfg(j.guidance_scale);
+                          if (j.width) setImageGenWidth(j.width);
+                          if (j.height) setImageGenHeight(j.height);
+                          if (j.total_frames) setImageGenFrames(j.total_frames);
+                          if (j.output_format) setImageGenOutputFormat(j.output_format);
+                          if (j.storyboard?.length > 0) setStoryboardDescs(j.storyboard.join('\n'));
+                        }} style={{ flex: 1, padding: '3px', borderRadius: '4px', border: '1px solid #333', backgroundColor: 'transparent', color: '#b388ff', cursor: 'pointer', fontSize: '9px' }}
+                          title="Load this job's prompt and settings into the form">📋 Load</button>
+                        {j.status !== 'complete' && (
+                          <button onClick={() => {
+                            // Load state and auto-resume
+                            setImageGenPrompt(j.prompt || '');
+                            if (j.negative_prompt) setImageGenNegative(j.negative_prompt);
+                            if (j.art_style) setImageGenArtStyle(j.art_style);
+                            if (j.seed >= 0) setImageGenSeed(j.seed);
+                            if (j.frame_strength) setImageGenFrameStrength(j.frame_strength);
+                            if (j.fps) setImageGenFps(j.fps);
+                            if (j.steps) setImageGenSteps(j.steps);
+                            if (j.guidance_scale) setImageGenCfg(j.guidance_scale);
+                            if (j.width) setImageGenWidth(j.width);
+                            if (j.height) setImageGenHeight(j.height);
+                            if (j.total_frames) setImageGenFrames(j.total_frames);
+                            if (j.output_format) setImageGenOutputFormat(j.output_format);
+                            if (j.storyboard?.length > 0) setStoryboardDescs(j.storyboard.join('\n'));
+                            // Trigger resume generation
+                            setImageGenAnimated(true);
+                            setTimeout(() => handleImageGenerate(), 100);
+                          }} style={{ flex: 1, padding: '3px', borderRadius: '4px', border: '1px solid #00cc88', backgroundColor: 'rgba(0,204,136,0.1)', color: '#00cc88', cursor: 'pointer', fontSize: '9px' }}
+                            title="Resume generating from last frame">▶ Resume</button>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -4928,9 +5606,27 @@ return (
               </div>
               <div>
                 <label style={{ fontSize: '11px', color: '#888' }}>Image Path</label>
-                <input type="text" value={upscaleImagePath} onChange={e => setUpscaleImagePath(e.target.value)}
-                  placeholder="C:\path\to\image.png"
-                  style={{ width: '100%', padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <input type="text" value={upscaleImagePath} onChange={e => setUpscaleImagePath(e.target.value)}
+                    placeholder="C:\path\to\image.png"
+                    style={{ flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#fff', fontSize: '12px' }} />
+                  <input id="upscale-file-picker" type="file" accept="image/png,image/jpeg,image/webp" style={{ display: 'none' }}
+                    onChange={(e) => {
+                      const f = (e.target as HTMLInputElement).files?.[0];
+                      if (!f) return;
+                      const anyF = f as any;
+                      if (anyF.path) {
+                        setUpscaleImagePath(anyF.path);
+                      } else {
+                        setUpscaleImagePath(f.name);
+                      }
+                      (document.getElementById('upscale-file-picker') as HTMLInputElement).value = '';
+                    }}
+                  />
+                  <button onClick={() => (document.getElementById('upscale-file-picker') as HTMLInputElement)?.click()}
+                    style={{ padding: '6px 12px', borderRadius: '6px', border: '1px solid #333', backgroundColor: '#111', color: '#b388ff', cursor: 'pointer', fontSize: '12px', whiteSpace: 'nowrap' }}
+                    title="Browse for image file">📁 Browse</button>
+                </div>
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                 <div>
@@ -5053,7 +5749,7 @@ return (
             }}>
               <textarea
                 value={imageGenPrompt}
-                onChange={e => { setImageGenPrompt(e.target.value); }}
+                onChange={e => { setImageGenPrompt(e.target.value); updateTokenCount(e.target.value); }}
                 onBlur={() => fetchVocabExpansion(imageGenPrompt)}
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (imageGenSubTab === 'storyboard') handleStoryboardPreview(); else handleImageGenerate(); } }}
                 placeholder="Describe what to generate... (supports long prompts, no 77-token limit, use (word:1.5) for weighting)"
@@ -5083,6 +5779,20 @@ return (
                   : imageGenSubTab === 'storyboard' ? '📋 Sketch'
                   : '🎨 Generate'}
               </button>
+              {imageGenSubTab === 'generate' && (
+                <button
+                  disabled={!imageGenPrompt.trim() || previewLoading || imageGenLoading}
+                  onClick={handleImagePreview}
+                  style={{
+                    padding: '12px 18px', borderRadius: '10px', border: '1px solid #ff990066',
+                    backgroundColor: previewLoading ? '#333' : 'rgba(255,153,0,0.1)', color: '#ff9900',
+                    cursor: (previewLoading || imageGenLoading) ? 'wait' : 'pointer', fontSize: '13px', fontWeight: 'bold',
+                    whiteSpace: 'nowrap', transition: 'background 0.2s',
+                  }}
+                >
+                  {previewLoading ? '⏳ Preview...' : '👁 Preview'}
+                </button>
+              )}
               {imageGenLoading && (
                 <button onClick={handleCancelGeneration}
                   style={{
@@ -5094,7 +5804,48 @@ return (
                   ⬛ Stop
                 </button>
               )}
+              {!imageGenLoading && (
+                <button onClick={handleFlushVram} disabled={vramFlushing}
+                  style={{
+                    padding: '12px 16px', borderRadius: '10px', border: '2px solid #44aaff',
+                    backgroundColor: vramFlushing ? '#333' : 'rgba(68,170,255,0.1)', color: '#44aaff',
+                    cursor: vramFlushing ? 'wait' : 'pointer', fontSize: '13px', fontWeight: 'bold',
+                    whiteSpace: 'nowrap', transition: 'background 0.2s',
+                  }}>
+                  {vramFlushing ? '⏳ Freeing...' : '🧹 Free VRAM'}
+                </button>
+              )}
             </div>
+
+            {/* Token counter bar */}
+            {imageGenPrompt.trim() && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: '8px',
+                padding: '6px 14px', fontSize: '11px', fontFamily: 'monospace',
+              }}>
+                <div style={{ flex: 1, height: '4px', borderRadius: '2px', backgroundColor: '#1a1a2e', overflow: 'hidden' }}>
+                  <div style={{
+                    height: '100%', borderRadius: '2px', transition: 'width 0.3s, background 0.3s',
+                    width: `${Math.min(100, (promptTokenCount / 225) * 100)}%`,
+                    background: promptTokenCount <= 75 ? '#00cc88' : promptTokenCount <= 150 ? '#ff9900' : '#ff4444',
+                  }} />
+                </div>
+                <span style={{
+                  color: promptTokenCount <= 75 ? '#00cc88' : promptTokenCount <= 150 ? '#ff9900' : '#ff4444',
+                  whiteSpace: 'nowrap', minWidth: '80px',
+                }}>
+                  {promptTokenCount} / 75 tokens
+                </span>
+                {promptTokenCount > 75 && (
+                  <span style={{ color: '#00cc88', fontSize: '10px', whiteSpace: 'nowrap' }}>
+                    ✓ Auto-chunked ({Math.ceil(promptTokenCount / 75)} segments)
+                  </span>
+                )}
+                {promptTokenMethod === 'clip_tokenizer' && (
+                  <span style={{ color: '#555', fontSize: '9px' }}>CLIP</span>
+                )}
+              </div>
+            )}
 
             {/* Vocab expansion suggestions */}
             {Object.keys(vocabSuggestions).length > 0 && (
@@ -5128,17 +5879,67 @@ return (
               border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
               overflow: 'hidden', display: 'flex', flexDirection: 'column',
             }}>
-              {imageGenLoading && (
+              {(imageGenLoading || previewLoading) && (
                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '12px' }}>
-                  <div style={{ fontSize: '32px', animation: 'spin 2s linear infinite' }}>🎨</div>
-                  <div style={{ color: '#b388ff', fontSize: '14px' }}>
-                    {imageGenAnimated ? `Generating ${imageGenFrames} frames...` : 'Generating image...'}
+                  <div style={{ fontSize: '32px', animation: 'spin 2s linear infinite' }}>{previewLoading ? '👁' : '🎨'}</div>
+                  <div style={{ color: previewLoading ? '#ff9900' : '#b388ff', fontSize: '14px' }}>
+                    {previewLoading ? 'Generating quick preview...'
+                      : imageGenAnimated ? `Generating ${imageGenFrames} frames...` : 'Generating full image...'}
                   </div>
-                  <div style={{ color: '#555', fontSize: '11px' }}>This may take 10-30 seconds depending on settings</div>
+                  <div style={{ color: '#555', fontSize: '11px' }}>
+                    {previewLoading ? 'Fast noisy preview — a few seconds' : 'This may take 10-30 seconds depending on settings'}
+                  </div>
                 </div>
               )}
 
-              {!imageGenLoading && imageGenResult && (
+              {/* Preview result with Full Render button */}
+              {!imageGenLoading && !previewLoading && previewResult && !imageGenResult && (
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '16px', gap: '12px' }}>
+                  <div style={{ fontSize: '11px', color: '#ff9900', textTransform: 'uppercase', letterSpacing: '1px', fontWeight: 'bold' }}>
+                    Preview (low-res, {previewSeed !== null ? `seed: ${previewSeed}` : 'noisy'})
+                  </div>
+                  <img
+                    src={previewResult}
+                    alt="Preview"
+                    onClick={() => { setLightboxUrl(previewResult); setLightboxZoom(1); setLightboxPan({ x: 0, y: 0 }); }}
+                    style={{ maxWidth: '100%', maxHeight: 'calc(100% - 80px)', borderRadius: '8px', cursor: 'zoom-in', objectFit: 'contain', imageRendering: 'auto', border: '2px solid rgba(255,153,0,0.3)' }}
+                  />
+                  <div style={{ display: 'flex', gap: '10px' }}>
+                    <button
+                      onClick={handleFullRenderFromPreview}
+                      style={{
+                        padding: '10px 24px', borderRadius: '10px', border: 'none',
+                        backgroundColor: '#7c4dff', color: '#fff', fontWeight: 'bold',
+                        cursor: 'pointer', fontSize: '14px', transition: 'background 0.2s',
+                      }}
+                    >
+                      🎨 Full Render (seed {previewSeed})
+                    </button>
+                    <button
+                      onClick={() => { setPreviewResult(null); setPreviewSeed(null); }}
+                      style={{
+                        padding: '10px 16px', borderRadius: '10px', border: '1px solid #555',
+                        backgroundColor: 'transparent', color: '#888',
+                        cursor: 'pointer', fontSize: '13px',
+                      }}
+                    >
+                      Discard
+                    </button>
+                    <button
+                      onClick={handleImagePreview}
+                      style={{
+                        padding: '10px 16px', borderRadius: '10px', border: '1px solid #ff990044',
+                        backgroundColor: 'rgba(255,153,0,0.08)', color: '#ff9900',
+                        cursor: 'pointer', fontSize: '13px',
+                      }}
+                    >
+                      ↻ Re-roll
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {!imageGenLoading && !previewLoading && imageGenResult && (
                 imageGenResult.startsWith('Error') ? (
                   <div style={{ padding: '20px', color: '#ff6666', fontSize: '14px' }}>{imageGenResult}</div>
                 ) : imageGenResult.startsWith('blob:') ? (
@@ -5155,9 +5956,9 @@ return (
                 )
               )}
 
-              {!imageGenLoading && !imageGenResult && (
+              {!imageGenLoading && !previewLoading && !imageGenResult && !previewResult && (
                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#444', fontSize: '14px' }}>
-                  Enter a prompt and press Generate
+                  Enter a prompt and press Generate or Preview
                 </div>
               )}
             </div>
@@ -5175,6 +5976,9 @@ return (
                   <div style={{ fontSize: '11px', color: '#888', marginBottom: '4px' }}>
                     Seed: <span style={{ color: '#fff', fontFamily: 'monospace' }}>{imageGenMeta.seed}</span>
                     {imageGenMeta.settings && <> | Model: <span style={{ color: '#fff' }}>{imageGenMeta.settings.model}</span></>}
+                    {imageGenMeta.long_prompt && (
+                      <> | <span style={{ color: '#00cc88' }}>Long prompt ✓ (compel encoded)</span></>
+                    )}
                   </div>
                   {imageGenMeta.prompt_analysis?.estimated_focus && (
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
@@ -5281,6 +6085,21 @@ return (
                 {h.feedback && (
                   <div style={{ marginTop: '4px', padding: '3px 6px', borderRadius: '4px', backgroundColor: 'rgba(255,153,0,0.1)', color: '#ff9900', fontSize: '10px' }}>
                     📝 {h.feedback.slice(0, 40)}
+                  </div>
+                )}
+                {h.result_path && (
+                  <div style={{ display: 'flex', gap: '4px', marginTop: '4px' }}>
+                    <button onClick={(e) => {
+                      e.stopPropagation();
+                      fetch(`http://localhost:8000/file/open?path=${encodeURIComponent(h.result_path)}`, { method: 'POST' });
+                    }} style={{ flex: 1, padding: '3px', borderRadius: '4px', border: '1px solid #333', backgroundColor: '#111', color: '#888', cursor: 'pointer', fontSize: '9px' }}
+                      title="Open in system viewer">📂 Open</button>
+                    <button onClick={(e) => {
+                      e.stopPropagation();
+                      setUpscaleImagePath(h.result_path);
+                      setImageGenSubTab('upscale');
+                    }} style={{ flex: 1, padding: '3px', borderRadius: '4px', border: '1px solid #333', backgroundColor: '#111', color: '#888', cursor: 'pointer', fontSize: '9px' }}
+                      title="Send to upscale tab">🔍 Upscale</button>
                   </div>
                 )}
               </div>

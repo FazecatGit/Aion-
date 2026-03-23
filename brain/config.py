@@ -36,6 +36,23 @@ LLM_TIMEOUT_SECONDS = int(os.getenv("RAG_LLM_TIMEOUT", "180"))    # per-call tim
 LLM_NUM_CTX_HARD = int(os.getenv("RAG_LLM_NUM_CTX_HARD", "32768"))
 LLM_NUM_PREDICT_HARD = int(os.getenv("RAG_LLM_NUM_PREDICT_HARD", "16384"))
 
+# Resource-saving profile for large models (30B+) on limited hardware.
+# When enabled, reduces context window and max output tokens to avoid
+# out-of-memory issues with 8GB VRAM + 32GB RAM setups.
+LOW_RESOURCE_MODE = _env_bool("RAG_LOW_RESOURCE_MODE", "0")
+LOW_RESOURCE_NUM_CTX = int(os.getenv("RAG_LOW_RESOURCE_NUM_CTX", "4096"))
+LOW_RESOURCE_NUM_PREDICT = int(os.getenv("RAG_LOW_RESOURCE_NUM_PREDICT", "2048"))
+LOW_RESOURCE_TIMEOUT = int(os.getenv("RAG_LOW_RESOURCE_TIMEOUT", "600"))  # longer timeout for slow models
+
+# Auto-detect large models (30B+) and apply resource limits
+_LARGE_MODEL_PATTERNS = ["30b", "32b", "33b", "34b", "35b", "70b", "72b", "27b"]
+
+
+def _is_large_model(model_name: str) -> bool:
+    """Check if a model name suggests a large (>20B) parameter model."""
+    name_lower = model_name.lower()
+    return any(pat in name_lower for pat in _LARGE_MODEL_PATTERNS)
+
 
 def make_llm(model: str = None, temperature: float = None, *,
              num_ctx: int = None, num_predict: int = None):
@@ -44,12 +61,24 @@ def make_llm(model: str = None, temperature: float = None, *,
     Sets num_ctx and num_predict to prevent unbounded context/generation.
     Pass explicit num_ctx/num_predict to override the defaults (e.g. for hard problems).
     Automatically disables thinking mode on qwen3.x models.
+    Auto-detects large models (30B+) and applies resource-saving limits.
     """
     from langchain_ollama import OllamaLLM
     m = model if model is not None else LLM_MODEL
     t = temperature if temperature is not None else LLM_TEMPERATURE
     ctx = num_ctx if num_ctx is not None else LLM_NUM_CTX
     pred = num_predict if num_predict is not None else LLM_NUM_PREDICT
+
+    # Auto-apply resource limits for large models
+    if LOW_RESOURCE_MODE or _is_large_model(m):
+        if num_ctx is None:
+            ctx = min(ctx, LOW_RESOURCE_NUM_CTX)
+        if num_predict is None:
+            pred = min(pred, LOW_RESOURCE_NUM_PREDICT)
+        logging.getLogger("config").info(
+            "[LLM] Resource-saving mode for %s: num_ctx=%d, num_predict=%d", m, ctx, pred
+        )
+
     # qwen3 models have 'thinking' on by default — disable via reasoning=False
     reasoning = False if "qwen3" in m.lower() else None
     raw_llm = OllamaLLM(
