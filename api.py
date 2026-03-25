@@ -2196,6 +2196,67 @@ async def flush_wan_endpoint():
     return {"status": "ok", "message": "WAN pipeline flushed"}
 
 
+@app.post("/generate/video/pause")
+async def pause_video_endpoint():
+    """Pause the current video generation after the current step."""
+    from agent.image_generation import pause_video_generation
+    return pause_video_generation()
+
+
+@app.post("/generate/video/resume")
+async def resume_video_endpoint():
+    """Resume a paused video generation."""
+    from agent.image_generation import resume_video_generation
+    return resume_video_generation()
+
+
+@app.get("/generate/video/checkpoints")
+async def list_video_checkpoints_endpoint():
+    """List all saved video generation checkpoints."""
+    from agent.image_generation import list_video_checkpoints
+    return {"status": "ok", "checkpoints": list_video_checkpoints()}
+
+
+@app.get("/generate/video/queue")
+async def video_queue_status_endpoint():
+    """Return full video queue status — running, paused, interrupted jobs."""
+    from agent.image_generation import get_video_queue_status
+    return get_video_queue_status()
+
+
+@app.post("/generate/video/resume-job")
+async def resume_interrupted_job_endpoint(body: dict):
+    """Resume an interrupted/cancelled video job. Returns the mp4 file on success."""
+    job_id = body.get("job_id")
+    if not job_id:
+        return {"status": "error", "error": "job_id is required"}
+    from agent.image_generation import resume_interrupted_job
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, resume_interrupted_job, job_id)
+    if result.get("status") != "ok" or not result.get("path"):
+        return result
+    # Stream the video file back to the frontend
+    from starlette.responses import FileResponse
+    video_path = result["path"]
+    if not Path(video_path).exists():
+        return result  # Return JSON with path if file doesn't exist
+    return FileResponse(video_path, media_type="video/mp4", filename=Path(video_path).name)
+
+
+@app.get("/generate/video/history")
+async def list_generated_videos_endpoint():
+    """List all generated videos with metadata."""
+    from agent.image_generation import list_generated_videos
+    return {"status": "ok", "videos": list_generated_videos()}
+
+
+@app.post("/generate/video/cleanup")
+async def cleanup_video_checkpoints_endpoint(job_id: Optional[str] = None, keep_latest: int = 3):
+    """Clean up old checkpoint directories."""
+    from agent.image_generation import cleanup_checkpoints
+    return cleanup_checkpoints(job_id=job_id, keep_latest=keep_latest)
+
+
 class RegenerateFrameRequest(BaseModel):
     job_id: str
     frame_index: int

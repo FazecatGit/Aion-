@@ -310,6 +310,7 @@ function App() {
   const [videoActionLora, setVideoActionLora] = useState('');
   const [actionLoras, setActionLoras] = useState<any[]>([]);
   const [isVideoResult, setIsVideoResult] = useState(false);
+  const [interruptedJobs, setInterruptedJobs] = useState<any[]>([]);
   const [trainingStatus, setTrainingStatus] = useState<any>(null);
   const [trainingImageDir, setTrainingImageDir] = useState('');
   const [trainingName, setTrainingName] = useState('');
@@ -405,6 +406,21 @@ function App() {
     progressPollRef.current = poll;
     return () => clearInterval(poll);
   }, [imageGenLoading]);
+
+  // ── Fetch resumable video jobs when video tab shown or generation finishes ──
+  useEffect(() => {
+    if (imageGenSubTab !== 'video') return;
+    const fetchResumable = async () => {
+      try {
+        const res = await fetch('http://localhost:8000/generate/video/queue');
+        if (res.ok) {
+          const data = await res.json();
+          setInterruptedJobs(data.resumable_jobs || data.interrupted_jobs || []);
+        }
+      } catch {}
+    };
+    fetchResumable();
+  }, [imageGenSubTab, imageGenLoading]);
 
   // ── LLM connection status ──────────────────────────────────────────────────
   const [llmConnected, setLlmConnected] = useState<boolean | null>(null);  // null = unknown
@@ -5876,12 +5892,15 @@ return (
                 setImageGenResult(null);
                 setIsVideoResult(false);
                 setMode('querying');
+                const controller = new AbortController();
+                globalAbortRef.current = controller;
                 try {
                   const res = await fetch('http://localhost:8000/generate/video', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    signal: controller.signal,
                     body: JSON.stringify({
                       prompt: (tagRating ? tagRating + ', ' : '') + imageGenPrompt.trim(),
-                      image_path: videoRefImage || undefined,
+                      image_path: videoRefImage ? videoRefImage.replace(/^["']|["']$/g, '').trim() : undefined,
                       width: imageGenWidth, height: imageGenHeight,
                       num_frames: videoFrames, fps: videoFps,
                       steps: videoSteps, guidance_scale: videoCfg,
@@ -5904,9 +5923,10 @@ return (
                     const err = await res.json().catch(() => ({}));
                     setImageGenResult(`Error: ${err.error || 'Video generation failed'}`);
                   }
-                } catch (e) {
-                  setImageGenResult(`Error: ${e}`);
+                } catch (e: any) {
+                  if (e?.name !== 'AbortError') setImageGenResult(`Error: ${e}`);
                 } finally {
+                  globalAbortRef.current = null;
                   setImageGenLoading(false);
                   setMode('idle');
                 }
@@ -5917,9 +5937,100 @@ return (
               }}>
                 {imageGenLoading ? '⏳ Generating Video...' : '🎥 Generate Video'}
               </button>
+              {/* Pause / Resume / Cancel controls during video gen */}
+              {imageGenLoading && imageGenSubTab === 'video' && (
+                <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }}>
+                  <button onClick={async () => {
+                    try {
+                      const isPaused = genProgress.message?.includes('PAUSED');
+                      const endpoint = isPaused ? 'resume' : 'pause';
+                      await fetch(`http://localhost:8000/generate/video/${endpoint}`, { method: 'POST' });
+                    } catch {}
+                  }} style={{
+                    flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #555',
+                    backgroundColor: 'transparent', cursor: 'pointer', fontSize: '11px', fontWeight: 'bold',
+                    color: genProgress.message?.includes('PAUSED') ? '#00cc88' : '#ff9900',
+                  }}>
+                    {genProgress.message?.includes('PAUSED') ? '▶ Resume' : '⏸ Pause'}
+                  </button>
+                  <button onClick={handleCancelGeneration} style={{
+                    flex: 1, padding: '6px', borderRadius: '6px', border: '1px solid #ff444466',
+                    backgroundColor: 'transparent', color: '#ff4444', cursor: 'pointer', fontSize: '11px', fontWeight: 'bold',
+                  }}>
+                    ✕ Cancel
+                  </button>
+                </div>
+              )}
+              {/* Resumable checkpoint jobs */}
+              {interruptedJobs.length > 0 && !imageGenLoading && (
+                <div style={{ marginTop: '6px', padding: '8px', borderRadius: '8px', border: '1px solid #ff990033', backgroundColor: '#1a1200' }}>
+                  <div style={{ fontSize: '11px', color: '#ff9900', marginBottom: '4px', fontWeight: 'bold' }}>📦 Resumable Jobs ({interruptedJobs.length})</div>
+                  {interruptedJobs.slice(0, 5).map((job: any, i: number) => {
+                    const savedSteps = job.checkpoint_count || job.latest_checkpoint || 0;
+                    const totalSteps = job.steps || job.total_steps || '?';
+                    const allDone = savedSteps >= totalSteps;
+                    return (<div key={job.job_id || i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '10px', color: '#999', padding: '4px 0', borderTop: i > 0 ? '1px solid #222' : 'none' }}>
+                      <div style={{ flex: 1, overflow: 'hidden', minWidth: 0 }}>
+                        <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {job.prompt?.slice(0, 50) || job.job_id}
+                        </div>
+                        <div style={{ fontSize: '9px', color: allDone ? '#00cc88' : '#888' }}>
+                          {allDone ? `✓ ${savedSteps}/${totalSteps} steps — ready to decode (~30s)` : `${savedSteps}/${totalSteps} steps — will re-run from scratch`}
+                          {' · '}{job.status}
+                        </div>
+                      </div>
+                      <button onClick={async () => {
+                        if (imageGenLoading) return;
+                        setImageGenLoading(true);
+                        setImageGenResult(null);
+                        setIsVideoResult(false);
+                        setMode('querying');
+                        const controller = new AbortController();
+                        globalAbortRef.current = controller;
+                        try {
+                          const res = await fetch('http://localhost:8000/generate/video/resume-job', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            signal: controller.signal,
+                            body: JSON.stringify({ job_id: job.job_id }),
+                          });
+                          if (res.ok) {
+                            const ct = res.headers.get('content-type') ?? '';
+                            if (ct.includes('video')) {
+                              const blob = await res.blob();
+                              setIsVideoResult(true);
+                              setImageGenResult(URL.createObjectURL(blob));
+                            } else if (ct.includes('json')) {
+                              const data = await res.json();
+                              if (data.status === 'ok' && data.path) {
+                                setImageGenResult(data.path);
+                              } else {
+                                setImageGenResult(`Error: ${data.error || 'Unexpected response'}`);
+                              }
+                            }
+                          } else {
+                            const err = await res.json().catch(() => ({}));
+                            setImageGenResult(`Error: ${err.error || 'Resume failed'}`);
+                          }
+                        } catch (e: any) {
+                          if (e?.name !== 'AbortError') setImageGenResult(`Error: ${e}`);
+                        } finally {
+                          globalAbortRef.current = null;
+                          setImageGenLoading(false);
+                          setMode('idle');
+                        }
+                      }} style={{ marginLeft: '6px', padding: '2px 10px', borderRadius: '4px', border: '1px solid #00cc8866', backgroundColor: 'transparent', color: '#00cc88', cursor: 'pointer', fontSize: '10px', fontWeight: 'bold' }}>
+                        ▶ Resume
+                      </button>
+                    </div>
+                  );
+                  })}
+                  {interruptedJobs.length > 3 && <div style={{ fontSize: '9px', color: '#666', marginTop: '2px' }}>+{interruptedJobs.length - 3} more</div>}
+                </div>
+              )}
               <div style={{ fontSize: '10px', color: '#555', lineHeight: 1.4 }}>
-                Requires WAN 2.1 T2V (1.3B) model. First run will auto-download (~2.5GB).
-                Fits comfortably in 8GB VRAM. Supply an image for style reference.
+                WAN 2.1 T2V (1.3B) — Loaded directly on GPU (~2.6GB model + working memory).
+                Falls back to CPU offload if VRAM is insufficient. Frames saved as PNGs if mp4 export fails.
               </div>
             </>)}
 
@@ -6175,14 +6286,38 @@ return (
               overflow: 'hidden', display: 'flex', flexDirection: 'column',
             }}>
               {(imageGenLoading || previewLoading) && (
-                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '12px' }}>
-                  <div style={{ fontSize: '32px', animation: 'spin 2s linear infinite' }}>{previewLoading ? '👁' : '🎨'}</div>
+                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '12px', padding: '20px' }}>
+                  <div style={{ fontSize: '32px', animation: 'spin 2s linear infinite' }}>{previewLoading ? '👁' : genProgress.type === 'video' ? '🎥' : '🎨'}</div>
                   <div style={{ color: previewLoading ? '#ff9900' : '#b388ff', fontSize: '14px' }}>
                     {previewLoading ? 'Generating quick preview...'
+                      : genProgress.type === 'video' ? 'Generating video...'
                       : imageGenAnimated ? `Generating ${imageGenFrames} frames...` : 'Generating full image...'}
                   </div>
+                  {/* Inline progress for video generation */}
+                  {genProgress.active && genProgress.type === 'video' && (
+                    <div style={{ width: '100%', maxWidth: '400px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', marginBottom: '6px' }}>
+                        <span style={{ color: '#b388ff' }}>Step {genProgress.current_step}/{genProgress.total_steps}</span>
+                        <span style={{ color: '#aaa' }}>
+                          {genProgress.total_steps > 0 ? `${Math.round(genProgress.current_step / genProgress.total_steps * 100)}%` : '0%'}
+                        </span>
+                      </div>
+                      <div style={{ height: '8px', borderRadius: '4px', backgroundColor: '#1a1a2e', overflow: 'hidden' }}>
+                        <div style={{
+                          height: '100%', borderRadius: '4px', transition: 'width 0.5s ease',
+                          width: `${genProgress.total_steps > 0 ? (genProgress.current_step / genProgress.total_steps * 100) : 0}%`,
+                          background: 'linear-gradient(90deg, #7c4dff, #b388ff)',
+                        }} />
+                      </div>
+                      {genProgress.message && (
+                        <div style={{ color: '#888', marginTop: '6px', fontSize: '11px', textAlign: 'center' }}>{genProgress.message}</div>
+                      )}
+                    </div>
+                  )}
                   <div style={{ color: '#555', fontSize: '11px' }}>
-                    {previewLoading ? 'Fast noisy preview — a few seconds' : 'This may take 10-30 seconds depending on settings'}
+                    {previewLoading ? 'Fast noisy preview — a few seconds'
+                      : genProgress.type === 'video' ? 'Model offload + attention slicing — GPU-accelerated on 8GB VRAM'
+                      : 'This may take 10-30 seconds depending on settings'}
                   </div>
                 </div>
               )}
@@ -6354,7 +6489,16 @@ return (
                 border: '1px solid #222', fontSize: '11px', cursor: 'pointer',
               }}
                 onClick={() => {
-                  const cleanPrompt = h.prompt?.replace(/^(score_9, score_8_up, score_7_up, |rating:\w+, )/, '') || '';
+                  let cleanPrompt = h.prompt?.replace(/^(score_9, score_8_up, score_7_up, |rating:\w+, )/, '') || '';
+                  // Strip COMPEL/multi-character artifacts for cleaner reuse
+                  cleanPrompt = cleanPrompt
+                    .replace(/\s*BREAK\s*/g, ' ')
+                    .replace(/,?\s*(?:on the (?:left|right)|in the (?:center|background))\s*/gi, ' ')
+                    .replace(/\(:\d+\.?\d*\)/g, '')
+                    .replace(/\(([^:()]+):\d+\.?\d*\)/g, '$1')
+                    .replace(/,\s*,+/g, ',')
+                    .replace(/\s{2,}/g, ' ')
+                    .trim().replace(/^,|,$/g, '').trim();
                   setImageGenPrompt(cleanPrompt);
                   if (h.settings?.seed) setImageGenSeed(h.settings.seed);
                   if (h.settings?.steps) setImageGenSteps(h.settings.steps);
