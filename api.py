@@ -2632,6 +2632,61 @@ async def list_loras_by_category_endpoint():
     return list_loras_by_category()
 
 
+@app.get("/generate/lora-preview/{lora_name}")
+async def lora_preview_endpoint(lora_name: str):
+    """Serve the preview image for a LoRA adapter."""
+    from pathlib import Path as _Path
+    from starlette.responses import FileResponse
+    models_dir = _Path("models")
+    for cat in ("styles", "characters", "clothing", "poses", "concept", "action"):
+        cat_dir = models_dir / cat
+        if not cat_dir.exists():
+            continue
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            candidate = cat_dir / f"{lora_name}.preview{ext}"
+            if candidate.exists():
+                media_types = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+                return FileResponse(str(candidate), media_type=media_types.get(ext, "image/png"))
+    return {"status": "error", "error": "No preview image found"}
+
+
+@app.post("/generate/lora-preview/{lora_name}")
+async def upload_lora_preview(lora_name: str, request):
+    """Upload/set a preview image for a LoRA adapter via file path or base64."""
+    import base64
+    from pathlib import Path as _Path
+    body = await request.json()
+    image_path = body.get("image_path")
+    image_base64 = body.get("image_base64")
+    models_dir = _Path("models")
+    # Find which category this LoRA belongs to
+    target_dir = None
+    for cat in ("styles", "characters", "clothing", "poses", "concept", "action"):
+        cat_dir = models_dir / cat
+        if cat_dir.exists():
+            for f in cat_dir.iterdir():
+                if f.stem == lora_name and f.suffix.lower() in (".safetensors", ".pt", ".ckpt"):
+                    target_dir = cat_dir
+                    break
+        if target_dir:
+            break
+    if not target_dir:
+        return {"status": "error", "error": f"LoRA '{lora_name}' not found in any category"}
+    preview_path = target_dir / f"{lora_name}.preview.png"
+    if image_path:
+        src = _Path(image_path)
+        if not src.exists():
+            return {"status": "error", "error": f"Source image not found: {image_path}"}
+        import shutil
+        shutil.copy2(str(src), str(preview_path))
+    elif image_base64:
+        data = base64.b64decode(image_base64)
+        preview_path.write_bytes(data)
+    else:
+        return {"status": "error", "error": "Provide image_path or image_base64"}
+    return {"status": "ok", "preview_path": str(preview_path)}
+
+
 class TriggerWordRequest(BaseModel):
     lora_name: str
     trigger_words: list[str]

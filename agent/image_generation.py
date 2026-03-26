@@ -287,18 +287,27 @@ def list_loras_by_category() -> dict:
     categories: dict[str, list[dict]] = {}
     LORA_CATEGORIES = ("styles", "characters", "clothing", "poses", "concept", "action")
     tw_data = _load_trigger_words()
+    PREVIEW_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
     for cat in LORA_CATEGORIES:
         cat_dir = MODELS_DIR / cat
         entries = []
         if cat_dir.exists():
             for f in sorted(cat_dir.iterdir()):
                 if f.suffix.lower() in LORA_EXTENSIONS and f.is_file():
+                    # Look for a preview image: <name>.preview.png/jpg/webp
+                    preview = None
+                    for ext in PREVIEW_EXTENSIONS:
+                        candidate = f.parent / f"{f.stem}.preview{ext}"
+                        if candidate.exists():
+                            preview = str(candidate)
+                            break
                     entries.append({
                         "name": f.stem,
                         "filename": f.name,
                         "path": str(f),
                         "size_mb": round(f.stat().st_size / (1024 * 1024), 1),
                         "trigger_words": tw_data.get(f.stem, []),
+                        "preview_image": preview,
                     })
         categories[cat] = entries
     return {"status": "ok", "categories": categories}
@@ -929,66 +938,51 @@ def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None 
     """Detect multiple character names in prompt and structure them so SDXL
     renders each character distinctly rather than merging them into one.
 
-    Strategy: wrap each character block with positional anchors (left/right)
-    and use BREAK to separate their descriptions.
+    Only activates when 2+ character-category LoRAs are actively loaded,
+    preventing false positives from trigger words that happen to appear
+    in the prompt text.
     """
-    # Collect known character names from trigger words
-    tw_data = _load_trigger_words()
-    known_chars: list[str] = []
-    for lora_name, words in tw_data.items():
-        for w in words:
-            if len(w) > 2:
-                known_chars.append(w.lower())
-
-    # Also check loaded LoRA file names as character hints
-    if lora_paths:
-        for lp in lora_paths:
-            stem = Path(lp).stem.lower()
-            if stem not in known_chars:
-                known_chars.append(stem)
-
-    # Find which characters appear in the prompt
-    prompt_lower = prompt.lower()
-    found_chars = [c for c in known_chars if c in prompt_lower]
-    # Deduplicate while preserving order
-    seen = set()
-    unique_chars = []
-    for c in found_chars:
-        if c not in seen:
-            seen.add(c)
-            unique_chars.append(c)
-
-    if len(unique_chars) < 2:
+    if not lora_paths or len(lora_paths) < 2:
         return prompt
 
-    _log.info("[IMAGE GEN] Multi-character detected: %s", unique_chars)
+    # Only count LoRAs from the 'characters' category
+    char_lora_paths = []
+    char_dir = MODELS_DIR / "characters"
+    for lp in lora_paths:
+        lp_path = Path(lp)
+        # Check if this LoRA lives in the characters/ folder
+        try:
+            if lp_path.parent.resolve() == char_dir.resolve():
+                char_lora_paths.append(lp)
+        except Exception:
+            pass
 
+    if len(char_lora_paths) < 2:
+        return prompt
+
+    _log.info("[IMAGE GEN] Multi-character structuring: %d character LoRAs active",
+              len(char_lora_paths))
+
+    tw_data = _load_trigger_words()
     positions = ["on the left", "on the right", "in the center", "in the background"]
     parts = []
-    remaining_prompt = prompt
 
-    for i, char_name in enumerate(unique_chars[:4]):  # max 4 characters
-        # Find the character's description segment in the prompt
+    for i, lp in enumerate(char_lora_paths[:4]):  # max 4 characters
+        stem = Path(lp).stem
         pos = positions[i] if i < len(positions) else positions[-1]
-        # Look up trigger words for this character
-        char_triggers = ""
-        for lora_name, words in tw_data.items():
-            if char_name in [w.lower() for w in words]:
-                char_triggers = ", ".join(words)
-                break
-        if not char_triggers:
-            char_triggers = char_name
-
+        # Look up trigger words for this character LoRA
+        char_triggers = ", ".join(tw_data.get(stem, [stem]))
         parts.append(f"{char_triggers}, {pos}")
 
-    # Build structured prompt: shared scene description + per-character blocks
-    # Remove character names from the base prompt for the shared part
+    # Remove character trigger words from the base prompt for the shared part
     shared = prompt
-    for c in unique_chars:
-        shared = re.sub(re.escape(c), '', shared, flags=re.IGNORECASE)
+    for lp in char_lora_paths:
+        stem = Path(lp).stem
+        for tw in tw_data.get(stem, []):
+            shared = re.sub(re.escape(tw), '', shared, flags=re.IGNORECASE)
     shared = re.sub(r',\s*,', ',', shared).strip(', ')
 
-    structured = f"{len(unique_chars)} characters, multiple girls, group shot, {shared}"
+    structured = f"{len(char_lora_paths)} characters, group shot, {shared}"
     for part in parts:
         structured += f" BREAK {part}"
 
@@ -1069,6 +1063,20 @@ def generate_image(
                 load_lora(pipe, lp, weight=lw)
             else:
                 _log.warning("[IMAGE GEN] LoRA not found: %s", lp)
+
+    # Auto-inject missing trigger words for active LoRAs
+    if lora_paths:
+        tw_data = _load_trigger_words()
+        prompt_lower = prompt.lower()
+        for lp in lora_paths:
+            stem = Path(lp).stem
+            words = tw_data.get(stem, [])
+            if words:
+                # Use the first trigger word as the primary activator
+                primary = words[0]
+                if primary.lower() not in prompt_lower:
+                    prompt = f"{primary}, {prompt}"
+                    _log.info("[IMAGE GEN] Auto-injected trigger word '%s' for LoRA %s", primary, stem)
 
     # Build prompt based on mode
     if mode == "explicit":
@@ -3377,12 +3385,20 @@ def search_characters(query: str) -> dict:
             name_match = query_lower in f.stem.lower()
             trigger_match = any(query_lower in tw.lower() for tw in tw_data.get(f.stem, []))
             if name_match or trigger_match:
+                # Look for a preview image
+                preview = None
+                for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                    candidate = f.parent / f"{f.stem}.preview{ext}"
+                    if candidate.exists():
+                        preview = str(candidate)
+                        break
                 matching_loras.append({
                     "name": f.stem,
                     "path": str(f),
                     "size_mb": round(f.stat().st_size / (1024 * 1024), 1),
                     "category": cat,
                     "trigger_words": tw_data.get(f.stem, []),
+                    "preview_image": preview,
                 })
 
     # Search generation history for matching prompts
@@ -3525,6 +3541,9 @@ def generate_video(
     seed: int = -1,
     action_lora: str | None = None,
     negative_prompt: str | None = None,
+    _resume_latent: object | None = None,
+    _resume_step: int = 0,
+    _resume_job_id: str | None = None,
 ) -> dict:
     """Generate a video clip using WAN 2.1 with dual-LoRA actions.
 
@@ -3709,7 +3728,7 @@ def generate_video(
         _video_timing = [_time.time()]  # mutable list so callback can update
 
         # ── Checkpoint directory for this job ────────────────────
-        job_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{seed}"
+        job_id = _resume_job_id or f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{seed}"
         ckpt_dir = VIDEO_CHECKPOINT_DIR / job_id
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3789,6 +3808,19 @@ def generate_video(
             return callback_kwargs
 
         # ── Run pipeline ─────────────────────────────────────────
+        # If resuming from a checkpoint, inject the saved latent and
+        # use a step callback that skips already-completed steps.
+        effective_steps = steps
+        if _resume_latent is not None and _resume_step > 0:
+            _log.info("[WAN VIDEO] Injecting resume latent from step %d — "
+                      "pipeline will run full %d steps but skip first %d in callback",
+                      _resume_step, steps, _resume_step)
+            # Move the resume latent to the pipeline's device
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            resume_lat = _resume_latent.to(device=device, dtype=torch.bfloat16)
+        else:
+            resume_lat = None
+
         gen_kwargs = {
             "prompt": prompt,
             "negative_prompt": neg,
@@ -3800,6 +3832,10 @@ def generate_video(
             "generator": generator,
             "callback_on_step_end": _video_step_cb,
         }
+
+        # Pass the resume latent so the pipeline starts from saved state
+        if resume_lat is not None:
+            gen_kwargs["latents"] = resume_lat
 
         if image_path:
             # T2V-1.3B has no native I2V mode. We embed the reference image
@@ -4036,8 +4072,9 @@ def resume_interrupted_job(job_id: str) -> dict:
 
     If all diffusion steps are already saved in checkpoints, just decode
     the final latents through the VAE (fast, ~30s) instead of re-running
-    the entire diffusion process.  If only partially done, re-run from
-    scratch with the same seed for an identical result.
+    the entire diffusion process.  If partially done, attempt to resume
+    from the last saved checkpoint step.  Falls back to re-running from
+    scratch with the same seed only if checkpoint loading fails.
 
     Returns dict with status + path to the output mp4.
     """
@@ -4073,9 +4110,48 @@ def resume_interrupted_job(job_id: str) -> dict:
         _log.info("[WAN VIDEO] All %d steps saved — decoding from checkpoint", total_steps)
         return _decode_checkpoint_to_video(job_id, meta, ckpt_dir)
 
-    # Otherwise re-run from scratch with same params
-    _log.info("[WAN VIDEO] Only %d/%d steps — re-running from scratch (same seed)",
-              saved_steps, total_steps)
+    # If we have partial steps, try to resume from the last checkpoint
+    if saved_steps > 0:
+        last_ckpt = latent_files[-1]
+        _log.info("[WAN VIDEO] Resuming from step %d/%d — loading %s",
+                  saved_steps, total_steps, last_ckpt.name)
+        try:
+            ckpt_data = torch.load(str(last_ckpt), map_location="cpu", weights_only=True)
+            resume_latent = ckpt_data["latents"]
+            resume_step = ckpt_data["step"]
+            resume_timestep = ckpt_data.get("timestep")
+
+            _log.info("[WAN VIDEO] Loaded latent from step %d (timestep=%.1f), "
+                      "will run remaining %d steps",
+                      resume_step, resume_timestep or -1,
+                      total_steps - resume_step)
+
+            meta["status"] = "resuming"
+            meta["resume_from_step"] = resume_step
+            _save_json(meta_file, meta)
+
+            return generate_video(
+                prompt=meta.get("prompt", ""),
+                image_path=meta.get("image_path"),
+                width=meta.get("width", 480),
+                height=meta.get("height", 720),
+                num_frames=meta.get("num_frames", 81),
+                fps=meta.get("fps", 16),
+                steps=meta.get("steps", 30),
+                guidance_scale=meta.get("guidance_scale", 5.0),
+                seed=meta.get("seed", -1),
+                action_lora=meta.get("action_lora"),
+                negative_prompt=meta.get("negative_prompt"),
+                _resume_latent=resume_latent,
+                _resume_step=resume_step,
+                _resume_job_id=job_id,
+            )
+        except Exception as e:
+            _log.warning("[WAN VIDEO] Failed to load checkpoint latent: %s — "
+                         "falling back to full re-run", e)
+
+    # Fallback: re-run from scratch with same params
+    _log.info("[WAN VIDEO] No usable checkpoints — re-running from scratch (same seed)")
     meta["status"] = "superseded"
     _save_json(meta_file, meta)
 
