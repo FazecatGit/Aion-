@@ -1895,6 +1895,7 @@ class ImageGenRequest(BaseModel):
     negative_prompt: Optional[str] = None
     seed: int = -1
     art_style: str = "custom"
+    selected_outfits: dict[str, str] = {}  # {lora_stem: outfit_name}
 
 
 @app.post("/generate/image")
@@ -1936,6 +1937,7 @@ async def generate_image_endpoint(req: ImageGenRequest):
             negative_prompt=req.negative_prompt,
             seed=req.seed,
             art_style=req.art_style,
+            selected_outfits=req.selected_outfits or None,
         )
 
     result = await asyncio.to_thread(_gen)
@@ -1953,6 +1955,8 @@ async def generate_image_endpoint(req: ImageGenRequest):
         "prompt_analysis": result.get("prompt_analysis"),
         "settings": result.get("settings"),
         "long_prompt": result.get("long_prompt", False),
+        "lora_diagnostics": result.get("lora_diagnostics", []),
+        "injected_triggers": result.get("injected_triggers", []),
     })
     return response
 
@@ -2340,6 +2344,7 @@ class PreviewGenRequest(BaseModel):
     seed: int = -1
     art_style: str = "anime"
     negative_prompt: Optional[str] = None
+    selected_outfits: dict[str, str] = {}  # {lora_stem: outfit_name}
 
 
 @app.post("/generate/preview/quick")
@@ -2376,6 +2381,7 @@ async def generate_preview_only_endpoint(req: PreviewGenRequest):
             lora_paths=lora_paths or None,
             lora_weights=req.lora_weights or None,
             negative_prompt=req.negative_prompt,
+            selected_outfits=req.selected_outfits or None,
         )
 
     result = await asyncio.to_thread(_gen)
@@ -2431,6 +2437,7 @@ async def generate_preview_endpoint(req: PreviewGenRequest):
             lora_paths=lora_paths or None,
             lora_weights=req.lora_weights or None,
             negative_prompt=req.negative_prompt,
+            selected_outfits=req.selected_outfits or None,
         )
 
     result = await asyncio.to_thread(_gen)
@@ -2599,6 +2606,40 @@ async def image_feedback(req: ImageFeedbackRequest):
     return submit_feedback(req.generation_index, req.feedback)
 
 
+@app.get("/generate/feedback/learnings")
+async def get_feedback_learnings_endpoint():
+    """Get all current feedback learnings (positive + negative) for review."""
+    from agent.image_generation import get_feedback_learnings
+    return get_feedback_learnings()
+
+
+class ClearFeedbackRequest(BaseModel):
+    scope: str = "all"  # "all", "negatives", "positives", "history"
+
+@app.post("/generate/feedback/clear")
+async def clear_feedback_learnings_endpoint(req: ClearFeedbackRequest):
+    """Clear stored feedback learnings."""
+    from agent.image_generation import clear_feedback_learnings
+    return clear_feedback_learnings(req.scope)
+
+
+class CustomPositiveRequest(BaseModel):
+    positive_text: str
+
+@app.post("/generate/feedback/positive")
+async def save_custom_positive_endpoint(req: CustomPositiveRequest):
+    """Save a persistent positive keyword to enhance future generations."""
+    from agent.image_generation import save_custom_positive
+    return save_custom_positive(req.positive_text)
+
+
+@app.get("/generate/loras/trigger-words/parsed/{lora_name}")
+async def get_trigger_words_parsed_endpoint(lora_name: str):
+    """Get parsed trigger words with outfit groups for a specific LoRA."""
+    from agent.image_generation import get_trigger_words_parsed
+    return get_trigger_words_parsed(lora_name)
+
+
 @app.get("/generate/characters/search")
 async def search_characters_endpoint(q: str = ""):
     """Search all LoRA categories and past generations by name or trigger word."""
@@ -2689,11 +2730,11 @@ async def upload_lora_preview(lora_name: str, request):
 
 class TriggerWordRequest(BaseModel):
     lora_name: str
-    trigger_words: list[str]
+    trigger_words: list  # Accepts plain strings, {"word": str, "weight": float} objects, and ";"
 
 @app.post("/generate/loras/trigger-words")
 async def set_trigger_words_endpoint(req: TriggerWordRequest):
-    """Set trigger words for a LoRA file."""
+    """Set trigger words for a LoRA file. Supports weighted entries and outfit grouping via ';'."""
     from agent.image_generation import set_trigger_words
     return set_trigger_words(req.lora_name, req.trigger_words)
 

@@ -268,6 +268,12 @@ function App() {
   const [selectedLoras, setSelectedLoras] = useState<string[]>(() => {
     try { const s = localStorage.getItem('aion_selectedLoras'); return s ? JSON.parse(s) : []; } catch { return []; }
   });
+  const [loraWeights, setLoraWeights] = useState<Record<string, number>>(() => {
+    try { const s = localStorage.getItem('aion_loraWeights'); return s ? JSON.parse(s) : {}; } catch { return {}; }
+  });
+  const [selectedOutfits, setSelectedOutfits] = useState<Record<string, string>>(() => {
+    try { const s = localStorage.getItem('aion_selectedOutfits'); return s ? JSON.parse(s) : {}; } catch { return {}; }
+  });
   const [imageGenMode, setImageGenMode] = useState<'normal' | 'explicit'>('normal');
   const [imageGenSteps, setImageGenSteps] = useState(35);
   const [imageGenCfg, setImageGenCfg] = useState(7.5);
@@ -278,6 +284,7 @@ function App() {
   const [imageGenMeta, setImageGenMeta] = useState<any>(null);
   const [imageGenHistory, setImageGenHistory] = useState<any[]>([]);
   const [imageGenFeedback, setImageGenFeedback] = useState('');
+  const [feedbackLearnings, setFeedbackLearnings] = useState<any>(null);
   const [imageGenAnimated, setImageGenAnimated] = useState(false);
   const [imageGenFrames, setImageGenFrames] = useState(16);
   // ── New ImageStudio state ──────────────────────────────────────────────────
@@ -598,10 +605,16 @@ function App() {
     if (activeMode === 'imagegen') { fetchImageModels(); fetchImageHistory(); fetchArtStyles(); fetchAnimJobs(); fetchLoraCategories(); }
   }, [activeMode]);
 
-  // Persist selectedLoras and artStyle to localStorage
+  // Persist selectedLoras, loraWeights, selectedOutfits and artStyle to localStorage
   useEffect(() => {
     try { localStorage.setItem('aion_selectedLoras', JSON.stringify(selectedLoras)); } catch {}
   }, [selectedLoras]);
+  useEffect(() => {
+    try { localStorage.setItem('aion_loraWeights', JSON.stringify(loraWeights)); } catch {}
+  }, [loraWeights]);
+  useEffect(() => {
+    try { localStorage.setItem('aion_selectedOutfits', JSON.stringify(selectedOutfits)); } catch {}
+  }, [selectedOutfits]);
   useEffect(() => {
     try { localStorage.setItem('aion_imageGenArtStyle', imageGenArtStyle); } catch {}
   }, [imageGenArtStyle]);
@@ -1517,7 +1530,11 @@ const handleImagePreview = async () => {
       art_style: imageGenArtStyle,
     };
     if (selectedImageModel) body.model = selectedImageModel;
-    if (selectedLoras.length > 0) body.loras = selectedLoras;
+    if (selectedLoras.length > 0) {
+      body.loras = selectedLoras;
+      body.lora_weights = selectedLoras.map(l => loraWeights[l] ?? 0.8);
+      if (Object.keys(selectedOutfits).length > 0) body.selected_outfits = selectedOutfits;
+    }
     if (imageGenNegative.trim()) body.negative_prompt = imageGenNegative.trim();
 
     const res = await fetch('http://localhost:8000/generate/preview/quick', {
@@ -1585,7 +1602,11 @@ const handleFullRenderFromPreview = async () => {
       art_style: imageGenArtStyle,
     };
     if (selectedImageModel) body.model = selectedImageModel;
-    if (selectedLoras.length > 0) body.loras = selectedLoras;
+    if (selectedLoras.length > 0) {
+      body.loras = selectedLoras;
+      body.lora_weights = selectedLoras.map(l => loraWeights[l] ?? 0.8);
+      if (Object.keys(selectedOutfits).length > 0) body.selected_outfits = selectedOutfits;
+    }
     if (imageGenNegative.trim()) body.negative_prompt = imageGenNegative.trim();
 
     const res = await fetch('http://localhost:8000/generate/image', {
@@ -1653,7 +1674,13 @@ const handleImageGenerate = async (animatedOverride?: boolean) => {
       seed: imageGenSeed,
     };
     if (selectedImageModel) body.model = selectedImageModel;
-    if (selectedLoras.length > 0) body.loras = selectedLoras;
+    if (selectedLoras.length > 0) {
+      body.loras = selectedLoras;
+      // Send per-LoRA weights (default 0.8 if not set)
+      body.lora_weights = selectedLoras.map(l => loraWeights[l] ?? 0.8);
+      // Send selected outfits for multi-costume LoRAs
+      if (Object.keys(selectedOutfits).length > 0) body.selected_outfits = selectedOutfits;
+    }
     if (imageGenNegative.trim()) body.negative_prompt = imageGenNegative.trim();
     body.art_style = imageGenArtStyle;
     if (isAnimated) {
@@ -1746,6 +1773,28 @@ const submitImageFeedback = async (index: number, feedback: string) => {
     });
     setImageGenFeedback('');
     fetchImageHistory();
+    fetchFeedbackLearnings();
+  } catch {}
+};
+
+// Fetch feedback learnings
+const fetchFeedbackLearnings = async () => {
+  try {
+    const res = await fetch('http://localhost:8000/generate/feedback/learnings');
+    const data = await res.json();
+    if (data.status === 'ok') setFeedbackLearnings(data);
+  } catch {}
+};
+
+// Clear feedback learnings
+const clearFeedbackLearnings = async (scope: string) => {
+  try {
+    await fetch('http://localhost:8000/generate/feedback/clear', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope }),
+    });
+    fetchFeedbackLearnings();
   } catch {}
 };
 
@@ -5281,21 +5330,58 @@ return (
                 </button>
               </div>
 
-              {/* Selected LoRAs chips */}
+              {/* Selected LoRAs chips with weight sliders */}
               {selectedLoras.length > 0 && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '6px' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '6px' }}>
                   {selectedLoras.map(l => {
                     // Find trigger words for this LoRA from loaded categories
-                    const loraTw = Object.values(loraCategories).flat().find((lr: any) => lr.name === l)?.trigger_words;
+                    const loraData = Object.values(loraCategories).flat().find((lr: any) => lr.name === l) as any;
+                    const loraTw = loraData?.trigger_words;
+                    const weight = loraWeights[l] ?? 0.8;
+                    // Check if this LoRA has outfit groups (semicolons in trigger words)
+                    const hasOutfits = loraTw && loraTw.some((tw: string) => tw === ';');
+                    let outfitNames: string[] = [];
+                    if (hasOutfits) {
+                      // Parse outfit names: words after each ";" that aren't tags
+                      let inGroup = false;
+                      for (const tw of loraTw) {
+                        if (tw === ';') { inGroup = true; continue; }
+                        if (inGroup) { outfitNames.push(tw); inGroup = false; }
+                      }
+                    }
                     return (
-                    <span key={l} style={{
-                      padding: '2px 8px', borderRadius: '10px', fontSize: '10px',
+                    <div key={l} style={{
+                      padding: '4px 8px', borderRadius: '10px', fontSize: '10px',
                       backgroundColor: 'rgba(179,136,255,0.15)', color: '#b388ff', border: '1px solid rgba(179,136,255,0.3)',
-                      display: 'flex', alignItems: 'center', gap: '4px',
+                      display: 'flex', flexDirection: 'column', gap: '3px',
                     }}>
-                      {l}
-                      <span onClick={() => { if (loraTw?.length) removeTriggerWord(loraTw[0]); setSelectedLoras(prev => prev.filter(x => x !== l)); }} style={{ cursor: 'pointer', color: '#ff4444', fontWeight: 'bold' }}>×</span>
-                    </span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{l}</span>
+                        {/* Weight slider */}
+                        <input type="range" min="0" max="1.5" step="0.05" value={weight}
+                          onChange={e => setLoraWeights(prev => ({ ...prev, [l]: parseFloat(e.target.value) }))}
+                          style={{ width: '60px', height: '12px', accentColor: '#b388ff' }}
+                          title={`Weight: ${weight.toFixed(2)}`} />
+                        <span style={{ fontSize: '9px', color: '#888', minWidth: '28px', textAlign: 'right', fontFamily: 'monospace' }}>{weight.toFixed(2)}</span>
+                        <span onClick={() => { if (loraTw?.length) removeTriggerWord(loraTw[0]); setSelectedLoras(prev => prev.filter(x => x !== l)); setLoraWeights(prev => { const n = {...prev}; delete n[l]; return n; }); }} style={{ cursor: 'pointer', color: '#ff4444', fontWeight: 'bold' }}>×</span>
+                      </div>
+                      {/* Outfit selector for multi-costume LoRAs */}
+                      {outfitNames.length > 0 && (
+                        <div style={{ display: 'flex', gap: '3px', flexWrap: 'wrap', paddingLeft: '4px' }}>
+                          <span style={{ fontSize: '9px', color: '#666' }}>Outfit:</span>
+                          {outfitNames.map(outfit => (
+                            <span key={outfit}
+                              onClick={() => setSelectedOutfits(prev => ({ ...prev, [l]: outfit }))}
+                              style={{
+                                padding: '1px 6px', borderRadius: '8px', fontSize: '9px', cursor: 'pointer',
+                                backgroundColor: selectedOutfits[l] === outfit ? 'rgba(179,136,255,0.3)' : 'rgba(100,100,100,0.15)',
+                                color: selectedOutfits[l] === outfit ? '#b388ff' : '#666',
+                                border: `1px solid ${selectedOutfits[l] === outfit ? 'rgba(179,136,255,0.4)' : 'rgba(100,100,100,0.2)'}`,
+                              }}>{outfit}</span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                     );
                   })}
                 </div>
@@ -6489,6 +6575,30 @@ return (
                   )}
                 </div>
 
+                {/* LoRA diagnostics */}
+                {imageGenMeta.lora_diagnostics?.length > 0 && (
+                  <details style={{ fontSize: '11px', color: '#888' }}>
+                    <summary style={{ cursor: 'pointer', color: '#b388ff' }}>LoRA Status ({imageGenMeta.lora_diagnostics.filter((d: any) => d.loaded).length}/{imageGenMeta.lora_diagnostics.length} loaded)</summary>
+                    <div style={{ marginTop: '4px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                      {imageGenMeta.lora_diagnostics.map((d: any, i: number) => (
+                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 6px', borderRadius: '6px', backgroundColor: d.loaded ? 'rgba(0,204,136,0.1)' : 'rgba(255,68,68,0.1)' }}>
+                          <span style={{ color: d.loaded ? '#00cc88' : '#ff4444' }}>{d.loaded ? '✓' : '✗'}</span>
+                          <span style={{ flex: 1, color: '#aaa' }}>{d.name}</span>
+                          <span style={{ fontSize: '9px', fontFamily: 'monospace', color: '#666' }}>w={d.weight}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+                {imageGenMeta.injected_triggers && (
+                  <details style={{ fontSize: '11px', color: '#888' }}>
+                    <summary style={{ cursor: 'pointer', color: '#666' }}>Injected trigger words</summary>
+                    <pre style={{ marginTop: '4px', padding: '8px', backgroundColor: '#0a0a0a', borderRadius: '6px', whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontSize: '10px', color: '#aaa', maxHeight: '80px', overflowY: 'auto' }}>
+                      {imageGenMeta.injected_triggers}
+                    </pre>
+                  </details>
+                )}
+
                 {/* Full prompt used */}
                 <details style={{ fontSize: '11px', color: '#888' }}>
                   <summary style={{ cursor: 'pointer', color: '#666' }}>Full prompt sent to model</summary>
@@ -6519,6 +6629,47 @@ return (
                     Submit Feedback
                   </button>
                 </div>
+
+                {/* Feedback learnings display */}
+                <details style={{ fontSize: '11px', color: '#888' }}
+                  onToggle={(e: any) => { if (e.target.open) fetchFeedbackLearnings(); }}>
+                  <summary style={{ cursor: 'pointer', color: '#ff9900' }}>Feedback Learnings</summary>
+                  {feedbackLearnings ? (
+                    <div style={{ marginTop: '4px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                      {feedbackLearnings.negative_keywords?.length > 0 && (
+                        <div>
+                          <span style={{ fontSize: '9px', color: '#ff4444' }}>Avoiding:</span>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '2px', marginTop: '2px' }}>
+                            {feedbackLearnings.negative_keywords.map((kw: string, i: number) => (
+                              <span key={i} style={{ padding: '1px 6px', borderRadius: '8px', fontSize: '9px', backgroundColor: 'rgba(255,68,68,0.1)', color: '#ff4444', border: '1px solid rgba(255,68,68,0.2)' }}>{kw}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {feedbackLearnings.positive_keywords?.length > 0 && (
+                        <div>
+                          <span style={{ fontSize: '9px', color: '#00cc88' }}>Boosting:</span>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '2px', marginTop: '2px' }}>
+                            {feedbackLearnings.positive_keywords.map((kw: string, i: number) => (
+                              <span key={i} style={{ padding: '1px 6px', borderRadius: '8px', fontSize: '9px', backgroundColor: 'rgba(0,204,136,0.1)', color: '#00cc88', border: '1px solid rgba(0,204,136,0.2)' }}>{kw}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {(!feedbackLearnings.negative_keywords?.length && !feedbackLearnings.positive_keywords?.length) && (
+                        <span style={{ color: '#444', fontSize: '10px' }}>No learnings yet — submit feedback to train the system</span>
+                      )}
+                      {(feedbackLearnings.negative_keywords?.length > 0 || feedbackLearnings.positive_keywords?.length > 0) && (
+                        <button onClick={() => clearFeedbackLearnings('all')} style={{
+                          marginTop: '4px', padding: '3px 8px', borderRadius: '6px', border: '1px solid #333',
+                          backgroundColor: 'transparent', color: '#666', fontSize: '9px', cursor: 'pointer',
+                        }}>Clear all learnings</button>
+                      )}
+                    </div>
+                  ) : (
+                    <span style={{ color: '#444', fontSize: '10px' }}>Loading...</span>
+                  )}
+                </details>
               </div>
             )}
           </div>

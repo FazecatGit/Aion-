@@ -255,16 +255,193 @@ def _save_trigger_words(data: dict):
     )
 
 
+def parse_trigger_word_entry(entry) -> dict:
+    """Parse a trigger word entry, which may be a plain string or a weighted object.
+
+    Returns: {"word": str, "weight": float}
+    """
+    if isinstance(entry, dict):
+        return {"word": str(entry.get("word", "")), "weight": float(entry.get("weight", 1.0))}
+    return {"word": str(entry), "weight": 1.0}
+
+
+def format_trigger_word(entry) -> str:
+    """Format a trigger word with its weight for prompt injection.
+
+    Plain weight 1.0 → just the word. Other weights → (word:weight) syntax.
+    """
+    parsed = parse_trigger_word_entry(entry)
+    word = parsed["word"]
+    weight = parsed["weight"]
+    if not word or word == ";":
+        return ""
+    # Already has explicit weight syntax like (word:1.2) — leave as-is
+    if re.match(r'^\(.*:\d+\.?\d*\)$', word):
+        return word
+    if abs(weight - 1.0) < 0.01:
+        return word
+    return f"({word}:{weight:.1f})"
+
+
+def parse_outfit_groups(words: list) -> dict:
+    """Parse a trigger word array that uses `;` as outfit/costume group separator.
+
+    Format in trigger_words.json:
+        ["primaryTrigger", ";", "outfitName", "tag1", "tag2", ";", "outfit2", ...]
+
+    Returns:
+        {
+            "primary": "primaryTrigger",         # first word before any ";"
+            "outfits": {                          # groups delimited by ";"
+                "outfitName": ["tag1", "tag2"],
+                "outfit2": [...]
+            },
+            "flat_words": ["primaryTrigger", "tag1", "tag2", ...],  # all non-";" entries
+            "has_outfits": True/False
+        }
+    """
+    raw_entries = [parse_trigger_word_entry(w) for w in words]
+    # Check if semicolons are present
+    has_semicolons = any(e["word"] == ";" for e in raw_entries)
+
+    if not has_semicolons:
+        # Simple list — no outfit grouping. All words are trigger words.
+        flat = [e for e in raw_entries if e["word"]]
+        return {
+            "primary": flat[0]["word"] if flat else "",
+            "outfits": {},
+            "flat_words": flat,
+            "has_outfits": False,
+        }
+
+    # Split by semicolons into groups
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    for e in raw_entries:
+        if e["word"] == ";":
+            if current:
+                groups.append(current)
+            current = []
+        else:
+            if e["word"]:
+                current.append(e)
+    if current:
+        groups.append(current)
+
+    # First group's first word (before any ";") = primary trigger
+    primary = groups[0][0]["word"] if groups and groups[0] else ""
+
+    # Everything in the first group beyond the primary is NOT an outfit — it's
+    # standalone trigger words. Remaining groups are outfit groups.
+    outfits: dict[str, list[dict]] = {}
+    standalone: list[dict] = []
+
+    if groups:
+        # First group: primary + any extras that aren't outfit groups
+        standalone = groups[0]
+
+    # Groups after the first — each starts with an outfit name
+    for g in groups[1:]:
+        if g:
+            outfit_name = g[0]["word"]
+            outfit_tags = g[1:] if len(g) > 1 else []
+            outfits[outfit_name] = outfit_tags
+
+    flat = [e for e in raw_entries if e["word"] and e["word"] != ";"]
+
+    return {
+        "primary": primary,
+        "outfits": outfits,
+        "flat_words": flat,
+        "has_outfits": bool(outfits),
+    }
+
+
+def build_trigger_prompt(words: list, selected_outfit: str | None = None) -> str:
+    """Build the trigger word string to inject into a prompt.
+
+    - If the LoRA has outfit groups and an outfit is selected, injects the
+      primary trigger + that outfit's tags.
+    - If no outfit selected but outfits exist, uses the first outfit.
+    - If no outfit groups, injects ALL trigger words.
+
+    Returns a comma-separated string ready to prepend to the prompt.
+    """
+    parsed = parse_outfit_groups(words)
+
+    parts: list[str] = []
+
+    if parsed["has_outfits"]:
+        # Always include the primary trigger
+        primary_fmt = format_trigger_word({"word": parsed["primary"], "weight": 1.0})
+        if primary_fmt:
+            parts.append(primary_fmt)
+
+        # Select outfit
+        outfit_tags: list[dict] = []
+        if selected_outfit and selected_outfit in parsed["outfits"]:
+            outfit_tags = parsed["outfits"][selected_outfit]
+        elif parsed["outfits"]:
+            # Default to first outfit
+            first_key = next(iter(parsed["outfits"]))
+            outfit_tags = parsed["outfits"][first_key]
+
+        for tag in outfit_tags:
+            fmt = format_trigger_word(tag)
+            if fmt:
+                parts.append(fmt)
+    else:
+        # No outfits — inject ALL trigger words
+        for entry in parsed["flat_words"]:
+            fmt = format_trigger_word(entry)
+            if fmt:
+                parts.append(fmt)
+
+    return ", ".join(parts)
+
+
 def get_trigger_words(lora_name: str) -> list[str]:
     """Get trigger words for a specific LoRA by name."""
     data = _load_trigger_words()
     return data.get(lora_name, [])
 
 
-def set_trigger_words(lora_name: str, words: list[str]) -> dict:
-    """Set trigger words for a LoRA. Overwrites any existing entry."""
+def get_trigger_words_parsed(lora_name: str) -> dict:
+    """Get parsed trigger words with outfit groups for a specific LoRA."""
     data = _load_trigger_words()
-    data[lora_name] = [w.strip() for w in words if w.strip()]
+    raw = data.get(lora_name, [])
+    parsed = parse_outfit_groups(raw)
+    return {
+        "lora": lora_name,
+        "primary": parsed["primary"],
+        "has_outfits": parsed["has_outfits"],
+        "outfits": {k: [format_trigger_word(t) for t in v] for k, v in parsed["outfits"].items()},
+        "all_words": [format_trigger_word(e) for e in parsed["flat_words"]],
+    }
+
+
+def set_trigger_words(lora_name: str, words: list) -> dict:
+    """Set trigger words for a LoRA. Overwrites any existing entry.
+
+    Accepts plain strings, weighted objects {"word": str, "weight": float},
+    and ";" separators for outfit grouping.
+    """
+    data = _load_trigger_words()
+    cleaned = []
+    for w in words:
+        if isinstance(w, dict):
+            word = str(w.get("word", "")).strip()
+            weight = float(w.get("weight", 1.0))
+            if word:
+                if word == ";" or abs(weight - 1.0) < 0.01:
+                    cleaned.append(word)
+                else:
+                    cleaned.append({"word": word, "weight": weight})
+        elif isinstance(w, str):
+            w = w.strip()
+            if w:
+                cleaned.append(w)
+    data[lora_name] = cleaned
     _save_trigger_words(data)
     return {"status": "ok", "lora": lora_name, "trigger_words": data[lora_name]}
 
@@ -278,8 +455,18 @@ def delete_trigger_words(lora_name: str) -> dict:
 
 
 def get_all_trigger_words() -> dict:
-    """Return the full trigger words mapping."""
-    return {"status": "ok", "trigger_words": _load_trigger_words()}
+    """Return the full trigger words mapping with parsed outfit info."""
+    raw = _load_trigger_words()
+    result = {}
+    for lora_name, words in raw.items():
+        parsed = parse_outfit_groups(words)
+        result[lora_name] = {
+            "raw": words,
+            "primary": parsed["primary"],
+            "has_outfits": parsed["has_outfits"],
+            "outfits": list(parsed["outfits"].keys()),
+        }
+    return {"status": "ok", "trigger_words": result}
 
 
 def list_loras_by_category() -> dict:
@@ -716,6 +903,145 @@ def save_custom_negative(negative_text: str):
     return {"status": "ok", "total": len(existing)}
 
 
+# ── Positive feedback learnings ──────────────────────────────────────────
+
+_CUSTOM_POSITIVES_FILE = Path(OUTPUT_DIR) / "custom_positives.json"
+
+# Keywords in feedback that suggest positive prompt additions
+_POSITIVE_KEYWORDS = {
+    "vibrant": "vibrant colors, vivid palette",
+    "vivid": "vibrant colors, vivid palette",
+    "colorful": "colorful, rich color palette",
+    "detailed": "highly detailed, intricate details",
+    "sharp": "sharp focus, crisp details",
+    "soft": "soft lighting, gentle tones",
+    "warm": "warm lighting, warm color palette",
+    "cool": "cool tones, cool lighting",
+    "dramatic": "dramatic lighting, high contrast",
+    "cinematic": "cinematic composition, cinematic lighting",
+    "dynamic": "dynamic pose, dynamic composition",
+    "elegant": "elegant, refined, graceful",
+    "cute": "cute, adorable, kawaii",
+    "beautiful": "beautiful, stunning, gorgeous",
+    "realistic": "realistic proportions, lifelike",
+    "moody": "moody atmosphere, atmospheric lighting",
+    "pastel": "pastel colors, soft palette",
+    "bold": "bold colors, strong contrast",
+    "clean": "clean lines, clean composition",
+    "smooth": "smooth shading, smooth skin",
+}
+
+
+def apply_positive_learnings(base_prompt: str) -> str:
+    """Apply positive learnings from user feedback to enhance the prompt.
+
+    Scans recent feedback for positive signals and adds corresponding prompt
+    enhancements. Also loads persistent custom positive keywords.
+    """
+    additions = set()
+
+    # Scan recent feedback for positive keywords
+    for entry in _generation_history[-10:]:
+        fb = (entry.get("feedback") or "").lower()
+        if not fb:
+            continue
+        # Skip negative-sounding feedback (these go to negative prompt)
+        negative_signals = ["bad", "wrong", "ugly", "deform", "error", "worse", "too"]
+        if any(sig in fb for sig in negative_signals):
+            continue
+        # Check for positive keywords
+        for key, pos_text in _POSITIVE_KEYWORDS.items():
+            if key in fb:
+                additions.add(pos_text)
+
+    # Load persistent custom positives
+    if _CUSTOM_POSITIVES_FILE.exists():
+        try:
+            data = json.loads(_CUSTOM_POSITIVES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                additions.update(data)
+        except Exception:
+            pass
+
+    if additions:
+        return ", ".join(additions) + ", " + base_prompt
+    return base_prompt
+
+
+def save_custom_positive(positive_text: str):
+    """Add a persistent positive keyword/phrase to enhance future generation prompts."""
+    existing = []
+    if _CUSTOM_POSITIVES_FILE.exists():
+        try:
+            existing = json.loads(_CUSTOM_POSITIVES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            existing = []
+    parts = [p.strip() for p in positive_text.split(",") if p.strip()]
+    for p in parts:
+        if p not in existing:
+            existing.append(p)
+    _CUSTOM_POSITIVES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _CUSTOM_POSITIVES_FILE.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    return {"status": "ok", "total": len(existing)}
+
+
+def get_feedback_learnings() -> dict:
+    """Return all current feedback learnings (positive + negative) for review."""
+    neg = []
+    if _CUSTOM_NEGATIVES_FILE.exists():
+        try:
+            neg = json.loads(_CUSTOM_NEGATIVES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    pos = []
+    if _CUSTOM_POSITIVES_FILE.exists():
+        try:
+            pos = json.loads(_CUSTOM_POSITIVES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # Also gather dynamic learnings from recent history
+    dynamic_neg = set()
+    dynamic_pos = set()
+    dummy_neg = apply_feedback_learnings("")
+    if dummy_neg:
+        dynamic_neg = {p.strip() for p in dummy_neg.split(",") if p.strip()}
+    dummy_pos_base = "MARKER"
+    dummy_pos = apply_positive_learnings(dummy_pos_base)
+    if dummy_pos != dummy_pos_base:
+        prefix = dummy_pos.replace(dummy_pos_base, "").strip(", ")
+        dynamic_pos = {p.strip() for p in prefix.split(",") if p.strip()}
+
+    return {
+        "status": "ok",
+        "persistent_negatives": neg,
+        "persistent_positives": pos,
+        "dynamic_negatives": list(dynamic_neg),
+        "dynamic_positives": list(dynamic_pos),
+        "total_history_entries": len(_generation_history),
+        "entries_with_feedback": sum(1 for e in _generation_history if e.get("feedback")),
+    }
+
+
+def clear_feedback_learnings(scope: str = "all") -> dict:
+    """Clear feedback learnings.
+
+    Args:
+        scope: "all", "negatives", "positives", or "history"
+    """
+    if scope in ("all", "negatives"):
+        if _CUSTOM_NEGATIVES_FILE.exists():
+            _CUSTOM_NEGATIVES_FILE.write_text("[]", encoding="utf-8")
+    if scope in ("all", "positives"):
+        if _CUSTOM_POSITIVES_FILE.exists():
+            _CUSTOM_POSITIVES_FILE.write_text("[]", encoding="utf-8")
+    if scope in ("all", "history"):
+        for entry in _generation_history:
+            entry["feedback"] = None
+        _save_history_to_disk()
+    return {"status": "ok", "cleared": scope}
+
+
 # ── Vocabulary Expansion (synonym suggestions for better prompts) ─────────
 
 # Curated mapping of common words to SD-friendly alternatives.
@@ -934,13 +1260,17 @@ def _structure_multi_angle_prompt(prompt: str) -> str:
 
 # ── Multi-character prompt structuring ────────────────────────────────────
 
-def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None = None) -> str:
+def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None = None,
+                                      selected_outfits: dict[str, str] | None = None) -> str:
     """Detect multiple character names in prompt and structure them so SDXL
     renders each character distinctly rather than merging them into one.
 
     Only activates when 2+ character-category LoRAs are actively loaded,
     preventing false positives from trigger words that happen to appear
     in the prompt text.
+
+    Args:
+        selected_outfits: Optional dict of {lora_stem: outfit_name} for outfit selection.
     """
     if not lora_paths or len(lora_paths) < 2:
         return prompt
@@ -966,20 +1296,29 @@ def _structure_multi_character_prompt(prompt: str, lora_paths: list[str] | None 
     tw_data = _load_trigger_words()
     positions = ["on the left", "on the right", "in the center", "in the background"]
     parts = []
+    selected_outfits = selected_outfits or {}
 
     for i, lp in enumerate(char_lora_paths[:4]):  # max 4 characters
         stem = Path(lp).stem
         pos = positions[i] if i < len(positions) else positions[-1]
-        # Look up trigger words for this character LoRA
-        char_triggers = ", ".join(tw_data.get(stem, [stem]))
+        # Use the new trigger word system for proper outfit-aware injection
+        words = tw_data.get(stem, [])
+        if words:
+            outfit = selected_outfits.get(stem)
+            char_triggers = build_trigger_prompt(words, selected_outfit=outfit)
+        else:
+            char_triggers = stem
         parts.append(f"{char_triggers}, {pos}")
 
     # Remove character trigger words from the base prompt for the shared part
     shared = prompt
     for lp in char_lora_paths:
         stem = Path(lp).stem
-        for tw in tw_data.get(stem, []):
-            shared = re.sub(re.escape(tw), '', shared, flags=re.IGNORECASE)
+        words = tw_data.get(stem, [])
+        for w in words:
+            tw_str = parse_trigger_word_entry(w)["word"]
+            if tw_str and tw_str != ";":
+                shared = re.sub(re.escape(tw_str), '', shared, flags=re.IGNORECASE)
     shared = re.sub(r',\s*,', ',', shared).strip(', ')
 
     structured = f"{len(char_lora_paths)} characters, group shot, {shared}"
@@ -1019,6 +1358,7 @@ def generate_image(
     negative_prompt: str | None = None,
     seed: int = -1,
     art_style: str = "custom",
+    selected_outfits: dict[str, str] | None = None,
 ) -> dict:
     """
     Generate an image. Returns dict with path, prompt analysis, settings used.
@@ -1055,28 +1395,66 @@ def generate_image(
     pipe = _load_pipeline(model_path)
 
     # Load LoRAs if requested
+    lora_diagnostics = []  # track what was actually loaded
     if lora_paths:
         unload_loras(pipe)  # clear any previous LoRAs
         weights = lora_weights or [0.8] * len(lora_paths)
         for lp, lw in zip(lora_paths, weights):
             if Path(lp).exists():
                 load_lora(pipe, lp, weight=lw)
+                stem = Path(lp).stem
+                tw_data_diag = _load_trigger_words()
+                words_diag = tw_data_diag.get(stem, [])
+                lora_diagnostics.append({
+                    "name": stem,
+                    "path": lp,
+                    "weight": lw,
+                    "trigger_words": [parse_trigger_word_entry(w)["word"]
+                                      for w in words_diag if parse_trigger_word_entry(w)["word"] != ";"],
+                    "loaded": True,
+                })
+                _log.info("[IMAGE GEN] ✓ LoRA loaded: %s (weight=%.2f, file=%s)",
+                          stem, lw, Path(lp).name)
             else:
-                _log.warning("[IMAGE GEN] LoRA not found: %s", lp)
+                lora_diagnostics.append({
+                    "name": Path(lp).stem,
+                    "path": lp,
+                    "weight": lw,
+                    "trigger_words": [],
+                    "loaded": False,
+                    "error": "File not found",
+                })
+                _log.warning("[IMAGE GEN] ✗ LoRA not found: %s", lp)
 
     # Auto-inject missing trigger words for active LoRAs
+    injected_triggers = []
     if lora_paths:
         tw_data = _load_trigger_words()
         prompt_lower = prompt.lower()
+        selected_outfits = selected_outfits or {}
         for lp in lora_paths:
+            if not Path(lp).exists():
+                continue
             stem = Path(lp).stem
             words = tw_data.get(stem, [])
             if words:
-                # Use the first trigger word as the primary activator
-                primary = words[0]
-                if primary.lower() not in prompt_lower:
-                    prompt = f"{primary}, {prompt}"
-                    _log.info("[IMAGE GEN] Auto-injected trigger word '%s' for LoRA %s", primary, stem)
+                # Build the full trigger prompt using outfit-aware system
+                outfit = selected_outfits.get(stem)
+                trigger_str = build_trigger_prompt(words, selected_outfit=outfit)
+                if trigger_str:
+                    # Check which parts are already in the prompt
+                    missing_parts = []
+                    for part in trigger_str.split(", "):
+                        part_clean = re.sub(r'^\(|\)$', '', part).split(":")[0].lower()
+                        if part_clean and part_clean not in prompt_lower:
+                            missing_parts.append(part)
+                    if missing_parts:
+                        inject_str = ", ".join(missing_parts)
+                        prompt = f"{inject_str}, {prompt}"
+                        prompt_lower = prompt.lower()
+                        injected_triggers.append({"lora": stem, "injected": inject_str})
+                        _log.info("[IMAGE GEN] Auto-injected trigger words for LoRA %s: %s",
+                                  stem, inject_str)
 
     # Build prompt based on mode
     if mode == "explicit":
@@ -1088,13 +1466,14 @@ def generate_image(
 
     # Structure multi-angle and multi-character prompts
     full_prompt = _structure_multi_angle_prompt(full_prompt)
-    full_prompt = _structure_multi_character_prompt(full_prompt, lora_paths)
+    full_prompt = _structure_multi_character_prompt(full_prompt, lora_paths, selected_outfits)
 
     # Apply art style
     full_prompt, base_neg = _apply_art_style(full_prompt, base_neg, art_style)
 
-    # Apply feedback learnings to negative prompt
+    # Apply feedback learnings
     full_negative = apply_feedback_learnings(base_neg)
+    full_prompt = apply_positive_learnings(full_prompt)
 
     # Clamp settings
     steps = max(10, min(steps, 80))
@@ -1190,6 +1569,8 @@ def generate_image(
             "prompt_analysis": prompt_analysis,
             "settings": settings,
             "long_prompt": long_prompt_used,
+            "lora_diagnostics": lora_diagnostics,
+            "injected_triggers": injected_triggers,
         }
 
     except InterruptedError:
@@ -1984,6 +2365,7 @@ def generate_animated(
     base_neg = negative_prompt or DEFAULT_NEGATIVE
     styled_prompt, styled_negative = _apply_art_style(prompt, base_neg, art_style)
     full_negative = apply_feedback_learnings(styled_negative)
+    styled_prompt = apply_positive_learnings(styled_prompt)
 
     # ── Load pipelines ────────────────────────────────────────────
     evict_ollama_models()
@@ -2531,13 +2913,20 @@ def generate_preview_only(
     lora_paths: list[str] | None = None,
     lora_weights: list[float] | None = None,
     negative_prompt: str | None = None,
+    selected_outfits: dict[str, str] | None = None,
+    preview_steps: int = 4,
 ) -> dict:
-    """Fast noisy preview that produces the SAME image as full render, just noisier.
+    """Fast noisy preview that produces a rough version of the SAME image
+    the full render will produce.
 
-    Strategy: run the full pipeline at full resolution but stop early (partial
-    denoise) and return the intermediate result. This guarantees the preview
-    is a noisy/pixelated version of the exact same image the full render will
-    produce, since the identical seed + latent noise path is used.
+    Strategy: run the full pipeline but use a step callback to capture the
+    intermediate noisy latent at an early step, then decode that latent with
+    the VAE. Because the same seed, same resolution, and same prompt are used,
+    the preview is guaranteed to share composition with the full render — it's
+    just noisier/rougher because the denoising was cut short.
+
+    The returned seed should be passed to the full render to reproduce the
+    exact same result at full quality.
     """
     from PIL import Image as PILImage
 
@@ -2545,47 +2934,155 @@ def generate_preview_only(
     if seed < 0:
         seed = torch.randint(0, 2**32, (1,)).item()
 
-    # Generate full image with very few steps — same seed, same resolution
-    # The key insight: same seed + same resolution = same latent noise = same composition
-    # Fewer steps = noisier but structurally identical
-    preview = generate_image(
-        prompt=prompt,
-        width=width,
-        height=height,
-        model_path=model_path,
-        lora_paths=lora_paths,
-        lora_weights=lora_weights,
-        mode=mode,
-        steps=max(4, min(steps, 8)),  # very few steps for speed
-        guidance_scale=guidance_scale,
-        negative_prompt=negative_prompt,
-        seed=seed,
-        art_style=art_style,
-    )
-    if preview.get("status") == "error":
-        return preview
+    # Resolve model
+    model_path = _resolve_model_path(model_path)
+    if model_path is None:
+        return {"status": "error", "error": "No model files found in models/ directory"}
+    if not Path(model_path).exists():
+        return {"status": "error", "error": f"Model not found: {model_path}"}
 
-    # Downscale the result for display speed (transfer over network)
-    preview_path = preview.get("path")
-    if preview_path and Path(preview_path).exists():
-        try:
-            img = PILImage.open(preview_path)
-            display_w = max(256, width // 2)
-            display_h = max(256, height // 2)
-            img_small = img.resize((display_w, display_h), PILImage.LANCZOS)
-            img_small.save(preview_path)
-        except Exception:
-            pass  # keep original if resize fails
+    evict_ollama_models()
+    pipe = _load_pipeline(model_path)
+
+    # Load LoRAs
+    if lora_paths:
+        unload_loras(pipe)
+        weights = lora_weights or [0.8] * len(lora_paths)
+        for lp, lw in zip(lora_paths, weights):
+            if Path(lp).exists():
+                load_lora(pipe, lp, weight=lw)
+
+    # Build prompt with trigger word injection (same logic as generate_image)
+    selected_outfits = selected_outfits or {}
+    if lora_paths:
+        tw_data = _load_trigger_words()
+        prompt_lower = prompt.lower()
+        for lp in lora_paths:
+            if not Path(lp).exists():
+                continue
+            stem = Path(lp).stem
+            words = tw_data.get(stem, [])
+            if words:
+                outfit = selected_outfits.get(stem)
+                trigger_str = build_trigger_prompt(words, selected_outfit=outfit)
+                if trigger_str:
+                    missing_parts = []
+                    for part in trigger_str.split(", "):
+                        part_clean = re.sub(r'^\(|\)$', '', part).split(":")[0].lower()
+                        if part_clean and part_clean not in prompt_lower:
+                            missing_parts.append(part)
+                    if missing_parts:
+                        inject_str = ", ".join(missing_parts)
+                        prompt = f"{inject_str}, {prompt}"
+                        prompt_lower = prompt.lower()
+
+    if mode == "explicit":
+        full_prompt = f"score_9, score_8_up, score_7_up, {prompt}"
+        base_neg = negative_prompt or EXPLICIT_NEGATIVE
+    else:
+        full_prompt = prompt
+        base_neg = negative_prompt or DEFAULT_NEGATIVE
+
+    full_prompt = _structure_multi_angle_prompt(full_prompt)
+    full_prompt = _structure_multi_character_prompt(full_prompt, lora_paths, selected_outfits)
+    full_prompt, base_neg = _apply_art_style(full_prompt, base_neg, art_style)
+    full_negative = apply_feedback_learnings(base_neg)
+    full_prompt = apply_positive_learnings(full_prompt)
+
+    # Use a moderate total step count but capture the latent at preview_steps
+    total_steps = max(preview_steps + 2, 15)
+    preview_steps = max(2, min(preview_steps, total_steps - 1))
+
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    # Latent capture via callback
+    captured_latent = [None]
+
+    def _preview_callback(pipe_self, step_index, timestep, callback_kwargs):
+        """Capture the latent at the preview step, then abort the pipeline."""
+        if step_index >= preview_steps - 1:
+            captured_latent[0] = callback_kwargs["latents"].clone()
+            # Raise to stop the pipeline early — we have what we need
+            raise InterruptedError("Preview latent captured")
+        return callback_kwargs
+
+    # Encode prompt
+    embed_kwargs = {}
+    long_prompt_used = False
+    encoding_result = _encode_long_prompt(pipe, full_prompt, full_negative)
+    if encoding_result and "_chunked_prompt" not in encoding_result:
+        embed_kwargs = encoding_result
+        long_prompt_used = True
+    elif encoding_result and "_chunked_prompt" in encoding_result:
+        full_prompt = encoding_result["_chunked_prompt"]
+        full_negative = encoding_result["_chunked_negative"]
+
+    gen_kwargs = {
+        "width": width,
+        "height": height,
+        "num_inference_steps": total_steps,
+        "guidance_scale": guidance_scale,
+        "generator": generator,
+        "callback_on_step_end": _preview_callback,
+    }
+    if long_prompt_used and embed_kwargs:
+        gen_kwargs.update(embed_kwargs)
+    else:
+        gen_kwargs["prompt"] = full_prompt
+        gen_kwargs["negative_prompt"] = full_negative
+
+    try:
+        pipe(**gen_kwargs)
+    except InterruptedError:
+        pass  # expected — we captured the latent and stopped
+
+    if captured_latent[0] is None:
+        return {"status": "error", "error": "Failed to capture preview latent"}
+
+    # Decode the noisy latent into a visible image
+    with torch.no_grad():
+        latent = captured_latent[0]
+        latent = 1 / pipe.vae.config.scaling_factor * latent
+        decoded = pipe.vae.decode(latent).sample
+        decoded = (decoded / 2 + 0.5).clamp(0, 1)
+        decoded = decoded.cpu().permute(0, 2, 3, 1).float().numpy()
+        import numpy as np
+        preview_img = PILImage.fromarray((decoded[0] * 255).astype(np.uint8))
+
+    # Downscale for network transfer
+    display_w = max(256, width // 2)
+    display_h = max(256, height // 2)
+    preview_img = preview_img.resize((display_w, display_h), PILImage.LANCZOS)
+
+    # Save
+    output_dir_path = Path(OUTPUT_DIR)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    preview_path = str(output_dir_path / f"{timestamp}_preview.png")
+    preview_img.save(preview_path)
+
+    _log.info("[IMAGE GEN] Noisy preview saved: %s (seed=%d, captured at step %d/%d)",
+              preview_path, seed, preview_steps, total_steps)
 
     return {
         "status": "ok",
         "preview_path": preview_path,
         "seed": seed,
-        "prompt_used": preview.get("prompt_used"),
-        "negative_used": preview.get("negative_used"),
-        "settings": preview.get("settings"),
+        "prompt_used": full_prompt,
+        "negative_used": full_negative,
+        "settings": {
+            "model": Path(model_path).stem,
+            "loras": [Path(lp).stem for lp in (lora_paths or [])],
+            "mode": mode,
+            "preview_steps": preview_steps,
+            "total_steps_used": total_steps,
+            "guidance_scale": guidance_scale,
+            "seed": seed,
+            "width": width,
+            "height": height,
+        },
         "is_preview": True,
-        "long_prompt": preview.get("long_prompt", False),
+        "long_prompt": long_prompt_used,
     }
 
 
@@ -2602,28 +3099,27 @@ def generate_with_preview(
     lora_paths: list[str] | None = None,
     lora_weights: list[float] | None = None,
     negative_prompt: str | None = None,
+    selected_outfits: dict[str, str] | None = None,
 ) -> dict:
-    """Two-pass generation: quick low-res preview, then full-res render.
+    """Two-pass generation: quick noisy preview, then full-res render.
 
     Returns both the preview and the full image so the frontend can show
     the preview within seconds while the full render completes.
     """
-    # Pass 1: quick preview at quarter resolution, 6 steps
-    preview_w = max(256, width // 4)
-    preview_h = max(256, height // 4)
-    preview = generate_image(
+    # Pass 1: noisy preview using latent capture
+    preview = generate_preview_only(
         prompt=prompt,
-        width=preview_w,
-        height=preview_h,
+        width=width,
+        height=height,
         model_path=model_path,
         lora_paths=lora_paths,
         lora_weights=lora_weights,
         mode=mode,
-        steps=6,
         guidance_scale=guidance_scale,
         negative_prompt=negative_prompt,
         seed=seed,
         art_style=art_style,
+        selected_outfits=selected_outfits,
     )
     if preview.get("status") == "error":
         return preview
@@ -2644,16 +3140,18 @@ def generate_with_preview(
         negative_prompt=negative_prompt,
         seed=actual_seed,
         art_style=art_style,
+        selected_outfits=selected_outfits,
     )
 
     return {
         "status": full.get("status", "ok"),
-        "preview_path": preview.get("path"),
+        "preview_path": preview.get("preview_path"),
         "full_path": full.get("path"),
         "path": full.get("path"),
         "seed": actual_seed,
         "prompt_used": full.get("prompt_used"),
         "settings": full.get("settings"),
+        "lora_diagnostics": full.get("lora_diagnostics", []),
     }
 
 
@@ -3326,7 +3824,11 @@ def cancel_training() -> dict:
 # ── Feedback submission ───────────────────────────────────────────────────
 
 def submit_feedback(generation_index: int, feedback_text: str) -> dict:
-    """Submit feedback for a specific generation to improve future results."""
+    """Submit feedback for a specific generation to improve future results.
+
+    Feedback is analyzed for both negative issues (added to negative prompt)
+    and positive preferences (added to positive prompt enhancements).
+    """
     if generation_index < 0 or generation_index >= len(_generation_history):
         return {"status": "error", "error": "Invalid generation index"}
 
@@ -3335,7 +3837,29 @@ def submit_feedback(generation_index: int, feedback_text: str) -> dict:
     _log.info("[IMAGE GEN] Feedback recorded for generation %d: %s",
               generation_index, feedback_text[:100])
 
-    return {"status": "ok", "message": "Feedback recorded — will influence future generations"}
+    # Analyze whether feedback contains positive or negative signals
+    fb_lower = feedback_text.lower()
+    has_negative = any(kw in fb_lower for kw in [
+        "bad", "wrong", "ugly", "deform", "error", "worse", "too",
+        "hands", "fingers", "blurry", "dark", "bright",
+    ])
+    has_positive = any(kw in fb_lower for kw in _POSITIVE_KEYWORDS)
+
+    feedback_type = "mixed"
+    if has_positive and not has_negative:
+        feedback_type = "positive"
+    elif has_negative and not has_positive:
+        feedback_type = "negative"
+
+    return {
+        "status": "ok",
+        "message": "Feedback recorded — will influence future generations",
+        "feedback_type": feedback_type,
+        "will_affect": {
+            "negative_prompt": has_negative,
+            "positive_prompt": has_positive,
+        },
+    }
 
 
 def delete_model(model_path: str) -> dict:
