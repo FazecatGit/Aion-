@@ -537,6 +537,131 @@ def list_loras_by_category() -> dict:
     return {"status": "ok", "categories": categories}
 
 
+def _fuzzy_match_score(a: str, b: str) -> float:
+    """Simple character-level similarity ratio between two strings (0.0–1.0)."""
+    a_low, b_low = a.lower(), b.lower()
+    if a_low == b_low:
+        return 1.0
+    if not a_low or not b_low:
+        return 0.0
+    # Longest common subsequence ratio
+    m, n = len(a_low), len(b_low)
+    if m > 40 or n > 40:
+        return 0.0  # skip long strings
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if a_low[i - 1] == b_low[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+    lcs = dp[m][n]
+    return (2.0 * lcs) / (m + n)
+
+
+def validate_prompt_characters(prompt: str, lora_stems: list[str] | None = None) -> dict:
+    """Validate prompt against known character trigger codes.
+
+    Scans the prompt text for words that look like character names or trigger
+    codes, compares them against the known trigger words from all character
+    LoRAs, and returns matches + warnings for possible misspellings.
+
+    Returns:
+        {
+            "detected_characters": [{name, trigger_code, lora, confidence}],
+            "warnings": [{text, suggestion, lora, reason}],
+            "unmatched_loras": [lora_stem],  # loaded LoRAs with no trigger in prompt
+        }
+    """
+    tw_data = _load_trigger_words()
+    char_dir = MODELS_DIR / "characters"
+
+    # Build a map of all known trigger codes → (lora_stem, display_name)
+    known_triggers: dict[str, tuple[str, str]] = {}  # code_lower → (stem, code_original)
+    all_char_stems: set[str] = set()
+
+    for stem, words in tw_data.items():
+        # Check if this is a character LoRA
+        lora_path = char_dir / f"{stem}.safetensors"
+        if not lora_path.exists():
+            continue
+        all_char_stems.add(stem)
+        parsed = parse_outfit_groups(words)
+        primary = parsed["primary"]
+        if primary:
+            known_triggers[primary.lower()] = (stem, primary)
+        # Also index all outfit trigger codes
+        for _outfit_name, tags in parsed.get("outfits", {}).items():
+            if tags:
+                code = tags[0]["word"] if isinstance(tags[0], dict) else str(tags[0])
+                if code:
+                    known_triggers[code.lower()] = (stem, code)
+
+    # If specific lora_stems provided, only validate those
+    if lora_stems:
+        relevant_stems = set(lora_stems) & all_char_stems
+    else:
+        relevant_stems = all_char_stems
+
+    detected = []
+    warnings = []
+    matched_stems: set[str] = set()
+    prompt_lower = prompt.lower()
+
+    # Check for exact trigger code matches
+    for code_lower, (stem, code_orig) in known_triggers.items():
+        if stem not in relevant_stems:
+            continue
+        if code_lower in prompt_lower:
+            detected.append({
+                "name": code_orig,
+                "trigger_code": code_orig,
+                "lora": stem,
+                "confidence": 1.0,
+            })
+            matched_stems.add(stem)
+
+    # Extract word-like tokens from the prompt to check for fuzzy matches
+    # (catches misspellings like "Gigi Mruin" vs "Gigi Murin")
+    prompt_tokens = re.findall(r'[A-Za-z][A-Za-z0-9]{2,}(?:\s+[A-Za-z][A-Za-z0-9]{2,})?', prompt)
+
+    for token in prompt_tokens:
+        token_lower = token.lower()
+        # Skip tokens that already matched exactly
+        if any(token_lower == d["trigger_code"].lower() for d in detected):
+            continue
+        # Check fuzzy similarity against all known trigger codes
+        best_score = 0.0
+        best_code = ""
+        best_stem = ""
+        for code_lower, (stem, code_orig) in known_triggers.items():
+            if stem not in relevant_stems:
+                continue
+            score = _fuzzy_match_score(token_lower, code_lower)
+            if score > best_score:
+                best_score = score
+                best_code = code_orig
+                best_stem = stem
+        # Warn if close but not exact (threshold 0.65–0.95)
+        if 0.65 <= best_score < 1.0:
+            warnings.append({
+                "text": token,
+                "suggestion": best_code,
+                "lora": best_stem,
+                "reason": f"Did you mean '{best_code}'? (similarity: {best_score:.0%})",
+                "similarity": round(best_score, 2),
+            })
+
+    # Find loaded LoRAs with no trigger detected in the prompt
+    unmatched = [s for s in relevant_stems if s not in matched_stems]
+
+    return {
+        "detected_characters": detected,
+        "warnings": warnings,
+        "unmatched_loras": unmatched,
+    }
+
+
 def get_active_model() -> str | None:
     return _active_model
 
@@ -841,7 +966,25 @@ def _split_respecting_parens(text: str) -> list[str]:
 def _analyze_prompt(prompt: str) -> dict:
     """Break down the prompt into weighted components for transparency.
     Handles BREAK-separated sections and preserves parenthesized character groups.
+    Detects character trigger codes and marks them as high-priority character tokens.
     """
+    # Build a set of known character trigger codes for detection
+    tw_data = _load_trigger_words()
+    char_dir = MODELS_DIR / "characters"
+    known_trigger_codes: set[str] = set()
+    for stem, words in tw_data.items():
+        # Only include character LoRA triggers
+        lora_path = char_dir / f"{stem}.safetensors"
+        if lora_path.exists():
+            parsed = parse_outfit_groups(words)
+            if parsed["primary"]:
+                known_trigger_codes.add(parsed["primary"].lower())
+            for _outfit_name, tags in parsed.get("outfits", {}).items():
+                if tags:
+                    code = tags[0]["word"] if isinstance(tags[0], dict) else str(tags[0])
+                    if code:
+                        known_trigger_codes.add(code.lower())
+
     # Split by BREAK tokens first to identify sections
     sections = re.split(r'\s+BREAK\s+', prompt)
 
@@ -849,6 +992,7 @@ def _analyze_prompt(prompt: str) -> dict:
         "total_parts": 0,
         "components": [],
         "estimated_focus": [],
+        "break_count": len(sections) - 1,
     }
 
     global_pos = 0
@@ -858,18 +1002,35 @@ def _analyze_prompt(prompt: str) -> dict:
 
         for part in parts:
             global_pos += 1
-            if sec_idx == 0:
+
+            # Check if this part contains a known character trigger code
+            part_lower = part.lower().strip()
+            is_character_token = False
+            for code in known_trigger_codes:
+                if code in part_lower:
+                    is_character_token = True
+                    break
+            # Also detect parenthesized character blocks like (TriggerCode:1.2, ...)
+            if re.match(r'^\(.*:\s*\d', part.strip()):
+                is_character_token = True
+
+            if sec_idx == 0 and not is_character_token:
                 # Shared section: use position-based priority
                 priority = "high" if global_pos <= 3 else "medium" if global_pos <= 8 else "low"
-            else:
-                # Character section: mark as character-specific
+                section_label = "shared"
+            elif is_character_token:
                 priority = "character"
+                section_label = f"character_{sec_idx}" if sec_idx > 0 else "character_inline"
+            else:
+                # Non-first section (after BREAK): character-specific
+                priority = "character"
+                section_label = f"character_{sec_idx}"
 
             analysis["estimated_focus"].append({
                 "text": part,
                 "priority": priority,
                 "position": global_pos,
-                "section": f"character_{sec_idx}" if sec_idx > 0 else "shared",
+                "section": section_label,
             })
             analysis["components"].append(part)
 
@@ -897,6 +1058,19 @@ def record_generation(prompt: str, negative: str, settings: dict, result_path: s
 
 def get_generation_history(last_n: int = 20) -> list[dict]:
     return _generation_history[-last_n:]
+
+
+def delete_generation_history_entry(index: int) -> dict:
+    """Delete a generation history entry by reverse index (0 = newest)."""
+    if not _generation_history:
+        return {"status": "error", "error": "No history entries"}
+    # Index is from newest (reversed), so convert to actual list index
+    actual_idx = len(_generation_history) - 1 - index
+    if actual_idx < 0 or actual_idx >= len(_generation_history):
+        return {"status": "error", "error": f"Index {index} out of range"}
+    removed = _generation_history.pop(actual_idx)
+    _save_history_to_disk()
+    return {"status": "ok", "removed_prompt": (removed.get("prompt") or "")[:60]}
 
 
 def apply_feedback_learnings(base_negative: str) -> str:
@@ -1970,6 +2144,57 @@ def generate_image(
         full_prompt = prompt
         base_neg = negative_prompt or DEFAULT_NEGATIVE
 
+    # Strip A1111/ComfyUI-style <lora:...> tags — this backend loads LoRAs via API,
+    # so these tags in the prompt text are noise to the CLIP encoder
+    full_prompt = re.sub(r'<lora:[^>]+>', '', full_prompt)
+    full_prompt = re.sub(r',\s*,', ',', full_prompt)  # clean double commas
+    full_prompt = re.sub(r'\s{2,}', ' ', full_prompt).strip(', ')
+
+    # Auto-insert BREAK tokens before parenthesized character blocks when the
+    # user didn't type them.  This ensures CLIP chunking isolates each
+    # character's description even for single-character prompts.
+    if 'BREAK' not in full_prompt:
+        # Detect parenthesized blocks that look like character descriptions:
+        # (TriggerCode:weight, tag, tag, ...) or (TriggerCode, tag, tag, ...)
+        tw_data_auto = _load_trigger_words()
+        char_dir_auto = MODELS_DIR / "characters"
+        _all_trigger_codes: set[str] = set()
+        for _stem, _words in tw_data_auto.items():
+            lp_check = char_dir_auto / f"{_stem}.safetensors"
+            if lp_check.exists():
+                _pg = parse_outfit_groups(_words)
+                if _pg["primary"]:
+                    _all_trigger_codes.add(_pg["primary"].lower())
+                for _on, _tags in _pg.get("outfits", {}).items():
+                    if _tags:
+                        _c = _tags[0]["word"] if isinstance(_tags[0], dict) else str(_tags[0])
+                        if _c:
+                            _all_trigger_codes.add(_c.lower())
+
+        # Find positions of parenthesized blocks containing known trigger codes
+        paren_blocks = list(re.finditer(r'\([^)]+\)', full_prompt))
+        insert_positions: list[int] = []
+        for pb in paren_blocks:
+            block_text = pb.group(0).lower()
+            for code in _all_trigger_codes:
+                if code in block_text:
+                    insert_positions.append(pb.start())
+                    break
+
+        if insert_positions:
+            # Insert BREAK before each detected character block (from end to start to preserve indices)
+            modified = full_prompt
+            for pos in sorted(insert_positions, reverse=True):
+                # Don't insert BREAK at the very start
+                if pos > 0:
+                    # Clean trailing commas/spaces before the BREAK
+                    pre = modified[:pos].rstrip(', ')
+                    post = modified[pos:]
+                    modified = f"{pre} BREAK {post}"
+            if modified != full_prompt:
+                _log.info("[IMAGE GEN] Auto-inserted BREAK tokens before %d character block(s)", len(insert_positions))
+                full_prompt = modified
+
     # Structure multi-angle and multi-character prompts
     full_prompt = _structure_multi_angle_prompt(full_prompt)
     full_prompt = _structure_multi_character_prompt(full_prompt, lora_paths, selected_outfits)
@@ -2070,6 +2295,10 @@ def generate_image(
 
             image = pipe(**gen_kwargs).images[0]
 
+        # Signal completion to the frontend
+        _update_progress(current_step=steps, total_steps=steps,
+                         message="Saving image...")
+
         # Save
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = re.sub(r'[^\w\s-]', '', prompt[:30]).strip().replace(' ', '_')
@@ -2089,6 +2318,9 @@ def generate_image(
             "height": height,
         }
         record = record_generation(full_prompt, full_negative, settings, filename)
+
+        _update_progress(current_step=steps, total_steps=steps,
+                         message="Complete!")
 
         return {
             "status": "ok",
@@ -2111,8 +2343,15 @@ def generate_image(
         _log.error("[IMAGE GEN] Error: %s", str(e))
         return {"status": "error", "error": str(e)}
     finally:
-        _update_progress(active=False, type="idle", current_step=0,
-                         total_steps=0, message="")
+        # Keep "Complete!" visible for a few seconds so the frontend poll catches it
+        _update_progress(active=True, type="image", current_step=steps,
+                         total_steps=steps, message="Complete!")
+        import threading as _th
+        def _clear_progress():
+            time.sleep(3)
+            _update_progress(active=False, type="idle", current_step=0,
+                             total_steps=0, message="")
+        _th.Thread(target=_clear_progress, daemon=True).start()
 
 
 # ── Art Style Presets ──────────────────────────────────────────────────────
@@ -3450,16 +3689,19 @@ def generate_preview_only(
     """Fast noisy preview that produces a rough version of the SAME image
     the full render will produce.
 
-    Strategy: run the full pipeline but use a step callback to capture the
-    intermediate noisy latent at an early step, then decode that latent with
-    the VAE. Because the same seed, same resolution, and same prompt are used,
-    the preview is guaranteed to share composition with the full render — it's
-    just noisier/rougher because the denoising was cut short.
+    Strategy: run the pipeline at a much smaller resolution (256×256) with
+    the same seed and prompt.  Because the same seed is used, the composition
+    is similar to the full render — just at lower resolution.  This is
+    dramatically faster than capturing an early latent at full resolution.
 
     The returned seed should be passed to the full render to reproduce the
     exact same result at full quality.
     """
     from PIL import Image as PILImage
+
+    # Use a small preview resolution for speed (256×256)
+    preview_w = 256
+    preview_h = 256
 
     # Resolve seed up front so preview and full render share it
     if seed < 0:
@@ -3528,29 +3770,59 @@ def generate_preview_only(
         full_prompt = prompt
         base_neg = negative_prompt or DEFAULT_NEGATIVE
 
+    # Strip A1111/ComfyUI-style <lora:...> tags
+    full_prompt = re.sub(r'<lora:[^>]+>', '', full_prompt)
+    full_prompt = re.sub(r',\s*,', ',', full_prompt)
+    full_prompt = re.sub(r'\s{2,}', ' ', full_prompt).strip(', ')
+
+    # Auto-insert BREAK tokens before parenthesized character blocks
+    if 'BREAK' not in full_prompt:
+        tw_data_auto = _load_trigger_words()
+        char_dir_auto = MODELS_DIR / "characters"
+        _all_trigger_codes_p: set[str] = set()
+        for _stem, _words in tw_data_auto.items():
+            lp_check = char_dir_auto / f"{_stem}.safetensors"
+            if lp_check.exists():
+                _pg = parse_outfit_groups(_words)
+                if _pg["primary"]:
+                    _all_trigger_codes_p.add(_pg["primary"].lower())
+                for _on, _tags in _pg.get("outfits", {}).items():
+                    if _tags:
+                        _c = _tags[0]["word"] if isinstance(_tags[0], dict) else str(_tags[0])
+                        if _c:
+                            _all_trigger_codes_p.add(_c.lower())
+        paren_blocks = list(re.finditer(r'\([^)]+\)', full_prompt))
+        insert_positions: list[int] = []
+        for pb in paren_blocks:
+            block_text = pb.group(0).lower()
+            for code in _all_trigger_codes_p:
+                if code in block_text:
+                    insert_positions.append(pb.start())
+                    break
+        if insert_positions:
+            modified = full_prompt
+            for pos in sorted(insert_positions, reverse=True):
+                if pos > 0:
+                    pre = modified[:pos].rstrip(', ')
+                    post = modified[pos:]
+                    modified = f"{pre} BREAK {post}"
+            if modified != full_prompt:
+                _log.info("[IMAGE GEN] Preview: auto-inserted BREAK tokens before %d character block(s)", len(insert_positions))
+                full_prompt = modified
+
     full_prompt = _structure_multi_angle_prompt(full_prompt)
     full_prompt = _structure_multi_character_prompt(full_prompt, lora_paths, selected_outfits)
     full_prompt, base_neg = _apply_art_style(full_prompt, base_neg, art_style)
     full_negative = apply_feedback_learnings(base_neg)
     full_prompt = apply_positive_learnings(full_prompt)
 
-    # Use a moderate total step count but capture the latent at preview_steps
-    total_steps = max(preview_steps + 2, 15)
+    # Use fewer steps at small resolution for speed
+    total_steps = max(preview_steps + 2, 8)
     preview_steps = max(2, min(preview_steps, total_steps - 1))
 
     generator = torch.Generator(device="cuda").manual_seed(seed)
 
-    # Latent capture via callback
-    captured_latent = [None]
-
-    def _preview_callback(pipe_self, step_index, timestep, callback_kwargs):
-        """Capture the latent at the preview step, then abort the pipeline."""
-        if step_index >= preview_steps - 1:
-            captured_latent[0] = callback_kwargs["latents"].clone()
-            # Raise to stop the pipeline early — we have what we need
-            raise InterruptedError("Preview latent captured")
-        return callback_kwargs
-
+    # At small resolution, run the full pipeline (no latent capture needed)
     # Encode prompt
     embed_kwargs = {}
     long_prompt_used = False
@@ -3563,12 +3835,11 @@ def generate_preview_only(
         full_negative = encoding_result["_chunked_negative"]
 
     gen_kwargs = {
-        "width": width,
-        "height": height,
+        "width": preview_w,
+        "height": preview_h,
         "num_inference_steps": total_steps,
         "guidance_scale": guidance_scale,
         "generator": generator,
-        "callback_on_step_end": _preview_callback,
     }
     if long_prompt_used and embed_kwargs:
         gen_kwargs.update(embed_kwargs)
@@ -3577,27 +3848,15 @@ def generate_preview_only(
         gen_kwargs["negative_prompt"] = full_negative
 
     try:
-        pipe(**gen_kwargs)
-    except InterruptedError:
-        pass  # expected — we captured the latent and stopped
+        preview_img = pipe(**gen_kwargs).images[0]
+    except Exception as e:
+        return {"status": "error", "error": f"Preview generation failed: {e}"}
 
-    if captured_latent[0] is None:
-        return {"status": "error", "error": "Failed to capture preview latent"}
-
-    # Decode the noisy latent into a visible image
-    with torch.no_grad():
-        latent = captured_latent[0]
-        latent = 1 / pipe.vae.config.scaling_factor * latent
-        decoded = pipe.vae.decode(latent).sample
-        decoded = (decoded / 2 + 0.5).clamp(0, 1)
-        decoded = decoded.cpu().permute(0, 2, 3, 1).float().numpy()
-        import numpy as np
-        preview_img = PILImage.fromarray((decoded[0] * 255).astype(np.uint8))
-
-    # Downscale for network transfer
-    display_w = max(256, width // 2)
-    display_h = max(256, height // 2)
-    preview_img = preview_img.resize((display_w, display_h), PILImage.LANCZOS)
+    # Upscale slightly for display (256×256 → readable)
+    display_w = max(256, preview_w)
+    display_h = max(256, preview_h)
+    if preview_img.size != (display_w, display_h):
+        preview_img = preview_img.resize((display_w, display_h), PILImage.LANCZOS)
 
     # Save
     output_dir_path = Path(OUTPUT_DIR)

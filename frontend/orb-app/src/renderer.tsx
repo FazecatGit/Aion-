@@ -312,6 +312,10 @@ function App() {
   const [charClothingText, setCharClothingText] = useState('');
   // ── UI layout ──────────────────────────────────────────────────────────────
   const [modelsExpanded, setModelsExpanded] = useState(false);
+  // ── Character validation ───────────────────────────────────────────────────
+  const [charValidation, setCharValidation] = useState<{ detected_characters: any[]; warnings: any[]; unmatched_loras: string[] } | null>(null);
+  // ── History management ─────────────────────────────────────────────────────
+  const [expandedHistoryIdx, setExpandedHistoryIdx] = useState<number | null>(null);
   // ── GPU monitor & progress tracking ────────────────────────────────────────
   const [gpuInfo, setGpuInfo] = useState<{ vram_used_mb: number; vram_total_mb: number; vram_percent: number; device_name: string; available?: boolean; error?: string } | null>(null);
   const [genProgress, setGenProgress] = useState<{ active: boolean; type: string; current_step: number; total_steps: number; current_frame: number; total_frames: number; message: string }>({ active: false, type: 'idle', current_step: 0, total_steps: 0, current_frame: 0, total_frames: 0, message: '' });
@@ -422,6 +426,23 @@ function App() {
     progressPollRef.current = poll;
     return () => clearInterval(poll);
   }, [imageGenLoading]);
+
+  // ── Character validation (debounced) ─────────────────────────────────────
+  useEffect(() => {
+    if (!imageGenPrompt.trim() || activeMode !== 'imagegen') { setCharValidation(null); return; }
+    const timer = setTimeout(async () => {
+      try {
+        const loraStems = selectedLoras.map((l: string) => l.split(/[/\\]/).pop()?.replace('.safetensors', '') || l);
+        const res = await fetch('http://localhost:8000/generate/validate-characters', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt: imageGenPrompt, loras: loraStems }),
+        });
+        if (res.ok) setCharValidation(await res.json());
+      } catch { /* backend down */ }
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [imageGenPrompt, selectedLoras, activeMode]);
 
   // ── Fetch resumable video jobs when video tab shown or generation finishes ──
   useEffect(() => {
@@ -6386,7 +6407,7 @@ return (
           </div>
 
           {/* Center panel: Prompt + Result */}
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', minWidth: 0, overflow: 'hidden' }}>
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', minWidth: 0 }}>
            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px', overflowY: 'auto', overflowX: 'hidden', minHeight: 0 }}>
 
             {/* Multi-character composition panel */}
@@ -6729,12 +6750,15 @@ return (
               {genProgress.active && (
                 <div style={{
                   flex: 1, minWidth: '180px', padding: '6px 10px', borderRadius: '8px',
-                  backgroundColor: '#0a0a14', border: '1px solid #b388ff33',
+                  backgroundColor: '#0a0a14',
+                  border: `1px solid ${genProgress.message?.includes('Complete') ? 'rgba(0,204,136,0.5)' : genProgress.message?.includes('Saving') ? 'rgba(255,153,0,0.4)' : '#b388ff33'}`,
                   fontSize: '10px',
                 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '3px' }}>
-                    <span style={{ color: '#b388ff' }}>
-                      {genProgress.type === 'animation'
+                    <span style={{ color: genProgress.message?.includes('Complete') ? '#00cc88' : '#b388ff' }}>
+                      {genProgress.message?.includes('Complete') ? '✓ Complete!'
+                        : genProgress.message?.includes('Saving') ? '💾 Saving...'
+                        : genProgress.type === 'animation'
                         ? `🎬 Frame ${genProgress.current_frame + 1}/${genProgress.total_frames}`
                         : genProgress.type === 'video' ? '🎥 Video'
                         : '🎨 Generating'}
@@ -6742,7 +6766,7 @@ return (
                     <span style={{ color: '#aaa' }}>
                       Step {genProgress.current_step}/{genProgress.total_steps}
                       {genProgress.total_steps > 0 && ` (${Math.round(genProgress.current_step / genProgress.total_steps * 100)}%)`}
-                      {genProgress.message && <> | <span style={{ color: '#00cc88' }}>{genProgress.message}</span></>}
+                      {genProgress.message && !genProgress.message.includes('Complete') && !genProgress.message.includes('Saving') && <> | <span style={{ color: '#00cc88' }}>{genProgress.message}</span></>}
                     </span>
                   </div>
                   <div style={{ height: '4px', borderRadius: '2px', backgroundColor: '#1a1a2e', overflow: 'hidden' }}>
@@ -6762,13 +6786,13 @@ return (
                       </div>
                     ) : (
                       <div style={{
-                        height: '100%', borderRadius: '2px', transition: 'width 0.3s',
+                        height: '100%', borderRadius: '2px', transition: 'width 0.3s, background 0.3s',
                         width: `${genProgress.total_steps > 0 ? (genProgress.current_step / genProgress.total_steps * 100) : 0}%`,
-                        background: '#7c4dff',
+                        background: genProgress.message?.includes('Complete') ? '#00cc88' : genProgress.message?.includes('Saving') ? '#ff9900' : '#7c4dff',
                       }} />
                     )}
                   </div>
-                  {genProgress.message && (
+                  {genProgress.message && !genProgress.message.includes('Complete') && !genProgress.message.includes('Saving') && (
                     <div style={{ color: '#666', marginTop: '2px', fontSize: '9px' }}>{genProgress.message}</div>
                   )}
                 </div>
@@ -6777,9 +6801,10 @@ return (
 
             {/* Result area */}
             <div style={{
-              flex: 1, backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
+              height: '450px', backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
               border: '1px solid rgba(179,136,255,0.2)', backdropFilter: 'blur(16px)',
-              overflow: 'hidden', display: 'flex', flexDirection: 'column',
+              overflow: 'hidden', display: 'flex', flexDirection: 'column', flexShrink: 0,
+              position: 'sticky', top: '0', zIndex: 5,
             }}>
               {(imageGenLoading || previewLoading) && (
                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '12px', padding: '20px' }}>
@@ -6879,7 +6904,7 @@ return (
                     />
                   </div>
                 ) : imageGenResult.startsWith('blob:') ? (
-                  <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px', position: 'relative' }}>
+                  <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px', position: 'relative', height: '100%' }}>
                     <img
                       src={imageGenResult}
                       alt="Generated"
@@ -6900,6 +6925,42 @@ return (
             </div>
 
             {/* Prompt analysis + feedback */}
+            {/* Character validation warnings */}
+            {charValidation && (charValidation.warnings?.length > 0 || charValidation.detected_characters?.length > 0) && (
+              <div style={{
+                backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
+                border: `1px solid ${charValidation.warnings?.length > 0 ? 'rgba(255,100,100,0.4)' : 'rgba(0,204,136,0.3)'}`,
+                padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: '6px',
+              }}>
+                <h4 style={{ margin: 0, fontSize: '11px', color: charValidation.warnings?.length > 0 ? '#ff6666' : '#00cc88' }}>
+                  {charValidation.warnings?.length > 0 ? '⚠ Character Detection' : '✓ Characters Detected'}
+                </h4>
+                {charValidation.detected_characters?.map((c: any, i: number) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px' }}>
+                    <span style={{ padding: '2px 8px', borderRadius: '8px', backgroundColor: 'rgba(0,204,136,0.15)', color: '#00cc88', border: '1px solid rgba(0,204,136,0.3)' }}>
+                      ✓ {c.trigger_code}
+                    </span>
+                    <span style={{ color: '#666' }}>→ LoRA: {c.lora}</span>
+                  </div>
+                ))}
+                {charValidation.warnings?.map((w: any, i: number) => (
+                  <div key={i} style={{ fontSize: '11px', padding: '4px 8px', borderRadius: '6px', backgroundColor: 'rgba(255,100,100,0.08)', border: '1px solid rgba(255,100,100,0.2)' }}>
+                    <span style={{ color: '#ff9900' }}>⚠ "{w.text}"</span>
+                    <span style={{ color: '#888' }}> — {w.reason}</span>
+                    <button onClick={() => {
+                      setImageGenPrompt(prev => prev.replace(new RegExp(w.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), w.suggestion));
+                    }} style={{ marginLeft: '8px', padding: '1px 8px', borderRadius: '4px', border: '1px solid rgba(0,204,136,0.3)', backgroundColor: 'rgba(0,204,136,0.1)', color: '#00cc88', cursor: 'pointer', fontSize: '10px' }}>
+                      Fix → {w.suggestion}
+                    </button>
+                  </div>
+                ))}
+                {charValidation.unmatched_loras?.length > 0 && (
+                  <div style={{ fontSize: '10px', color: '#888' }}>
+                    ⚠ Loaded LoRAs not found in prompt: {charValidation.unmatched_loras.join(', ')}
+                  </div>
+                )}
+              </div>
+            )}
             {imageGenMeta && (
               <div style={{
                 backgroundColor: 'rgba(10,10,20,0.95)', borderRadius: '14px',
@@ -6914,6 +6975,9 @@ return (
                     {imageGenMeta.settings && <> | Model: <span style={{ color: '#fff' }}>{imageGenMeta.settings.model}</span></>}
                     {imageGenMeta.long_prompt && (
                       <> | <span style={{ color: '#00cc88' }}>Long prompt ✓ (compel encoded)</span></>
+                    )}
+                    {imageGenMeta.prompt_analysis?.break_count > 0 && (
+                      <> | <span style={{ color: '#7c4dff' }}>Auto-chunked ({imageGenMeta.prompt_analysis.break_count + 1} segments)</span></>
                     )}
                     {imageGenMeta.regional_mode && (
                       <> | <span style={{ color: '#ff6e40' }}>Regional conditioning ✓ (per-character isolation)</span></>
@@ -6936,6 +7000,9 @@ return (
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                         {groups.map((group, gi) => {
                           const isChar = group.section !== 'shared';
+                          const sectionLabel = group.section === 'character_inline'
+                            ? 'Character (inline — add BREAK for better isolation)'
+                            : group.section.replace('_', ' ');
                           const tagElements = group.items.map((f: any, i: number) => (
                             <span key={i} style={{
                               padding: '2px 8px', borderRadius: '12px', fontSize: '10px',
@@ -6952,8 +7019,8 @@ return (
                             return (
                               <details key={gi} open>
                                 <summary style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', margin: '2px 0' }}>
-                                  <span style={{ fontSize: '9px', color: '#7c4dff', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                                    BREAK — {group.section.replace('_', ' ')}
+                                  <span style={{ fontSize: '9px', color: group.section === 'character_inline' ? '#ff9900' : '#7c4dff', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                                    {group.section === 'character_inline' ? '⚠ ' : 'BREAK — '}{sectionLabel}
                                   </span>
                                   <span style={{ fontSize: '9px', color: '#555' }}>({group.items.length} tags)</span>
                                   <div style={{ flex: 1, height: '1px', background: 'rgba(124,77,255,0.3)' }} />
@@ -7093,34 +7160,15 @@ return (
               <button onClick={fetchImageHistory} style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '12px' }}>⟳</button>
             </h4>
             {imageGenHistory.length === 0 && <div style={{ color: '#444', fontSize: '11px', textAlign: 'center', padding: '20px 0' }}>No history yet — generate an image to see it here</div>}
-            {imageGenHistory.slice().reverse().map((h, i) => (
+            {imageGenHistory.slice().reverse().map((h, i) => {
+              const isExpanded = expandedHistoryIdx === i;
+              return (
               <div key={i} style={{
-                padding: '8px', borderRadius: '8px', backgroundColor: '#111',
-                border: '1px solid #222', fontSize: '11px', cursor: 'pointer',
+                padding: '8px', borderRadius: '8px', backgroundColor: isExpanded ? '#1a1a2e' : '#111',
+                border: `1px solid ${isExpanded ? 'rgba(179,136,255,0.3)' : '#222'}`, fontSize: '11px', cursor: 'pointer',
+                transition: 'all 0.2s',
               }}
-                onClick={() => {
-                  let cleanPrompt = h.prompt?.replace(/^(score_9, score_8_up, score_7_up, |rating:\w+, )/, '') || '';
-                  // Strip backend-injected multi-character artifacts but preserve user-authored weights
-                  cleanPrompt = cleanPrompt
-                    .replace(/\s*BREAK\s*/g, ' ')
-                    .replace(/,?\s*(?:on the (?:left|right)|in the (?:center|background))\s*/gi, ' ')
-                    .replace(/^\d+ characters, (?:group shot, )?/i, '')
-                    // Strip known art style prefixes that the backend injects
-                    .replace(/^anime screencap, hand-drawn animation, cel shading, soft lighting, natural colour palette, expressive linework, high quality anime key visual, /i, '')
-                    .replace(/^studio ghibli style, watercolour background, warm lighting, soft pastel tones, hand-painted, detailed environment, gentle linework, /i, '')
-                    .replace(/^manga panel, black and white, screentone, detailed linework, dramatic shading, ink drawing, /i, '')
-                    .replace(/^oil painting, visible brush strokes, impressionist lighting, textured canvas, rich earth tones, gallery quality, /i, '')
-                    .replace(/^game concept art, splash art, dynamic composition, dramatic rim lighting, painterly rendering, detailed character design, /i, '')
-                    .replace(/^photorealistic, RAW photo, 8k UHD, DSLR, professional lighting, studio quality, /i, '')
-                    .replace(/^3d render, blender, unreal engine 5, octane render, volumetric lighting, subsurface scattering, PBR materials, video game character, detailed textures, sharp focus, /i, '')
-                    .replace(/,\s*,+/g, ',')
-                    .replace(/\s{2,}/g, ' ')
-                    .trim().replace(/^,|,$/g, '').trim();
-                  setImageGenPrompt(cleanPrompt);
-                  if (h.settings?.seed) setImageGenSeed(h.settings.seed);
-                  if (h.settings?.steps) setImageGenSteps(h.settings.steps);
-                  if (h.settings?.guidance_scale) setImageGenCfg(h.settings.guidance_scale);
-                }}
+                onClick={() => setExpandedHistoryIdx(isExpanded ? null : i)}
               >
                 {h.result_path && (
                   <img
@@ -7132,12 +7180,12 @@ return (
                       setLightboxZoom(1);
                       setLightboxPan({ x: 0, y: 0 });
                     }}
-                    style={{ width: '100%', height: '120px', objectFit: 'cover', borderRadius: '6px', marginBottom: '6px', cursor: 'zoom-in' }}
+                    style={{ width: '100%', height: isExpanded ? '200px' : '120px', objectFit: 'cover', borderRadius: '6px', marginBottom: '6px', cursor: 'zoom-in', transition: 'height 0.2s' }}
                     onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
                   />
                 )}
-                <div style={{ color: '#ccc', marginBottom: '4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '11px' }}>
-                  {h.prompt?.replace(/^(score_9, score_8_up, score_7_up, |rating:\w+, )/, '').slice(0, 80) || 'Unknown'}
+                <div style={{ color: '#ccc', marginBottom: '4px', overflow: isExpanded ? 'visible' : 'hidden', textOverflow: isExpanded ? 'unset' : 'ellipsis', whiteSpace: isExpanded ? 'pre-wrap' : 'nowrap', fontSize: '11px', wordBreak: 'break-word' }}>
+                  {h.prompt?.replace(/^(score_9, score_8_up, score_7_up, |rating:\w+, )/, '').slice(0, isExpanded ? 500 : 80) || 'Unknown'}
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', color: '#555', fontSize: '10px' }}>
                   <span>{h.settings?.model ? String(h.settings.model).split(/[/\\]/).pop()?.replace('.safetensors', '') : '?'}</span>
@@ -7153,7 +7201,85 @@ return (
                     📝 {h.feedback.slice(0, 40)}
                   </div>
                 )}
-                {h.result_path && (
+                {/* Expanded details */}
+                {isExpanded && (
+                  <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    {h.settings && (
+                      <div style={{ fontSize: '10px', color: '#666', display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                        <span>steps: {h.settings.steps}</span>
+                        <span>cfg: {h.settings.guidance_scale}</span>
+                        <span>{h.settings.width}×{h.settings.height}</span>
+                        {h.settings.loras?.length > 0 && <span>LoRAs: {h.settings.loras.join(', ')}</span>}
+                      </div>
+                    )}
+                    {h.prompt_analysis?.estimated_focus && (
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '2px', marginTop: '2px' }}>
+                        {h.prompt_analysis.estimated_focus.slice(0, 20).map((f: any, fi: number) => (
+                          <span key={fi} style={{
+                            padding: '1px 6px', borderRadius: '8px', fontSize: '9px',
+                            backgroundColor: f.section !== 'shared' ? 'rgba(124,77,255,0.15)' : f.priority === 'high' ? 'rgba(0,204,136,0.15)' : 'rgba(80,80,80,0.15)',
+                            color: f.section !== 'shared' ? '#b388ff' : f.priority === 'high' ? '#00cc88' : '#666',
+                          }}>{f.text}</span>
+                        ))}
+                      </div>
+                    )}
+                    <div style={{ display: 'flex', gap: '4px', marginTop: '4px' }}>
+                      <button onClick={(e) => {
+                        e.stopPropagation();
+                        let cleanPrompt = h.prompt?.replace(/^(score_9, score_8_up, score_7_up, |rating:\w+, )/, '') || '';
+                        cleanPrompt = cleanPrompt
+                          .replace(/,?\s*(?:on the (?:left|right)|in the (?:center|background))\s*/gi, ' ')
+                          .replace(/^\d+ characters, (?:group shot, )?/i, '')
+                          .replace(/^anime screencap, hand-drawn animation, cel shading, soft lighting, natural colour palette, expressive linework, high quality anime key visual, /i, '')
+                          .replace(/^studio ghibli style, watercolour background, warm lighting, soft pastel tones, hand-painted, detailed environment, gentle linework, /i, '')
+                          .replace(/^manga panel, black and white, screentone, detailed linework, dramatic shading, ink drawing, /i, '')
+                          .replace(/^oil painting, visible brush strokes, impressionist lighting, textured canvas, rich earth tones, gallery quality, /i, '')
+                          .replace(/^game concept art, splash art, dynamic composition, dramatic rim lighting, painterly rendering, detailed character design, /i, '')
+                          .replace(/^photorealistic, RAW photo, 8k UHD, DSLR, professional lighting, studio quality, /i, '')
+                          .replace(/^3d render, blender, unreal engine 5, octane render, volumetric lighting, subsurface scattering, PBR materials, video game character, detailed textures, sharp focus, /i, '')
+                          .replace(/,\s*,+/g, ',')
+                          .replace(/\s{2,}/g, ' ')
+                          .trim().replace(/^,|,$/g, '').trim();
+                        setImageGenPrompt(cleanPrompt);
+                        if (h.settings?.seed) setImageGenSeed(h.settings.seed);
+                        if (h.settings?.steps) setImageGenSteps(h.settings.steps);
+                        if (h.settings?.guidance_scale) setImageGenCfg(h.settings.guidance_scale);
+                      }} style={{ flex: 1, padding: '4px', borderRadius: '4px', border: '1px solid #333', backgroundColor: '#111', color: '#b388ff', cursor: 'pointer', fontSize: '9px' }}>
+                        📋 Load Prompt
+                      </button>
+                      {h.result_path && (
+                        <>
+                          <button onClick={(e) => {
+                            e.stopPropagation();
+                            fetch(`http://localhost:8000/file/open?path=${encodeURIComponent(h.result_path)}`, { method: 'POST' });
+                          }} style={{ flex: 1, padding: '4px', borderRadius: '4px', border: '1px solid #333', backgroundColor: '#111', color: '#888', cursor: 'pointer', fontSize: '9px' }}>
+                            📂 Open
+                          </button>
+                          <button onClick={(e) => {
+                            e.stopPropagation();
+                            setUpscaleImagePath(h.result_path);
+                            setImageGenSubTab('upscale');
+                          }} style={{ flex: 1, padding: '4px', borderRadius: '4px', border: '1px solid #333', backgroundColor: '#111', color: '#888', cursor: 'pointer', fontSize: '9px' }}>
+                            🔍 Upscale
+                          </button>
+                        </>
+                      )}
+                      <button onClick={async (e) => {
+                        e.stopPropagation();
+                        try {
+                          await fetch(`http://localhost:8000/generate/history/${i}`, { method: 'DELETE' });
+                          fetchImageHistory();
+                          setExpandedHistoryIdx(null);
+                        } catch {}
+                      }} style={{ padding: '4px 6px', borderRadius: '4px', border: '1px solid rgba(255,68,68,0.3)', backgroundColor: 'rgba(255,68,68,0.05)', color: '#ff4444', cursor: 'pointer', fontSize: '9px' }}
+                        title="Remove from history">
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {/* Collapsed action buttons */}
+                {!isExpanded && h.result_path && (
                   <div style={{ display: 'flex', gap: '4px', marginTop: '4px' }}>
                     <button onClick={(e) => {
                       e.stopPropagation();
@@ -7166,10 +7292,19 @@ return (
                       setImageGenSubTab('upscale');
                     }} style={{ flex: 1, padding: '3px', borderRadius: '4px', border: '1px solid #333', backgroundColor: '#111', color: '#888', cursor: 'pointer', fontSize: '9px' }}
                       title="Send to upscale tab">🔍 Upscale</button>
+                    <button onClick={async (e) => {
+                      e.stopPropagation();
+                      try {
+                        await fetch(`http://localhost:8000/generate/history/${i}`, { method: 'DELETE' });
+                        fetchImageHistory();
+                      } catch {}
+                    }} style={{ padding: '3px 6px', borderRadius: '4px', border: '1px solid rgba(255,68,68,0.2)', backgroundColor: 'transparent', color: '#ff4444', cursor: 'pointer', fontSize: '9px' }}
+                      title="Remove from history">✕</button>
                   </div>
                 )}
               </div>
-            ))}
+            );
+            })}
           </div>
         </div>
       )}

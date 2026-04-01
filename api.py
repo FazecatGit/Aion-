@@ -1969,6 +1969,26 @@ async def tokenize_prompt_endpoint(req: dict):
     return count_tokens(prompt)
 
 
+@app.post("/generate/validate-characters")
+async def validate_characters_endpoint(req: dict):
+    """Validate prompt for character trigger codes — detect matches and misspellings."""
+    from agent.image_generation import validate_prompt_characters, list_models
+    prompt = req.get("prompt", "")
+    lora_names = req.get("loras", [])
+
+    # Resolve LoRA names to stems
+    lora_stems = []
+    if lora_names:
+        models = list_models()
+        for ln in lora_names:
+            match = next((m for m in models if m["name"] == ln and m["type"] == "lora"), None)
+            if match:
+                lora_stems.append(match["name"])
+
+    result = validate_prompt_characters(prompt, lora_stems or None)
+    return {"status": "ok", **result}
+
+
 class AnimatedGenRequest(BaseModel):
     prompt: str
     width: int = 512
@@ -2652,6 +2672,14 @@ async def image_gen_history(limit: int = 20):
     """Get recent image generation history with prompt analysis."""
     from agent.image_generation import get_generation_history
     return {"status": "ok", "history": get_generation_history(limit)}
+
+
+@app.delete("/generate/history/{index}")
+async def delete_history_entry(index: int):
+    """Delete a specific generation history entry by index (0-based from newest)."""
+    from agent.image_generation import delete_generation_history_entry
+    result = delete_generation_history_entry(index)
+    return result
 
 
 class VocabExpandRequest(BaseModel):
