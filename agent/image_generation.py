@@ -995,6 +995,43 @@ def _analyze_prompt(prompt: str) -> dict:
         "break_count": len(sections) - 1,
     }
 
+    # If there are character BREAK sections, compute regional layout info
+    if len(sections) >= 3:
+        # Parse region positions the same way _parse_regional_sections does
+        region_positions = []
+        for sec_idx, sec in enumerate(sections[1:]):
+            sec_lower = sec.lower().strip()
+            pos = None
+            if "on the left" in sec_lower:
+                pos = "left"
+            elif "on the right" in sec_lower:
+                pos = "right"
+            elif "in the center" in sec_lower:
+                pos = "center"
+            elif "in the background" in sec_lower:
+                pos = "background"
+            region_positions.append(pos)
+
+        # Auto-assign positions like _parse_regional_sections does
+        explicit_count = sum(1 for p in region_positions if p is not None)
+        n_regions = len(region_positions)
+        if explicit_count < n_regions:
+            auto_positions = {
+                2: ["left", "right"],
+                3: ["left", "center", "right"],
+                4: ["left", "center", "right", "background"],
+            }
+            layout = auto_positions.get(n_regions, ["left", "center", "right", "background"][:n_regions])
+            for i in range(n_regions):
+                if region_positions[i] is None:
+                    region_positions[i] = layout[i] if i < len(layout) else "center"
+
+        analysis["regional_layout"] = [
+            {"region": i + 1, "position": region_positions[i],
+             "auto_assigned": region_positions[i] is not None}
+            for i in range(n_regions)
+        ]
+
     global_pos = 0
     for sec_idx, section in enumerate(sections):
         # Split by commas but keep parenthesized groups intact
@@ -1740,25 +1777,39 @@ def _create_spatial_masks(regions: list[dict], latent_w: int, latent_h: int,
             return (idx + 0.5) / n
 
     # Sigma controls how wide each bell curve is.  Larger = more overlap,
-    # softer blending, more seamless.  0.35 gives ~70 % overlap between
-    # neighbours which keeps character features distinct but prevents any
-    # visible boundary.
-    sigma = 0.35
+    # softer blending, more seamless.
+    # For 2 characters: 0.35 gives ~70% overlap (very seamless)
+    # For 3+ characters: tighter sigma so the center character isn't overwhelmed
+    #                     by flanking duplicates
+    if n <= 2:
+        sigma = 0.35
+    elif n == 3:
+        sigma = 0.28  # tighter for 3 chars — prevents center from being swamped
+    else:
+        sigma = 0.22  # even tighter for 4+
 
     raw_masks: list[torch.Tensor] = []
+    centres_used = []
     for idx, r in enumerate(regions):
         if r["position"] == "background":
             # Uniform low weight
             weight = torch.ones(latent_w, device=device, dtype=dtype) * 0.5
+            centres_used.append(0.5)
         else:
             cx = _centre(r["position"], idx)
+            centres_used.append(cx)
             weight = torch.exp(-((xs - cx) ** 2) / (2 * sigma ** 2))
         raw_masks.append(weight)
 
+    _log.info("[IMAGE GEN] Spatial masks: %d regions, sigma=%.2f, centres=%s",
+              n, sigma, [f"{c:.2f}" for c in centres_used])
+
     # Stack and softmax-normalise across characters at every x position
     stacked = torch.stack(raw_masks, dim=0)  # (n, latent_w)
-    # Softmax gives smooth competition — dominant in their zone, fading elsewhere
-    normed = torch.softmax(stacked * 3.0, dim=0)  # temperature 3.0 sharpens slightly
+    # Softmax temperature: higher = sharper separation between regions
+    # Use sharper temp for 3+ chars to keep distinct zones
+    temperature = 3.0 if n <= 2 else 4.0
+    normed = torch.softmax(stacked * temperature, dim=0)
 
     masks = []
     for i in range(n):
@@ -1774,6 +1825,10 @@ def _parse_regional_sections(prompt: str) -> tuple[str, list[dict]] | None:
 
     Returns None if the prompt doesn't have character regions.
     Returns (shared_prompt, [{"prompt": str, "position": str}, ...])
+
+    When no explicit position keywords are found, characters are auto-assigned
+    evenly-spaced positions (left/center/right) so spatial masks actually
+    separate them instead of all piling up at "center".
     """
     sections = re.split(r'\s+BREAK\s+', prompt)
     if len(sections) < 3:  # need shared + at least 2 characters
@@ -1785,7 +1840,7 @@ def _parse_regional_sections(prompt: str) -> tuple[str, list[dict]] | None:
         sec = sec.strip()
         if not sec:
             continue
-        pos = "center"
+        pos = None  # None = no explicit position
         sec_lower = sec.lower()
         if "on the left" in sec_lower:
             pos = "left"
@@ -1799,6 +1854,26 @@ def _parse_regional_sections(prompt: str) -> tuple[str, list[dict]] | None:
 
     if len(regions) < 2:
         return None
+
+    # ── Auto-assign positions when user didn't specify any ─────────────
+    # If none or only one region has an explicit position, spread them evenly.
+    explicit_count = sum(1 for r in regions if r["position"] is not None)
+    if explicit_count < len(regions):
+        n = len(regions)
+        # Standard layouts by character count
+        auto_positions = {
+            2: ["left", "right"],
+            3: ["left", "center", "right"],
+            4: ["left", "center", "right", "background"],
+        }
+        layout = auto_positions.get(n, ["left", "center", "right", "background"][:n])
+
+        for i, r in enumerate(regions):
+            if r["position"] is None:
+                r["position"] = layout[i] if i < len(layout) else "center"
+                _log.info("[IMAGE GEN] Auto-assigned position '%s' to region %d: %s",
+                          r["position"], i, r["prompt"][:60])
+
     return shared, regions
 
 
@@ -2181,8 +2256,10 @@ def generate_image(
                     insert_positions.append(pb.start())
                     break
 
-        if insert_positions:
-            # Insert BREAK before each detected character block (from end to start to preserve indices)
+        if len(insert_positions) >= 2:
+            # Only auto-insert BREAKs for MULTI-character prompts (2+ blocks).
+            # Single-character prompts benefit from keeping everything in one
+            # CLIP attention window — splitting weakens LoRA coherence.
             modified = full_prompt
             for pos in sorted(insert_positions, reverse=True):
                 # Don't insert BREAK at the very start
@@ -2194,6 +2271,8 @@ def generate_image(
             if modified != full_prompt:
                 _log.info("[IMAGE GEN] Auto-inserted BREAK tokens before %d character block(s)", len(insert_positions))
                 full_prompt = modified
+        elif len(insert_positions) == 1:
+            _log.info("[IMAGE GEN] Single character block detected — skipping auto-BREAK to preserve CLIP coherence")
 
     # Structure multi-angle and multi-character prompts
     full_prompt = _structure_multi_angle_prompt(full_prompt)

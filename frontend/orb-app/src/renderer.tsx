@@ -6984,6 +6984,9 @@ return (
                     )}
                   </div>
                   {imageGenMeta.prompt_analysis?.estimated_focus && (() => {
+                    // Regional layout info
+                    const layout = imageGenMeta.prompt_analysis?.regional_layout;
+
                     // Group tags by section for collapsible character rendering
                     const groups: { section: string; items: any[] }[] = [];
                     let currentSection = '';
@@ -6998,6 +7001,27 @@ return (
 
                     return (
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                        {/* Regional layout visualization */}
+                        {layout && layout.length >= 2 && (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '4px 8px', borderRadius: '6px', backgroundColor: 'rgba(255,110,64,0.1)', border: '1px solid rgba(255,110,64,0.3)', marginBottom: '4px' }}>
+                            <span style={{ fontSize: '9px', color: '#ff6e40', fontWeight: 600 }}>LAYOUT:</span>
+                            <div style={{ display: 'flex', gap: '2px', flex: 1 }}>
+                              {layout.map((r: any, i: number) => (
+                                <div key={i} style={{
+                                  flex: r.position === 'background' ? undefined : 1,
+                                  padding: '2px 6px', borderRadius: '4px', textAlign: 'center' as const,
+                                  fontSize: '9px', fontWeight: 500,
+                                  backgroundColor: i === 0 ? 'rgba(0,176,255,0.2)' : i === 1 ? 'rgba(124,77,255,0.2)' : 'rgba(255,110,64,0.2)',
+                                  color: i === 0 ? '#00b0ff' : i === 1 ? '#b388ff' : '#ff6e40',
+                                  border: '1px solid',
+                                  borderColor: i === 0 ? 'rgba(0,176,255,0.4)' : i === 1 ? 'rgba(124,77,255,0.4)' : 'rgba(255,110,64,0.4)',
+                                }}>
+                                  Char {r.region} → {r.position}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                         {groups.map((group, gi) => {
                           const isChar = group.section !== 'shared';
                           const sectionLabel = group.section === 'character_inline'
