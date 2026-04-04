@@ -16,6 +16,8 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [lastUserQuery, setLastUserQuery] = useState<string | null>(null);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const [lightboxZoom, setLightboxZoom] = useState(1);
+  const [lightboxPan, setLightboxPan] = useState({ x: 0, y: 0 });
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [pendingAgentEdit, setPendingAgentEdit] = useState<{ instruction: string; output: string; filePath: string; newSource?: string; contextEdits?: { path: string; diff: string; new_source: string; explanation?: string }[] } | null>(null);
   const computeSize = () => {

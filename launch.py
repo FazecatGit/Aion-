@@ -40,7 +40,7 @@ def start_frontend():
     )
 
 
-def wait_for_server(timeout: int = 30) -> bool:
+def wait_for_server(timeout: int = 60) -> bool:
     """Wait until the backend server is responding."""
     import urllib.request
     start = time.time()
@@ -101,14 +101,28 @@ def main():
 
         print(f"[LAUNCHER] Running ({len(procs)} process(es)). Press Ctrl+C to stop.")
 
-        # Wait for any process to exit
+        # Wait for processes — auto-restart server if it crashes
         while True:
-            for p in procs:
+            for i, p in enumerate(procs):
                 ret = p.poll()
                 if ret is not None:
-                    name = "Server" if p == procs[0] and (both or args.server) else "Frontend"
+                    is_server = (both or args.server) and i == 0
+                    name = "Server" if is_server else "Frontend"
                     print(f"[LAUNCHER] {name} exited with code {ret}")
-                    shutdown()
+
+                    if is_server and not args.server:
+                        # Server crashed but frontend is still running — restart it
+                        print("[LAUNCHER] Restarting backend server...")
+                        new_server = start_server()
+                        procs[i] = new_server
+                        time.sleep(2)
+                        if wait_for_server(timeout=60):
+                            print("[LAUNCHER] Backend restarted successfully!")
+                        else:
+                            print("[LAUNCHER] WARNING: Backend restart failed")
+                    else:
+                        # Frontend died or server-only mode — shut down
+                        shutdown()
             time.sleep(1)
 
     except KeyboardInterrupt:

@@ -245,7 +245,7 @@ def generate_image(
 ) -> dict:
     """Generate an image. Returns dict with path, prompt analysis, settings used."""
     # Lazy import history functions (still in monolith)
-    from agent.image_generation import record_generation, apply_feedback_learnings, apply_positive_learnings
+    from .history import record_generation, apply_feedback_learnings, apply_positive_learnings
 
     # Resolve model
     if model_path is None:
@@ -579,7 +579,7 @@ def generate_preview_only(
 ) -> dict:
     """Fast noisy preview at small resolution (256×256) with the same seed."""
     from PIL import Image as PILImage
-    from agent.image_generation import apply_feedback_learnings, apply_positive_learnings
+    from .history import apply_feedback_learnings, apply_positive_learnings
 
     preview_w = 256
     preview_h = 256
@@ -824,3 +824,151 @@ def generate_with_preview(
         "settings": full.get("settings"),
         "lora_diagnostics": full.get("lora_diagnostics", []),
     }
+
+
+def upscale_image(
+    image_path: str,
+    scale: float = 2.0,
+    tile_size: int = 768,
+    model_path: str | None = None,
+    prompt: str = "",
+    steps: int = 20,
+    strength: float = 0.35,
+) -> dict:
+    """
+    Content-aware tiled upscaling: split image into overlapping tiles,
+    run img2img on each tile, then stitch back together.
+
+    Keeps VRAM usage bounded regardless of output resolution.
+    Recommended tile_size values for 8 GB VRAM: 512-768.
+    """
+    from PIL import Image as PILImage
+    import numpy as np
+
+    if not Path(image_path).exists():
+        return {"status": "error", "error": f"Image not found: {image_path}"}
+
+    scale = max(1.5, min(scale, 6.0))
+    tile_size = max(256, min(tile_size, 2048))
+
+    src = PILImage.open(image_path).convert("RGB")
+    orig_w, orig_h = src.size
+    new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+    # Round to nearest 8 (required for SDXL)
+    new_w = (new_w // 8) * 8
+    new_h = (new_h // 8) * 8
+
+    _log.info("[UPSCALE] %dx%d → %dx%d (%.1fx, tile=%d)",
+              orig_w, orig_h, new_w, new_h, scale, tile_size)
+
+    model_path = _resolve_model_path(model_path)
+    if model_path is None:
+        return {"status": "error", "error": "No model found"}
+    img2img_pipe = _load_img2img_pipeline(model_path)
+    if img2img_pipe is None:
+        return {"status": "error", "error": "img2img pipeline unavailable"}
+
+    # Upscale source to target size using PIL first (bicubic)
+    upscaled = src.resize((new_w, new_h), PILImage.LANCZOS)
+
+    # Tile parameters
+    overlap = tile_size // 4  # 25% overlap for blending
+    step = tile_size - overlap
+    output_np = np.array(upscaled, dtype=np.float64)
+    weight_map = np.zeros((new_h, new_w), dtype=np.float64)
+
+    tile_count = 0
+    for y in range(0, new_h, step):
+        for x in range(0, new_w, step):
+            y2 = min(y + tile_size, new_h)
+            x2 = min(x + tile_size, new_w)
+            y1 = max(0, y2 - tile_size)
+            x1 = max(0, x2 - tile_size)
+
+            tile = upscaled.crop((x1, y1, x2, y2))
+            tw, th = tile.size
+            # Round tile to 8
+            tw8, th8 = (tw // 8) * 8, (th // 8) * 8
+            if tw8 < 64 or th8 < 64:
+                continue
+            tile = tile.resize((tw8, th8), PILImage.LANCZOS)
+
+            tile_prompt = prompt or "high resolution, detailed, sharp"
+            generator = torch.Generator(device="cuda").manual_seed(42)
+            result = img2img_pipe(
+                prompt=tile_prompt,
+                negative_prompt="blurry, low quality, artifacts, noise",
+                image=tile,
+                strength=strength,
+                num_inference_steps=steps,
+                guidance_scale=5.0,
+                generator=generator,
+            ).images[0]
+
+            # Resize back to tile dimensions
+            result = result.resize((x2 - x1, y2 - y1), PILImage.LANCZOS)
+            result_np = np.array(result, dtype=np.float64)
+
+            # Feathered blend mask
+            mask = _make_feather_mask(y2 - y1, x2 - x1, overlap)
+            for c in range(3):
+                output_np[y1:y2, x1:x2, c] += result_np[:, :, c] * mask
+            weight_map[y1:y2, x1:x2] += mask
+
+            tile_count += 1
+            _log.info("[UPSCALE] Tile %d processed (%d,%d)-(%d,%d)", tile_count, x1, y1, x2, y2)
+
+    # Normalize by weights
+    weight_map = np.maximum(weight_map, 1e-6)
+    for c in range(3):
+        output_np[:, :, c] /= weight_map
+    output_np = np.clip(output_np, 0, 255).astype(np.uint8)
+
+    # ── Brightness preservation ──────────────────────────────────
+    # The img2img tiles tend to brighten the image. Match the mean
+    # luminance of the output to the (upscaled) source image.
+    upscaled_np = np.array(upscaled, dtype=np.float64)
+    src_lum = 0.2126 * upscaled_np[:,:,0] + 0.7152 * upscaled_np[:,:,1] + 0.0722 * upscaled_np[:,:,2]
+    out_lum = 0.2126 * output_np[:,:,0].astype(np.float64) + 0.7152 * output_np[:,:,1].astype(np.float64) + 0.0722 * output_np[:,:,2].astype(np.float64)
+    src_mean = np.mean(src_lum)
+    out_mean = np.mean(out_lum)
+    if out_mean > 1e-3:
+        lum_ratio = src_mean / out_mean
+        # Clamp ratio to avoid extreme corrections
+        lum_ratio = max(0.5, min(lum_ratio, 1.5))
+        if abs(lum_ratio - 1.0) > 0.02:
+            _log.info("[UPSCALE] Brightness correction: ratio=%.3f", lum_ratio)
+            output_np = np.clip(output_np.astype(np.float64) * lum_ratio, 0, 255).astype(np.uint8)
+
+    final = PILImage.fromarray(output_np)
+
+    output_dir_path = Path(OUTPUT_DIR)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = str(output_dir_path / f"{timestamp}_upscaled_{scale:.1f}x.png")
+    final.save(out_path, quality=95)
+    _log.info("[UPSCALE] Done: %s (%d tiles)", out_path, tile_count)
+
+    return {
+        "status": "ok",
+        "path": out_path,
+        "original_size": [orig_w, orig_h],
+        "upscaled_size": [new_w, new_h],
+        "scale": scale,
+        "tiles_processed": tile_count,
+    }
+
+
+def _make_feather_mask(h: int, w: int, margin: int):
+    """Create a 2D feathering mask that fades at tile edges for seamless blending."""
+    import numpy as np
+    mask = np.ones((h, w), dtype=np.float64)
+    ramp = np.linspace(0, 1, margin) if margin > 0 else np.array([1.0])
+    # Feather edges
+    for i in range(min(margin, h)):
+        mask[i, :] *= ramp[i]
+        mask[h - 1 - i, :] *= ramp[i]
+    for j in range(min(margin, w)):
+        mask[:, j] *= ramp[j]
+        mask[:, w - 1 - j] *= ramp[j]
+    return mask
+

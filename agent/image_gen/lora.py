@@ -315,3 +315,88 @@ def unload_loras(pipe: StableDiffusionXLPipeline):
         pipe.unload_lora_weights()
         _core._active_loras = []
         _log.info("[IMAGE GEN] All LoRAs unloaded")
+
+
+def search_characters(query: str) -> dict:
+    """Search all LoRA categories and past generations matching a query.
+
+    Searches file names, trigger words, and generation history prompts.
+    Returns matching LoRA adapters and recent history entries.
+    """
+    from .history import _generation_history
+    query_lower = query.lower().strip()
+    if not query_lower:
+        return {"status": "ok", "loras": [], "history_matches": []}
+
+    # Search ALL LoRA categories
+    LORA_CATEGORIES = ("styles", "characters", "clothing", "poses", "concept", "action")
+    tw_data = _load_trigger_words()
+    matching_loras = []
+    for cat in LORA_CATEGORIES:
+        cat_dir = MODELS_DIR / cat
+        if not cat_dir.exists():
+            continue
+        for f in cat_dir.iterdir():
+            if f.suffix.lower() not in LORA_EXTENSIONS or not f.is_file():
+                continue
+            name_match = query_lower in f.stem.lower()
+            trigger_match = any(query_lower in tw.lower() for tw in tw_data.get(f.stem, []))
+            if name_match or trigger_match:
+                # Look for a preview image
+                preview = None
+                for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                    candidate = f.parent / f"{f.stem}.preview{ext}"
+                    if candidate.exists():
+                        preview = str(candidate)
+                        break
+                matching_loras.append({
+                    "name": f.stem,
+                    "path": str(f),
+                    "size_mb": round(f.stat().st_size / (1024 * 1024), 1),
+                    "category": cat,
+                    "trigger_words": tw_data.get(f.stem, []),
+                    "preview_image": preview,
+                })
+
+    # Search generation history for matching prompts
+    history_matches = []
+    for entry in _generation_history:
+        prompt = (entry.get("prompt") or "").lower()
+        if query_lower in prompt:
+            history_matches.append({
+                "prompt": entry.get("prompt", "")[:100],
+                "result_path": entry.get("result_path"),
+                "seed": entry.get("settings", {}).get("seed"),
+                "timestamp": entry.get("timestamp"),
+            })
+
+    return {
+        "status": "ok",
+        "loras": matching_loras,
+        "history_matches": history_matches[-10:],  # last 10 matches
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WAN Video Generation
+# ══════════════════════════════════════════════════════════════════════════
+# Uses WAN 2.1 image-to-video pipeline with dual-LoRA (high_noise +
+# low_noise) for action animations.  Requires a WAN base model to be
+# downloaded into models/ directory.
+#
+# Required HuggingFace model (auto-downloaded on first run):
+#   Wan-AI/Wan2.1-T2V-1.3B  (text-to-video, fits in ~4 GB with bf16
+#                             + cpu offload, 8 GB VRAM comfortable)
+#
+# NOTE: WAN only released I2V (image-to-video) at 14B.  The 1.3B model
+# is T2V only.  When an image is provided it is used as a style/scene
+# reference via prompt enrichment rather than direct frame conditioning.
+#
+# The user's action LoRAs are split into high_noise / low_noise variants.
+# Both are applied simultaneously: high_noise LoRA acts on early (noisy)
+# diffusion steps and low_noise LoRA acts on late (clean) steps.
+# ══════════════════════════════════════════════════════════════════════════
+
+_WAN_MODELS_DIR = MODELS_DIR  # WAN model goes in models/ alongside SDXL
+_wan_pipeline = None
+

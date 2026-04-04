@@ -884,8 +884,6 @@ const handleCancelGeneration = async () => {
 };
 
 // Free all VRAM (unload SD pipelines + evict Ollama models)
-const [vramFlushing, setVramFlushing] = React.useState(false);
-
   const handleFlushVram = async () => {
     setVramFlushing(true);
     try {

@@ -13,7 +13,7 @@ from brain.config import OUTPUT_DIR
 _log = logging.getLogger("image_gen")
 
 # ── Model management ──────────────────────────────────────────────────────
-MODELS_DIR = Path(__file__).parent.parent / "models"
+MODELS_DIR = Path(__file__).parent.parent.parent / "models"
 SUPPORTED_EXTENSIONS = {".safetensors", ".ckpt"}
 LORA_EXTENSIONS = {".safetensors"}
 
@@ -134,3 +134,31 @@ def _check_cancelled():
         _cancel_event.clear()
         return True
     return False
+
+
+def _recover_interrupted_jobs():
+    """On server start, mark any 'running' jobs as 'interrupted'."""
+    if not VIDEO_CHECKPOINT_DIR.exists():
+        return
+    for job_dir in VIDEO_CHECKPOINT_DIR.iterdir():
+        meta_file = job_dir / "job.json"
+        if not meta_file.exists():
+            continue
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if meta.get("status") in ("running", "paused"):
+                meta["status"] = "interrupted"
+                with open(meta_file, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2, default=str)
+                _log.info("[WAN VIDEO] Recovered interrupted job: %s (step %d/%d)",
+                          meta.get("job_id"), meta.get("last_completed_step", 0),
+                          meta.get("steps", 0))
+        except Exception:
+            pass
+
+try:
+    _recover_interrupted_jobs()
+except Exception:
+    pass
+

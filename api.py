@@ -198,14 +198,14 @@ async def restart_server():
 @app.get("/system/gpu")
 async def gpu_info_endpoint():
     """Return GPU VRAM stats (allocated, reserved, total, device name)."""
-    from agent.image_generation import get_gpu_info
+    from agent.image_gen import get_gpu_info
     return get_gpu_info()
 
 
 @app.get("/generate/progress")
 async def generation_progress_endpoint():
     """Return real-time generation progress (step, frame, VRAM)."""
-    from agent.image_generation import get_generation_progress
+    from agent.image_gen import get_generation_progress
     return get_generation_progress()
 
 
@@ -1919,7 +1919,7 @@ class ImageGenRequest(BaseModel):
 async def generate_image_endpoint(req: ImageGenRequest):
     """Generate an image using local Stable Diffusion XL."""
     _api_log.info("[API] /generate/image — prompt=%s, mode=%s", req.prompt[:60], req.mode)
-    from agent.image_generation import generate_image, list_models
+    from agent.image_gen import generate_image, list_models
 
     # Resolve model name to path
     model_path = None
@@ -1981,7 +1981,7 @@ async def generate_image_endpoint(req: ImageGenRequest):
 @app.post("/generate/tokenize")
 async def tokenize_prompt_endpoint(req: dict):
     """Count CLIP tokens for a prompt without generating an image."""
-    from agent.image_generation import count_tokens
+    from agent.image_gen import count_tokens
     prompt = req.get("prompt", "")
     return count_tokens(prompt)
 
@@ -1989,7 +1989,7 @@ async def tokenize_prompt_endpoint(req: dict):
 @app.post("/generate/validate-characters")
 async def validate_characters_endpoint(req: dict):
     """Validate prompt for character trigger codes — detect matches and misspellings."""
-    from agent.image_generation import validate_prompt_characters, list_models
+    from agent.image_gen import validate_prompt_characters, list_models
     prompt = req.get("prompt", "")
     lora_names = req.get("loras", [])
 
@@ -2036,7 +2036,7 @@ async def generate_animated_endpoint(req: AnimatedGenRequest):
     """Generate a frame-consistent animated sequence with img2img chaining."""
     _api_log.info("[API] /generate/animated — prompt=%s, frames=%d, style=%s",
                   req.prompt[:60], req.num_frames, req.art_style)
-    from agent.image_generation import generate_animated, list_models
+    from agent.image_gen import generate_animated, list_models
 
     model_path = None
     if req.model:
@@ -2105,14 +2105,14 @@ async def generate_animated_endpoint(req: AnimatedGenRequest):
 @app.get("/generate/animated/jobs")
 async def list_animation_jobs():
     """List all saved animation jobs with resume status."""
-    from agent.image_generation import list_animation_jobs
+    from agent.image_gen import list_animation_jobs
     return {"status": "ok", "jobs": list_animation_jobs()}
 
 
 @app.get("/generate/animated/jobs/{job_id}")
 async def get_animation_job_endpoint(job_id: str):
     """Get full checkpoint data for a specific animation job."""
-    from agent.image_generation import get_animation_job
+    from agent.image_gen import get_animation_job
     data = get_animation_job(job_id)
     if not data:
         return {"status": "error", "error": "Job not found"}
@@ -2122,7 +2122,7 @@ async def get_animation_job_endpoint(job_id: str):
 @app.post("/generate/cancel")
 async def cancel_generation_endpoint():
     """Cancel any running image/animation generation."""
-    from agent.image_generation import cancel_generation
+    from agent.image_gen import cancel_generation
     return cancel_generation()
 
 
@@ -2148,7 +2148,7 @@ class SaveAnimStateRequest(BaseModel):
 @app.post("/generate/animated/save")
 async def save_animation_state_endpoint(req: SaveAnimStateRequest):
     """Save current animation settings without generating."""
-    from agent.image_generation import save_animation_state
+    from agent.image_gen import save_animation_state
     return save_animation_state(
         prompt=req.prompt,
         negative_prompt=req.negative_prompt,
@@ -2189,7 +2189,7 @@ class VideoGenRequest(BaseModel):
 async def generate_video_endpoint(req: VideoGenRequest):
     """Generate a video using WAN 2.1 with optional dual-LoRA actions."""
     _api_log.info("[API] /generate/video — prompt=%s, frames=%d", req.prompt[:60], req.num_frames)
-    from agent.image_generation import generate_video
+    from agent.image_gen import generate_video
 
     def _gen():
         return generate_video(
@@ -2225,14 +2225,14 @@ async def generate_video_endpoint(req: VideoGenRequest):
 @app.get("/generate/video/action-loras")
 async def list_action_loras_endpoint():
     """List available action LoRAs with pair detection."""
-    from agent.image_generation import list_action_loras
+    from agent.image_gen import list_action_loras
     return {"status": "ok", "loras": list_action_loras()}
 
 
 @app.post("/generate/video/flush")
 async def flush_wan_endpoint():
     """Unload WAN pipeline from VRAM."""
-    from agent.image_generation import flush_wan_pipeline
+    from agent.image_gen import flush_wan_pipeline
     flush_wan_pipeline()
     return {"status": "ok", "message": "WAN pipeline flushed"}
 
@@ -2240,28 +2240,28 @@ async def flush_wan_endpoint():
 @app.post("/generate/video/pause")
 async def pause_video_endpoint():
     """Pause the current video generation after the current step."""
-    from agent.image_generation import pause_video_generation
+    from agent.image_gen import pause_video_generation
     return pause_video_generation()
 
 
 @app.post("/generate/video/resume")
 async def resume_video_endpoint():
     """Resume a paused video generation."""
-    from agent.image_generation import resume_video_generation
+    from agent.image_gen import resume_video_generation
     return resume_video_generation()
 
 
 @app.get("/generate/video/checkpoints")
 async def list_video_checkpoints_endpoint():
     """List all saved video generation checkpoints."""
-    from agent.image_generation import list_video_checkpoints
+    from agent.image_gen import list_video_checkpoints
     return {"status": "ok", "checkpoints": list_video_checkpoints()}
 
 
 @app.get("/generate/video/queue")
 async def video_queue_status_endpoint():
     """Return full video queue status — running, paused, interrupted jobs."""
-    from agent.image_generation import get_video_queue_status
+    from agent.image_gen import get_video_queue_status
     return get_video_queue_status()
 
 
@@ -2271,7 +2271,7 @@ async def resume_interrupted_job_endpoint(body: dict):
     job_id = body.get("job_id")
     if not job_id:
         return {"status": "error", "error": "job_id is required"}
-    from agent.image_generation import resume_interrupted_job
+    from agent.image_gen import resume_interrupted_job
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, resume_interrupted_job, job_id)
     if result.get("status") != "ok" or not result.get("path"):
@@ -2287,14 +2287,14 @@ async def resume_interrupted_job_endpoint(body: dict):
 @app.get("/generate/video/history")
 async def list_generated_videos_endpoint():
     """List all generated videos with metadata."""
-    from agent.image_generation import list_generated_videos
+    from agent.image_gen import list_generated_videos
     return {"status": "ok", "videos": list_generated_videos()}
 
 
 @app.post("/generate/video/cleanup")
 async def cleanup_video_checkpoints_endpoint(job_id: Optional[str] = None, keep_latest: int = 3):
     """Clean up old checkpoint directories."""
-    from agent.image_generation import cleanup_checkpoints
+    from agent.image_gen import cleanup_checkpoints
     return cleanup_checkpoints(job_id=job_id, keep_latest=keep_latest)
 
 
@@ -2308,7 +2308,7 @@ class RegenerateFrameRequest(BaseModel):
 @app.post("/generate/animated/frame/edit")
 async def edit_animation_frame(req: RegenerateFrameRequest):
     """Re-generate a single frame in an animation job."""
-    from agent.image_generation import regenerate_frame
+    from agent.image_gen import regenerate_frame
     result = await asyncio.to_thread(
         regenerate_frame, req.job_id, req.frame_index, req.fix_prompt, req.strength, req.steps
     )
@@ -2320,7 +2320,7 @@ async def edit_animation_frame(req: RegenerateFrameRequest):
 @app.get("/generate/styles")
 async def list_art_styles():
     """List available art style presets."""
-    from agent.image_generation import get_art_styles, STYLE_NAMES
+    from agent.image_gen import get_art_styles, STYLE_NAMES
     return {"status": "ok", "styles": get_art_styles(), "names": STYLE_NAMES}
 
 
@@ -2338,7 +2338,7 @@ class StoryboardRequest(BaseModel):
 @app.post("/generate/storyboard")
 async def generate_storyboard_endpoint(req: StoryboardRequest):
     """Generate a quick low-res storyboard sketch for animation preview."""
-    from agent.image_generation import generate_storyboard, list_models
+    from agent.image_gen import generate_storyboard, list_models
 
     model_path = None
     if req.model:
@@ -2387,7 +2387,7 @@ class PreviewGenRequest(BaseModel):
 @app.post("/generate/preview/quick")
 async def generate_preview_only_endpoint(req: PreviewGenRequest):
     """Fast noisy preview — quarter res, 6 steps. Returns preview image + seed."""
-    from agent.image_generation import generate_preview_only, list_models
+    from agent.image_gen import generate_preview_only, list_models
 
     model_path = None
     if req.model:
@@ -2443,7 +2443,7 @@ async def generate_preview_only_endpoint(req: PreviewGenRequest):
 @app.post("/generate/preview")
 async def generate_preview_endpoint(req: PreviewGenRequest):
     """Two-pass generation: quick low-res preview, then full-res render."""
-    from agent.image_generation import generate_with_preview, list_models
+    from agent.image_gen import generate_with_preview, list_models
 
     model_path = None
     if req.model:
@@ -2495,7 +2495,7 @@ class UpscaleRequest(BaseModel):
 @app.post("/generate/upscale")
 async def upscale_image_endpoint(req: UpscaleRequest):
     """Tile-based VRAM-friendly image upscaling."""
-    from agent.image_generation import upscale_image, list_models
+    from agent.image_gen import upscale_image, list_models
 
     model_path = None
     if req.model:
@@ -2532,7 +2532,7 @@ class TrainingCritiqueRequest(BaseModel):
 @app.post("/generate/train/critique")
 async def critique_dataset_endpoint(req: TrainingCritiqueRequest):
     """Analyse training images and return quality report."""
-    from agent.image_generation import critique_training_dataset
+    from agent.image_gen import critique_training_dataset
     return critique_training_dataset(req.image_dir, req.training_type)
 
 
@@ -2551,7 +2551,7 @@ class StartTrainRequest(BaseModel):
 @app.post("/generate/train/start")
 async def start_training_endpoint(req: StartTrainRequest):
     """Start LoRA fine-tuning on a set of training images."""
-    from agent.image_generation import start_lora_training, list_models
+    from agent.image_gen import start_lora_training, list_models
 
     base_model = None
     if req.base_model:
@@ -2577,14 +2577,14 @@ async def start_training_endpoint(req: StartTrainRequest):
 @app.get("/generate/train/status")
 async def training_status_endpoint():
     """Get the status of the current LoRA training job."""
-    from agent.image_generation import get_training_status
+    from agent.image_gen import get_training_status
     return get_training_status()
 
 
 @app.post("/generate/train/cancel")
 async def cancel_training_endpoint():
     """Cancel the currently running LoRA training job."""
-    from agent.image_generation import cancel_training
+    from agent.image_gen import cancel_training
     return cancel_training()
 
 
@@ -2593,7 +2593,7 @@ async def cancel_training_endpoint():
 @app.get("/generate/models")
 async def list_image_models():
     """List all available checkpoint and LoRA models."""
-    from agent.image_generation import list_models, get_active_model
+    from agent.image_gen import list_models, get_active_model
     return {
         "status": "ok",
         "models": list_models(),
@@ -2607,7 +2607,7 @@ class DeleteImageModelRequest(BaseModel):
 @app.post("/generate/models/delete")
 async def delete_image_model(req: DeleteImageModelRequest):
     """Delete an image generation model from disk."""
-    from agent.image_generation import delete_model
+    from agent.image_gen import delete_model
     return delete_model(req.model_path)
 
 
@@ -2617,7 +2617,7 @@ class UnloadImageModelRequest(BaseModel):
 @app.post("/generate/models/unload")
 async def unload_image_model(req: UnloadImageModelRequest):
     """Unload a model from GPU memory."""
-    from agent.image_generation import unload_model
+    from agent.image_gen import unload_model
     unload_model(req.model_path)
     return {"status": "ok", "message": "Model unloaded"}
 
@@ -2625,7 +2625,7 @@ async def unload_image_model(req: UnloadImageModelRequest):
 @app.post("/generate/vram/flush")
 async def flush_vram_endpoint():
     """Unload ALL image-gen pipelines and evict Ollama models to fully free VRAM."""
-    from agent.image_generation import flush_vram
+    from agent.image_gen import flush_vram
     await asyncio.to_thread(flush_vram)
     return {"status": "ok", "message": "VRAM flushed — all models evicted"}
 
@@ -2639,14 +2639,14 @@ class ImageFeedbackRequest(BaseModel):
 @app.post("/generate/feedback")
 async def image_feedback(req: ImageFeedbackRequest):
     """Submit feedback about a generated image to improve future generations."""
-    from agent.image_generation import submit_feedback
+    from agent.image_gen import submit_feedback
     return submit_feedback(req.generation_index, req.feedback)
 
 
 @app.get("/generate/feedback/learnings")
 async def get_feedback_learnings_endpoint():
     """Get all current feedback learnings (positive + negative) for review."""
-    from agent.image_generation import get_feedback_learnings
+    from agent.image_gen import get_feedback_learnings
     return get_feedback_learnings()
 
 
@@ -2656,7 +2656,7 @@ class ClearFeedbackRequest(BaseModel):
 @app.post("/generate/feedback/clear")
 async def clear_feedback_learnings_endpoint(req: ClearFeedbackRequest):
     """Clear stored feedback learnings."""
-    from agent.image_generation import clear_feedback_learnings
+    from agent.image_gen import clear_feedback_learnings
     return clear_feedback_learnings(req.scope)
 
 
@@ -2666,35 +2666,35 @@ class CustomPositiveRequest(BaseModel):
 @app.post("/generate/feedback/positive")
 async def save_custom_positive_endpoint(req: CustomPositiveRequest):
     """Save a persistent positive keyword to enhance future generations."""
-    from agent.image_generation import save_custom_positive
+    from agent.image_gen import save_custom_positive
     return save_custom_positive(req.positive_text)
 
 
 @app.get("/generate/loras/trigger-words/parsed/{lora_name}")
 async def get_trigger_words_parsed_endpoint(lora_name: str):
     """Get parsed trigger words with outfit groups for a specific LoRA."""
-    from agent.image_generation import get_trigger_words_parsed
+    from agent.image_gen import get_trigger_words_parsed
     return get_trigger_words_parsed(lora_name)
 
 
 @app.get("/generate/characters/search")
 async def search_characters_endpoint(q: str = ""):
     """Search all LoRA categories and past generations by name or trigger word."""
-    from agent.image_generation import search_characters
+    from agent.image_gen import search_characters
     return search_characters(q)
 
 
 @app.get("/generate/history")
 async def image_gen_history(limit: int = 20):
     """Get recent image generation history with prompt analysis."""
-    from agent.image_generation import get_generation_history
+    from agent.image_gen import get_generation_history
     return {"status": "ok", "history": get_generation_history(limit)}
 
 
 @app.delete("/generate/history/{index}")
 async def delete_history_entry(index: int):
     """Delete a specific generation history entry by index (0-based from newest)."""
-    from agent.image_generation import delete_generation_history_entry
+    from agent.image_gen import delete_generation_history_entry
     result = delete_generation_history_entry(index)
     return result
 
@@ -2705,7 +2705,7 @@ class VocabExpandRequest(BaseModel):
 @app.post("/generate/vocab/expand")
 async def expand_vocab_endpoint(req: VocabExpandRequest):
     """Get synonym suggestions for prompt words."""
-    from agent.image_generation import expand_vocabulary
+    from agent.image_gen import expand_vocabulary
     return expand_vocabulary(req.text)
 
 
@@ -2714,7 +2714,7 @@ async def expand_vocab_endpoint(req: VocabExpandRequest):
 @app.get("/generate/loras/categories")
 async def list_loras_by_category_endpoint():
     """List all LoRAs organized by folder category with trigger words."""
-    from agent.image_generation import list_loras_by_category
+    from agent.image_gen import list_loras_by_category
     return list_loras_by_category()
 
 
@@ -2780,14 +2780,14 @@ class TriggerWordRequest(BaseModel):
 @app.post("/generate/loras/trigger-words")
 async def set_trigger_words_endpoint(req: TriggerWordRequest):
     """Set trigger words for a LoRA file. Supports weighted entries and outfit grouping via ';'."""
-    from agent.image_generation import set_trigger_words
+    from agent.image_gen import set_trigger_words
     return set_trigger_words(req.lora_name, req.trigger_words)
 
 
 @app.get("/generate/loras/trigger-words")
 async def get_all_trigger_words_endpoint():
     """Get all saved trigger words for all LoRAs."""
-    from agent.image_generation import get_all_trigger_words
+    from agent.image_gen import get_all_trigger_words
     return get_all_trigger_words()
 
 
@@ -2797,7 +2797,7 @@ class DeleteTriggerWordRequest(BaseModel):
 @app.post("/generate/loras/trigger-words/delete")
 async def delete_trigger_words_endpoint(req: DeleteTriggerWordRequest):
     """Remove trigger words for a LoRA."""
-    from agent.image_generation import delete_trigger_words
+    from agent.image_gen import delete_trigger_words
     return delete_trigger_words(req.lora_name)
 
 

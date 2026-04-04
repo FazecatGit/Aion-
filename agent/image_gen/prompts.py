@@ -1,6 +1,7 @@
 """Prompt analysis, encoding, validation, vocabulary expansion, and multi-character structuring."""
 
 import math
+from pathlib import Path
 import re
 import logging
 
