@@ -30,12 +30,20 @@ function App() {
   const [ragChunkPrompt, setRagChunkPrompt] = useState<{ show: boolean; instruction: string; filePath: string } | null>(null);
   const [customChunkInput, setCustomChunkInput] = useState('');
   const [ragSearchMethod, setRagSearchMethod] = useState<'bm25' | 'semantic' | 'both'>('both');
+  const [responseTone, setResponseTone] = useState<string>('default');
   // ── Test runner state ──────────────────────────────────────────────────────
   const [testCases, setTestCases]         = useState<TestCase[]>([]);
   const [testResults, setTestResults]     = useState<TestResult[]>([]);
   const [showTestPanel, setShowTestPanel] = useState(false);
   const [testNextId, setTestNextId]       = useState(1);
   const lastAgentInstruction              = useRef<string>('');
+  // ── In-app file editor state ───────────────────────────────────────────────
+  const [fileEditorContent, setFileEditorContent] = useState<string>('');
+  const [fileEditorOriginal, setFileEditorOriginal] = useState<string>('');
+  const [fileEditorLoading, setFileEditorLoading] = useState(false);
+  const [fileEditorDirty, setFileEditorDirty] = useState(false);
+  const [fileEditorSaving, setFileEditorSaving] = useState(false);
+  const [fileEditorOpen, setFileEditorOpen] = useState(false);
   // ── Session management ─────────────────────────────────────────────────────
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [sessionId, setSessionId] = useState<string>(() => crypto.randomUUID());
@@ -485,6 +493,74 @@ function App() {
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [showModelPicker]);
+
+  // ── Load file content when selectedFilePath changes ─────────────────────
+  useEffect(() => {
+    if (!selectedFilePath) {
+      setFileEditorContent('');
+      setFileEditorOriginal('');
+      setFileEditorDirty(false);
+      setFileEditorOpen(false);
+      return;
+    }
+    let cancelled = false;
+    setFileEditorLoading(true);
+    fetch(`${API_BASE}/file/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_path: selectedFilePath }),
+    })
+      .then(r => r.json())
+      .then(d => {
+        if (cancelled) return;
+        if (d.status === 'ok') {
+          setFileEditorContent(d.content);
+          setFileEditorOriginal(d.content);
+          setFileEditorDirty(false);
+          setFileEditorOpen(true);
+        }
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setFileEditorLoading(false); });
+    return () => { cancelled = true; };
+  }, [selectedFilePath]);
+
+  // Reload file after agent apply so editor stays in sync
+  const reloadFileEditor = async () => {
+    if (!selectedFilePath) return;
+    try {
+      const r = await fetch(`${API_BASE}/file/read`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_path: selectedFilePath }),
+      });
+      const d = await r.json();
+      if (d.status === 'ok') {
+        setFileEditorContent(d.content);
+        setFileEditorOriginal(d.content);
+        setFileEditorDirty(false);
+      }
+    } catch {}
+  };
+
+  const handleFileSave = async () => {
+    if (!selectedFilePath || !fileEditorDirty) return;
+    setFileEditorSaving(true);
+    try {
+      const r = await fetch(`${API_BASE}/file/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_path: selectedFilePath, content: fileEditorContent }),
+      });
+      const d = await r.json();
+      if (d.status === 'ok') {
+        setFileEditorOriginal(fileEditorContent);
+        setFileEditorDirty(false);
+      }
+    } catch {}
+    setFileEditorSaving(false);
+  };
+
 
   // ── WAV encoder (no ffmpeg needed — pure PCM → WAV) ──────────────────────
   const encodeWAV = (samples: Float32Array, sampleRate: number): Blob => {
@@ -1191,7 +1267,7 @@ const handleSubmit = async (e: React.FormEvent) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal,
-        body: JSON.stringify({ question: queryQuestion, mode: queryMode, session_id: sid }),
+        body: JSON.stringify({ question: queryQuestion, mode: queryMode, session_id: sid, tone: responseTone !== 'default' ? responseTone : undefined }),
       });
       const data = await safeJson(res);
 
@@ -1584,6 +1660,25 @@ return (
             <option value="both">Both</option>
           </select>
         )}
+        {activeMode === 'query' && (
+          <select
+            value={responseTone}
+            onChange={e => setResponseTone(e.target.value)}
+            disabled={mode !== 'idle'}
+            title="Response tone & style"
+            style={{ padding: '6px', borderRadius: '6px', backgroundColor: '#111', color: '#fff', border: '1px solid #333', fontSize: '12px' }}
+          >
+            <option value="default">🎭 Default</option>
+            <option value="formal and academic">📝 Formal</option>
+            <option value="casual and conversational">💬 Casual</option>
+            <option value="concise and direct">⚡ Concise</option>
+            <option value="detailed and thorough">📖 Detailed</option>
+            <option value="eli5 simple and easy to understand">🧒 ELI5</option>
+            <option value="technical and precise">🔧 Technical</option>
+            <option value="encouraging and supportive like a mentor">🎓 Mentor</option>
+            <option value="socratic, asking guiding questions">🤔 Socratic</option>
+          </select>
+        )}
       </div>
 
       <ToolsPanel
@@ -1690,6 +1785,13 @@ return (
               <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }} title={selectedFilePath}>
                 {selectedFilePath}
               </span>
+              {!fileEditorOpen && (
+                <button
+                  onClick={() => setFileEditorOpen(true)}
+                  title="Open file editor"
+                  style={{ background: 'none', border: 'none', color: '#cca8ff', cursor: 'pointer', fontSize: '11px', padding: '0 2px' }}
+                >✎</button>
+              )}
               <button
                 onClick={() => { setSelectedFilePath(null); setTestResults([]); }}
                 style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', fontSize: '11px', padding: '0 2px' }}
@@ -1715,6 +1817,124 @@ return (
                 style={{ fontSize: '10px', padding: '3px 6px', borderRadius: '10px', backgroundColor: 'rgba(255,50,50,0.15)', border: '1px solid rgba(255,50,50,0.3)', color: '#ff5555', cursor: 'pointer' }}>
                 Clear
               </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── In-App File Editor (agent mode) ──────────────────────────────── */}
+      {activeMode === 'agent' && fileEditorOpen && selectedFilePath && (
+        <div style={{
+          position: 'fixed', top: '70px', right: '20px', zIndex: 45,
+          width: '520px', bottom: '80px',
+          backgroundColor: 'rgba(10,10,18,0.97)',
+          border: '1px solid rgba(68,34,170,0.35)',
+          borderRadius: '14px',
+          display: 'flex', flexDirection: 'column',
+          boxShadow: '0 8px 40px rgba(0,0,0,0.7)',
+          overflow: 'hidden',
+        }}>
+          {/* Editor header */}
+          <div style={{
+            padding: '8px 14px',
+            borderBottom: '1px solid rgba(68,34,170,0.3)',
+            display: 'flex', alignItems: 'center', gap: '8px',
+            backgroundColor: 'rgba(68,34,170,0.1)',
+            flexShrink: 0,
+          }}>
+            <span style={{ fontSize: '12px', color: '#cca8ff', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+              title={selectedFilePath}>
+              {selectedFilePath.split(/[/\\]/).pop()}
+              {fileEditorDirty && <span style={{ color: '#ff8855', marginLeft: '6px' }}>●</span>}
+            </span>
+            <button
+              onClick={handleFileSave}
+              disabled={!fileEditorDirty || fileEditorSaving}
+              style={{
+                padding: '4px 12px', borderRadius: '6px', fontSize: '11px', fontWeight: 'bold',
+                border: 'none', cursor: fileEditorDirty ? 'pointer' : 'default',
+                backgroundColor: fileEditorDirty ? '#4422aa' : '#222',
+                color: fileEditorDirty ? '#fff' : '#555',
+                transition: 'all 0.15s',
+              }}
+            >
+              {fileEditorSaving ? 'Saving…' : 'Save'}
+            </button>
+            <button
+              onClick={() => {
+                if (fileEditorDirty) { setFileEditorContent(fileEditorOriginal); setFileEditorDirty(false); }
+              }}
+              disabled={!fileEditorDirty}
+              title="Discard changes"
+              style={{
+                padding: '4px 8px', borderRadius: '6px', fontSize: '11px',
+                border: 'none', cursor: fileEditorDirty ? 'pointer' : 'default',
+                backgroundColor: fileEditorDirty ? 'rgba(255,50,50,0.15)' : 'transparent',
+                color: fileEditorDirty ? '#ff5555' : '#444',
+              }}
+            >
+              ↩ Revert
+            </button>
+            <button
+              onClick={() => setFileEditorOpen(false)}
+              style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', fontSize: '14px', padding: '0 4px' }}
+            >✕</button>
+          </div>
+
+          {/* Line numbers + editor */}
+          {fileEditorLoading ? (
+            <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#666', fontSize: '13px' }}>
+              Loading…
+            </div>
+          ) : (
+            <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+              {/* Line numbers */}
+              <div style={{
+                padding: '10px 8px 10px 10px', fontFamily: 'monospace', fontSize: '12px', lineHeight: '1.45',
+                color: '#444', textAlign: 'right', userSelect: 'none', overflowY: 'hidden',
+                minWidth: '40px', backgroundColor: 'rgba(0,0,0,0.3)', flexShrink: 0,
+              }} id="file-editor-line-nums">
+                {fileEditorContent.split('\n').map((_, i) => (
+                  <div key={i}>{i + 1}</div>
+                ))}
+              </div>
+              {/* Text editor */}
+              <textarea
+                value={fileEditorContent}
+                onChange={e => {
+                  setFileEditorContent(e.target.value);
+                  setFileEditorDirty(e.target.value !== fileEditorOriginal);
+                }}
+                onScroll={e => {
+                  const lineNums = document.getElementById('file-editor-line-nums');
+                  if (lineNums) lineNums.scrollTop = (e.target as HTMLTextAreaElement).scrollTop;
+                }}
+                onKeyDown={e => {
+                  // Ctrl+S / Cmd+S to save
+                  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+                    e.preventDefault();
+                    handleFileSave();
+                  }
+                  // Tab inserts spaces
+                  if (e.key === 'Tab') {
+                    e.preventDefault();
+                    const ta = e.target as HTMLTextAreaElement;
+                    const start = ta.selectionStart;
+                    const end = ta.selectionEnd;
+                    const val = ta.value;
+                    const newVal = val.substring(0, start) + '    ' + val.substring(end);
+                    setFileEditorContent(newVal);
+                    setFileEditorDirty(newVal !== fileEditorOriginal);
+                    setTimeout(() => { ta.selectionStart = ta.selectionEnd = start + 4; }, 0);
+                  }
+                }}
+                spellCheck={false}
+                style={{
+                  flex: 1, padding: '10px', fontFamily: 'monospace', fontSize: '12px', lineHeight: '1.45',
+                  backgroundColor: 'transparent', color: '#e0e0e0', border: 'none', outline: 'none',
+                  resize: 'none', overflowY: 'auto', whiteSpace: 'pre', tabSize: 4,
+                }}
+              />
             </div>
           )}
         </div>
@@ -1926,6 +2146,17 @@ return (
               Learnings
             </button>
           </div>
+
+          {/* ── Math Tools Quick Access — always available in math mode ─── */}
+          {isMathMode && !tutorProblem && (
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '10px', padding: '8px 12px', borderRadius: '10px', backgroundColor: 'rgba(179,136,255,0.04)', border: '1px solid rgba(179,136,255,0.15)' }}>
+              <button onClick={() => { triggerPulse('mathviz'); setShowMathViz(v => !v); }}
+                style={{ padding: '8px 16px', borderRadius: '8px', border: '1px solid #b388ff66', backgroundColor: showMathViz ? 'rgba(179,136,255,0.15)' : 'transparent', color: '#b388ff', cursor: 'pointer', fontSize: '12px', animation: pulsingBtn === 'mathviz' ? 'greenPulse 0.6s ease-out' : undefined }}>
+                🧮 Math Tools
+              </button>
+              <span style={{ color: '#555', fontSize: '11px', alignSelf: 'center' }}>Visualizations available — generate a problem for hints &amp; step-by-step</span>
+            </div>
+          )}
 
           {/* ── Math / CS Tools Bar — always visible when a problem exists ── */}
           {tutorProblem && (
@@ -4494,6 +4725,7 @@ return (
                         : '';
                       setMessages(prev => [...prev, { role: 'ai', text: (result.message || 'Changes applied successfully!') + ctxNote }]);
                       setPendingAgentEdit(null);
+                      reloadFileEditor();
                     } catch (e) {
                       setMessages(prev => [...prev, { role: 'ai', text: 'Error applying changes.' }]);
                     }

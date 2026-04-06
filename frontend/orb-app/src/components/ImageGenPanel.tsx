@@ -2648,10 +2648,17 @@ const handleCancelGeneration = async () => {
                 <summary style={{ cursor: 'pointer', color: '#b388ff' }}>LoRA Status ({imageGenMeta.lora_diagnostics.filter((d: any) => d.loaded).length}/{imageGenMeta.lora_diagnostics.length} loaded)</summary>
                 <div style={{ marginTop: '4px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
                   {imageGenMeta.lora_diagnostics.map((d: any, i: number) => (
-                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 6px', borderRadius: '6px', backgroundColor: d.loaded ? 'rgba(0,204,136,0.1)' : 'rgba(255,68,68,0.1)' }}>
-                      <span style={{ color: d.loaded ? '#00cc88' : '#ff4444' }}>{d.loaded ? '✓' : '✗'}</span>
-                      <span style={{ flex: 1, color: '#aaa' }}>{d.name}</span>
-                      <span style={{ fontSize: '9px', fontFamily: 'monospace', color: '#666' }}>w={d.weight}</span>
+                    <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: '2px', padding: '3px 6px', borderRadius: '6px', backgroundColor: d.loaded ? 'rgba(0,204,136,0.1)' : 'rgba(255,68,68,0.1)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <span style={{ color: d.loaded ? '#00cc88' : '#ff4444' }}>{d.loaded ? '✓' : '✗'}</span>
+                        <span style={{ flex: 1, color: '#aaa' }}>{d.name}</span>
+                        <span style={{ fontSize: '9px', fontFamily: 'monospace', color: '#666' }}>w={d.weight}</span>
+                      </div>
+                      {d.error && (
+                        <div style={{ fontSize: '10px', color: '#ff8855', paddingLeft: '18px', lineHeight: '1.3' }}>
+                          {d.error}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>

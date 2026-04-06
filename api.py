@@ -330,6 +330,7 @@ class QueryRequest(BaseModel):
     verbose: bool = False
     mode: Literal['auto', 'fast', 'deep', 'deep_semantic', 'both'] = 'auto'
     session_id: Optional[str] = None
+    tone: Optional[str] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -354,7 +355,8 @@ async def query(req: QueryRequest):
             verbose=req.verbose,
             raw_docs=raw_docs,
             session_chat_history=history,
-            mode_override=req.mode
+            mode_override=req.mode,
+            tone=req.tone
         )
 
         # Persist turns to Chroma session store
@@ -1893,6 +1895,45 @@ async def open_file_in_os(path: str):
         else:
             subprocess.Popen(["xdg-open", str(p)])
         return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+class FileReadRequest(BaseModel):
+    file_path: str
+
+
+@app.post("/file/read")
+async def read_file_content(req: FileReadRequest):
+    """Read file content for the in-app editor."""
+    p = Path(req.file_path)
+    if not p.exists():
+        return {"status": "error", "error": f"File not found: {req.file_path}"}
+    if not p.is_file():
+        return {"status": "error", "error": "Path is not a file"}
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+        return {"status": "ok", "content": content, "file_path": str(p.resolve())}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+class FileSaveRequest(BaseModel):
+    file_path: str
+    content: str
+
+
+@app.post("/file/save")
+async def save_file_content(req: FileSaveRequest):
+    """Save file content from the in-app editor."""
+    p = Path(req.file_path)
+    if not p.exists():
+        return {"status": "error", "error": f"File not found: {req.file_path}"}
+    if not p.is_file():
+        return {"status": "error", "error": "Path is not a file"}
+    try:
+        p.write_text(req.content, encoding="utf-8")
+        return {"status": "ok", "file_path": str(p.resolve())}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 

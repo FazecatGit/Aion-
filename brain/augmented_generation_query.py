@@ -322,7 +322,7 @@ def _format_search_results_for_prompt(results: list) -> str:
     return "\n\n".join(formatted)
 
 
-async def answer_question(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None) -> str:
+async def answer_question(query: str, formatted_docs: str, llm_model: str, session_chat_history: list[dict] | None = None, tone: str | None = None) -> str:
     llm = make_llm(model=llm_model, temperature=LLM_TEMPERATURE)
 
     history_entries = []
@@ -358,8 +358,12 @@ Using the provided context chunks, answer the question directly and concisely.
 - If the context is partially relevant, supplement with your own knowledge
 - If the documents don't contain enough information, say so honestly."""
 
+    tone_instruction = ""
+    if tone and tone != "default":
+        tone_instruction = f"\n- Respond using a {tone} tone and writing style throughout your answer."
+
     prompt = f"""{persona}
-{length_instruction}
+{length_instruction}{tone_instruction}
 
 previous conversation (if relevant):
 {recent_history}
@@ -480,7 +484,7 @@ Detailed Explanation:"""
     return response
 
 
-async def fast_pipeline(query: str, llm_model: str, session_chat_history: list[dict] | None = None):
+async def fast_pipeline(query: str, llm_model: str, session_chat_history: list[dict] | None = None, tone: str | None = None):
     topics = _extract_query_topics(query)
     is_math = _is_math_query(query)
 
@@ -508,7 +512,7 @@ async def fast_pipeline(query: str, llm_model: str, session_chat_history: list[d
     formatted_docs = _format_search_results_for_prompt(top_docs)
 
     coros = [
-        answer_question(query, formatted_docs, llm_model, session_chat_history),
+        answer_question(query, formatted_docs, llm_model, session_chat_history, tone=tone),
         summarize_documents(query, formatted_docs, llm_model, session_chat_history),
         cite_documents(query, formatted_docs, llm_model, session_chat_history),
         detailed_answer(query, formatted_docs, llm_model, session_chat_history),
@@ -528,7 +532,8 @@ async def deep_pipeline(
     llm_model,
     verbose=False,
     raw_docs=None,
-    session_chat_history=None
+    session_chat_history=None,
+    tone=None
 ):
     global _last_filters
 
@@ -566,7 +571,7 @@ async def deep_pipeline(
     formatted_docs = _format_search_results_for_prompt(results)
 
     coros = [
-        answer_question(query, formatted_docs, llm_model, session_chat_history),
+        answer_question(query, formatted_docs, llm_model, session_chat_history, tone=tone),
         summarize_documents(query, formatted_docs, llm_model, session_chat_history),
         cite_documents(query, formatted_docs, llm_model, session_chat_history),
         detailed_answer(query, formatted_docs, llm_model, session_chat_history)
@@ -586,7 +591,8 @@ async def deep_semantic_pipeline(
     llm_model,
     verbose=False,
     raw_docs=None,
-    session_chat_history=None
+    session_chat_history=None,
+    tone=None
 ):
     """
     Deep retrieval using semantic (cross-encoder) reranking.
@@ -630,7 +636,7 @@ async def deep_semantic_pipeline(
     formatted_docs = _format_search_results_for_prompt(results)
 
     coros = [
-        answer_question(query, formatted_docs, llm_model, session_chat_history),
+        answer_question(query, formatted_docs, llm_model, session_chat_history, tone=tone),
         summarize_documents(query, formatted_docs, llm_model, session_chat_history),
         cite_documents(query, formatted_docs, llm_model, session_chat_history),
         detailed_answer(query, formatted_docs, llm_model, session_chat_history)
@@ -651,7 +657,8 @@ async def query_brain_comprehensive(
     verbose: bool = False,
     raw_docs: list[dict] | None = None,
     session_chat_history: list[dict] | None = None,
-    mode_override: str | None = None  # 'auto','fast','deep','deep_semantic','both'
+    mode_override: str | None = None,  # 'auto','fast','deep','deep_semantic','both'
+    tone: str | None = None
 ) -> dict:
 
     llm_model = llm_model or _cfg.LLM_MODEL
@@ -684,23 +691,25 @@ async def query_brain_comprehensive(
         print(f"[ROUTER] Execution mode: {mode}")
 
     if mode == "fast":
-        result = await fast_pipeline(effective_query, llm_model, session_chat_history)
+        result = await fast_pipeline(effective_query, llm_model, session_chat_history, tone=tone)
     elif mode == "deep_semantic":
         result = await deep_semantic_pipeline(
             query=effective_query,
             llm_model=llm_model,
             verbose=verbose,
             raw_docs=raw_docs,
-            session_chat_history=session_chat_history
+            session_chat_history=session_chat_history,
+            tone=tone
         )
     elif mode == "both":
-        fast_res = await fast_pipeline(effective_query, llm_model, session_chat_history)
+        fast_res = await fast_pipeline(effective_query, llm_model, session_chat_history, tone=tone)
         deep_res = await deep_pipeline(
             query=effective_query,
             llm_model=llm_model,
             verbose=verbose,
             raw_docs=raw_docs,
             session_chat_history=session_chat_history,
+            tone=tone,
         )
         result = {"fast": fast_res, "deep": deep_res}
     else:
@@ -710,7 +719,8 @@ async def query_brain_comprehensive(
             llm_model=llm_model,
             verbose=verbose,
             raw_docs=raw_docs,
-            session_chat_history=session_chat_history
+            session_chat_history=session_chat_history,
+            tone=tone
         )
 
     # ── Store the ORIGINAL query and the answer in chat history ──────

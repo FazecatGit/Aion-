@@ -301,8 +301,49 @@ def list_loras_by_category() -> dict:
 def load_lora(pipe: StableDiffusionXLPipeline, lora_path: str, weight: float = 0.8):
     """Load a LoRA adapter on top of the current pipeline."""
     import agent.image_gen.core as _core
+    from safetensors.torch import load_file as safe_load
+    from pathlib import Path
+
     _log.info("[IMAGE GEN] Loading LoRA: %s (weight=%.2f)", lora_path, weight)
-    pipe.load_lora_weights(lora_path)
+
+    # ── Quick architecture compatibility check ─────────────────────────
+    # Detect SD1.5 LoRAs being loaded on SDXL (or vice-versa) before
+    # diffusers throws an opaque state_dict error.
+    lp = Path(lora_path)
+    if lp.suffix.lower() == ".safetensors":
+        try:
+            sd = safe_load(str(lp), device="cpu")
+            # SD1.5 cross-attn keys project from 768-dim text encoder;
+            # SDXL projects from 2048-dim.  Check any attn2.to_k key.
+            for key, tensor in sd.items():
+                if "attn2.to_k" in key and "lora_A" in key:
+                    dim = tensor.shape[-1]  # last dim is always the input
+                    if dim == 768:
+                        raise ValueError(
+                            f"LoRA '{lp.stem}' was trained for SD 1.5 "
+                            f"(cross-attn dim=768) but the current model is SDXL "
+                            f"(cross-attn dim=2048). This LoRA is incompatible — "
+                            f"use an SDXL version instead."
+                        )
+                    break  # only need to check one key
+            del sd  # free memory
+        except ValueError:
+            raise
+        except Exception as e:
+            _log.warning("[IMAGE GEN] LoRA pre-check skipped: %s", e)
+
+    try:
+        pipe.load_lora_weights(lora_path)
+    except RuntimeError as e:
+        err_msg = str(e)
+        if "size mismatch" in err_msg:
+            raise ValueError(
+                f"LoRA '{lp.stem}' is incompatible with the current model "
+                f"(tensor shape mismatch). This usually means the LoRA was "
+                f"trained for a different architecture (e.g. SD1.5 vs SDXL). "
+                f"Use a LoRA matching your checkpoint."
+            ) from e
+        raise
     pipe.fuse_lora(lora_scale=weight)
     _core._active_loras.append(lora_path)
 

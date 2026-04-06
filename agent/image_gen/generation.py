@@ -271,7 +271,19 @@ def generate_image(
         weights = lora_weights or [0.8] * len(lora_paths)
         for lp, lw in zip(lora_paths, weights):
             if Path(lp).exists():
-                load_lora(pipe, lp, weight=lw)
+                try:
+                    load_lora(pipe, lp, weight=lw)
+                except (ValueError, RuntimeError) as e:
+                    lora_diagnostics.append({
+                        "name": Path(lp).stem,
+                        "path": lp,
+                        "weight": lw,
+                        "trigger_words": [],
+                        "loaded": False,
+                        "error": str(e),
+                    })
+                    _log.error("[IMAGE GEN] ✗ LoRA incompatible: %s — %s", Path(lp).stem, e)
+                    continue
                 stem = Path(lp).stem
                 tw_data_diag = _load_trigger_words()
                 words_diag = tw_data_diag.get(stem, [])
@@ -601,7 +613,10 @@ def generate_preview_only(
         weights = lora_weights or [0.8] * len(lora_paths)
         for lp, lw in zip(lora_paths, weights):
             if Path(lp).exists():
-                load_lora(pipe, lp, weight=lw)
+                try:
+                    load_lora(pipe, lp, weight=lw)
+                except (ValueError, RuntimeError) as e:
+                    _log.error("[IMAGE GEN] ✗ Preview LoRA incompatible: %s — %s", Path(lp).stem, e)
 
     # Build prompt with trigger word injection
     selected_outfits = selected_outfits or {}
